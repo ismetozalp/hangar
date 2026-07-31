@@ -88,6 +88,18 @@ function walk(dir) {
     return out;
 }
 
+function walkHtml(dir) {
+    const out = [];
+    const abs = path.join(ROOT, dir);
+    if (!fs.existsSync(abs)) return out;
+    for (const entry of fs.readdirSync(abs, { withFileTypes: true })) {
+        const rel = path.join(dir, entry.name);
+        if (entry.isDirectory()) out.push(...walkHtml(rel));
+        else if (entry.name.endsWith('.html')) out.push(rel);
+    }
+    return out;
+}
+
 const VENDOR = new Set(['js/alpine.min.js', 'js/bootstrap.bundle.min.js']);
 const modules = walk('js').filter((m) => !VENDOR.has(m));
 
@@ -139,6 +151,35 @@ if (!exists('libexec/hangar-run')) {
         fail('hangar-run lost its empty-retention guard');
     ok('hangar-run structural checks pass');
 }
+
+// --- x-show must never share an element with a Bootstrap display utility -
+
+// Alpine's x-show toggles an inline `display: none`. Bootstrap's display utilities
+// (.d-flex, .d-block, …) are declared `!important`, so they beat the inline style and
+// the element stays permanently visible. This silently produced an empty red error
+// box on the Overview screen, which is exactly the kind of defect that reads as
+// "the UI is broken" rather than as a bug in one binding.
+const DISPLAY_UTIL = /\bd-(flex|block|inline|inline-flex|inline-block|grid|table)\b/;
+
+for (const f of [...modules, 'index.html', ...walkHtml('html')]) {
+    const text = read(f);
+    text.split('\n').forEach((line, i) => {
+        const trimmed = line.trim();
+        // Skip prose: the comments explaining this very rule name both x-show and
+        // d-flex, and would otherwise flag themselves.
+        if (trimmed.startsWith('//') || trimmed.startsWith('<!--') || trimmed.startsWith('*')) return;
+        if (!line.includes('x-show')) return;
+        // Only flag when both appear on the same tag — a class attribute on a
+        // following line belongs to a different element.
+        const m = DISPLAY_UTIL.exec(line);
+        if (m) {
+            fail(`${f}:${i + 1} puts x-show on an element with "${m[0]}" — ` +
+                'Bootstrap display utilities are !important and defeat x-show. ' +
+                'Move the toggle to a plain wrapper.');
+        }
+    });
+}
+ok('no x-show is defeated by a Bootstrap display utility');
 
 // --- the feature is called Logbook, never Time Machine ------------------
 

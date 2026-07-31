@@ -179,6 +179,45 @@ test('a check fails cleanly when cockpit is unavailable', async () => {
     assert.equal(state.available, false);
 });
 
+test('initUpdate forwards settings to the check', async () => {
+    // Regression: initUpdate used to call checkForUpdate(false) without settings, so
+    // the repository was never seen and the startup check silently resolved to "no
+    // repository configured" instead of contacting GitHub. Caught by the browser
+    // test, pinned here.
+    const c = U.hangarUpdateUi();
+    let seen;
+    c.checkForUpdate = async (manual, settings) => { seen = { manual, settings }; };
+    c.readInstalledVersion = async () => '1.0.0';
+
+    await c.initUpdate({ updateCheckOnStartup: true, updateRepo: 'appuser/hangar' });
+    assert.ok(seen, 'checkForUpdate was never called');
+    assert.equal(seen.manual, false);
+    assert.equal(seen.settings.updateRepo, 'appuser/hangar');
+});
+
+test('initUpdate skips the check when it would be pointless', async () => {
+    for (const settings of [
+        null,
+        {},
+        { updateCheckOnStartup: false, updateRepo: 'appuser/hangar' },
+        { updateCheckOnStartup: true, updateRepo: '' }   // nothing to check against
+    ]) {
+        const c = U.hangarUpdateUi();
+        let called = false;
+        c.checkForUpdate = async () => { called = true; };
+        c.readInstalledVersion = async () => '1.0.0';
+        await c.initUpdate(settings);
+        assert.equal(called, false, `should not check for ${JSON.stringify(settings)}`);
+    }
+});
+
+test('initUpdate always records the installed version', async () => {
+    const c = U.hangarUpdateUi();
+    c.readInstalledVersion = async () => '1.2.3';
+    await c.initUpdate(null);
+    assert.equal(c.installedVersion, '1.2.3');
+});
+
 test('the update modal cannot be opened without a download URL', () => {
     const c = U.hangarUpdateUi();
     assert.equal(c.openUpdateModal(), false);

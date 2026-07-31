@@ -788,3 +788,665 @@ test('init() loads settings and diagnostics together', async () => {
 test('readInstalledVersion resolves to null with no cockpit', async () => {
     assert.equal(await UI.readInstalledVersion(), null);
 });
+
+// ===================================================================== hardening
+//
+// Everything below attacks the screen rather than describing it: the error paths
+// nobody clicks through by hand, and the pure functions fed input no form would
+// ever produce. Two rules are load-bearing enough to be asserted directly rather
+// than inferred — a non-fatal outcome is a WARNING that names the files it could
+// not read, and every failure that has a remediation offers it as an action.
+
+// A core call that fails once and then succeeds, so a retry can be observed
+// rather than assumed.
+function flaky(err) {
+    let armed = true;
+    const calls = [];
+    return {
+        calls: calls,
+        disarm: function () { armed = false; },
+        fn: function (arg) {
+            calls.push(arg);
+            if (armed) return Promise.reject(err);
+            return Promise.resolve();
+        }
+    };
+}
+
+// ------------------------------------------------------ no DOM, no cockpit
+
+test('no pure export touches the DOM or cockpit, and none throws on nothing', () => {
+    assert.equal(typeof globalThis.document, 'undefined');
+    assert.equal(typeof globalThis.cockpit, 'undefined');
+    assert.equal(typeof globalThis.window, 'undefined');
+
+    // Every exported function, called with the arguments a caller is most likely
+    // to get wrong. None may throw; a settings screen that dies on a null is not
+    // a settings screen.
+    Object.keys(UI).forEach((name) => {
+        const fn = UI[name];
+        if (typeof fn !== 'function' || name === 'hangarSettingsUi' ||
+            name === 'mount' || name === 'readInstalledVersion') return;
+        [[], [null], [undefined], [''], [0], [NaN], [{}], [[]], [true],
+            [null, null], [undefined, undefined]].forEach((args) => {
+            assert.doesNotThrow(() => fn.apply(null, args),
+                name + '(' + args.map(String).join(', ') + ') threw');
+        });
+    });
+});
+
+test('the module has no side effects at load time beyond its own globals', () => {
+    // Requiring it again must be a no-op, not a second attempt to find a document.
+    delete require.cache[require.resolve('../../js/features/settings-ui.js')];
+    const again = require('../../js/features/settings-ui.js');
+    assert.equal(typeof again.hangarSettingsUi, 'function');
+    assert.equal(typeof globalThis.document, 'undefined');
+    assert.equal(globalThis.HangarSettingsUi, again);
+});
+
+test('mount() refuses anything that is not a document, without throwing', () => {
+    [null, undefined, 0, '', 'document', [], { getElementById: 'not a function' }]
+        .forEach((d) => assert.equal(UI.mount(d), false, String(d)));
+    // A document with no #hangar-settings is a no-op, not a crash.
+    assert.equal(UI.mount({ getElementById: () => null }), false);
+    // A host that is already mounted is never mounted twice.
+    let inserted = 0;
+    const host = {
+        _attrs: { 'data-hangar-mounted': null },
+        getAttribute(k) { return this._attrs[k]; },
+        setAttribute(k, v) { this._attrs[k] = v; },
+        insertAdjacentHTML() { inserted++; }
+    };
+    const doc = { getElementById: () => host };
+    assert.equal(UI.mount(doc), true);
+    assert.equal(UI.mount(doc), false);
+    assert.equal(inserted, 1);
+});
+
+// ------------------------------------------------------------ hostile input
+
+test('a value with no usable string conversion is empty, not an exception', () => {
+    const hostile = { toString() { throw new Error('nope'); } };
+    assert.deepEqual(UI.pathProblems(hostile), ['Mount folder is required.']);
+    assert.equal(UI.toNumber(hostile), null);
+    assert.equal(UI.bannerText(hostile), 'not installed');
+    assert.equal(UI.describeTimeout(hostile), '');
+    assert.equal(UI.pad(hostile, 4), '    ');
+    // Object.create(null) has no toString at all.
+    assert.deepEqual(UI.pathProblems(Object.create(null)), ['Mount folder is required.']);
+});
+
+test('unicode, quotes and non-latin text are ordinary characters in a path', () => {
+    assert.deepEqual(UI.pathProblems('/srv/yedekler/\u{1F4BE}'), []);
+    assert.deepEqual(UI.pathProblems('/srv/備份/快照'), []);
+    assert.deepEqual(UI.pathProblems('/srv/نسخ احتياطي'), []);
+    assert.deepEqual(UI.pathProblems('/srv/it\'s a "backup"'), []);
+    assert.deepEqual(UI.pathProblems('/srv/a\\backup'), []);   // backslash is a legal byte
+});
+
+test('a path with an embedded newline is rejected however it is dressed up', () => {
+    ['/srv/mnt\nExecStart=/bin/sh', '/srv/mnt\r\nWantedBy=x', '/srv/"mnt"\n[Unit]']
+        .forEach((p) => {
+            assert.ok(UI.pathProblems(p).some((m) => /control characters/.test(m)), p);
+        });
+});
+
+test('an enormous path is rejected once, not counted character by character', () => {
+    const huge = '/' + 'a'.repeat(200000);
+    const problems = UI.pathProblems(huge);
+    assert.equal(problems.length, 1);
+    assert.match(problems[0], /longer than 4096/);
+});
+
+test('toNumber survives the exotic numeric literals a paste can carry', () => {
+    assert.equal(UI.toNumber('0x10'), 16);            // Number() accepts it; the range check rejects it
+    assert.ok(UI.timeoutProblems('0x10').some((m) => /at least 60/.test(m)));
+    assert.equal(UI.toNumber('1e400'), null);         // overflows to Infinity
+    assert.equal(UI.toNumber('-0'), -0);
+    assert.equal(UI.toNumber('١٢٣'), null);   // Arabic-Indic digits are not JS numbers
+    assert.equal(UI.toNumber('900\n'), 900);          // a trailing newline is whitespace
+    assert.equal(UI.toNumber('9,00'), null);
+    assert.equal(UI.toNumber(' '), null);
+});
+
+test('an absurd idle timeout is bounded rather than believed', () => {
+    [Number.MAX_SAFE_INTEGER, 1e15, 86401].forEach((v) => {
+        assert.ok(UI.timeoutProblems(v).some((m) => /at most 86400/.test(m)), String(v));
+    });
+    assert.deepEqual(UI.timeoutProblems(-Number.MAX_SAFE_INTEGER),
+        ['Idle timeout cannot be negative.']);
+    // 1e21 is an integer but stringifies in exponential notation; it must still
+    // be rejected by value, and describing it must not throw.
+    assert.ok(UI.timeoutProblems(1e21).some((m) => /at most 86400/.test(m)));
+    assert.doesNotThrow(() => UI.describeTimeout(1e21));
+});
+
+test('describeTimeout never claims a duration it was not given', () => {
+    assert.equal(UI.describeTimeout(null), '');
+    assert.equal(UI.describeTimeout(''), '');
+    assert.equal(UI.describeTimeout(0.5), '');
+    assert.equal(UI.describeTimeout(-0), 'Snapshots stay mounted until you unmount them.');
+    assert.equal(UI.describeTimeout(119), 'Unmounts after 119 seconds of no activity.');
+    assert.equal(UI.describeTimeout(120), 'Unmounts after 2 minutes of no activity.');
+    assert.equal(UI.describeTimeout(7199), 'Unmounts after 120 minutes of no activity.');
+    assert.equal(UI.describeTimeout(7200), 'Unmounts after 2 hours of no activity.');
+});
+
+test('a probe row made of junk still produces a renderable row', () => {
+    const rows = UI.toolRows([{
+        tool: { toString() { return 'weird'; } },
+        binary: null, optional: 'yes', present: 'no', version: 'not a version',
+        ok: 1, raw: { toString() { throw new Error('x'); } }
+    }]);
+    assert.equal(rows.length, 1);
+    assert.deepEqual(rows[0], {
+        tool: 'weird', binary: '', optional: true, need: 'optional',
+        present: true, version: 'not a version', status: 'ok', banner: 'not installed'
+    });
+});
+
+test('toolRows survives a probe list full of the wrong things', () => {
+    assert.deepEqual(UI.toolRows([undefined, 0, '', false, [], { tool: '' }, { tool: 0 }]), []);
+    assert.equal(UI.toolRows([{ tool: 'restic' }, { tool: 'restic' }]).length, 2);
+});
+
+test('fuseState reads the fuse3 row and only the fuse3 row', () => {
+    // Duplicate probes: the last one wins, deliberately, so a re-probe appended to
+    // the list is what the screen reports.
+    const state = UI.fuseState([
+        probeRow('fuse3', { present: false }),
+        probeRow('fuse3', { present: true, ok: true })
+    ]);
+    assert.equal(state.usable, true);
+    assert.equal(UI.fuseState([probeRow('FUSE3', { present: true, ok: true })]).label, 'unknown');
+});
+
+test('the report survives settings and notes full of newlines and quotes', () => {
+    const text = UI.diagnosticsText({
+        version: 'v1\ninjected: yes',
+        family: 'rhel"; DROP',
+        tools: [],
+        settings: { mountRoot: '/srv/"mnt"\nnotifyOnFailure  false', mountIdleTimeoutSec: 900 },
+        generatedAt: '  2026-08-01  ',
+        notes: [null, undefined, 0, { toString() { throw new Error('x'); } }, 'a real note']
+    });
+    // Untrusted text is padded, never interpreted — and it never truncates the
+    // report or throws.
+    assert.match(text, /hangar version: {7}v1\ninjected: yes/);
+    assert.match(text, /\nnotes\n-----\n/);
+    assert.match(text, /a real note\n$/);
+    // A note with no string form is dropped rather than rendered as a stack trace.
+    assert.doesNotMatch(text, /nope|Error/);
+    assert.ok(text.endsWith('\n'));
+});
+
+test('pad handles the widths a caller can get wrong', () => {
+    assert.equal(UI.pad('ab', 0), 'ab');
+    assert.equal(UI.pad('ab', -5), 'ab');
+    assert.equal(UI.pad('', 3), '   ');
+    assert.equal(UI.pad('ab', NaN), 'ab');
+    assert.equal(UI.pad('ab', undefined), 'ab');
+});
+
+// -------------------------------------------------------- update repository
+
+test('an update repository is accepted in every form update.js accepts', () => {
+    ['owner/name', 'appuser/hangar', 'https://github.com/appuser/hangar',
+        'https://github.com/appuser/hangar.git', 'http://www.github.com/a/b',
+        'a.b-c_d/e.f-g_h'].forEach((v) => {
+        assert.deepEqual(UI.updateRepoProblems(v), [], v);
+    });
+    assert.deepEqual(UI.updateRepoProblems(''), []);
+    assert.deepEqual(UI.updateRepoProblems('   '), []);
+    assert.deepEqual(UI.updateRepoProblems(null), []);
+});
+
+test('an update repository hangar could never check is rejected, not saved', () => {
+    ['owner', 'owner/name/extra', '/name', 'owner/', 'owner name',
+        'https://gitlab.com/a/b', 'owner/name;rm -rf /', 'a/b\nc/d',
+        '../../etc/passwd', 'x'.repeat(300) + '/y'].forEach((v) => {
+        const problems = UI.updateRepoProblems(v);
+        assert.equal(problems.length, 1, JSON.stringify(v) + ' should be rejected');
+        assert.match(problems[0], /"owner\/name"/);
+    });
+});
+
+test('the built-in repository check agrees with update.js, so it is safe as a fallback', () => {
+    // In the browser index.html loads update.js AFTER this screen, so the field
+    // must still validate before HangarUpdate exists. Silently accepting anything
+    // would save a repository that is never checked and never says why.
+    const Update = require('../../js/features/update.js');
+    ['owner/name', 'https://github.com/a/b.git', 'owner', 'a/b/c', '', 'a b/c',
+        'https://gitlab.com/a/b', '/a/b/'].forEach((v) => {
+        assert.equal(UI.looksLikeRepo(v), !!Update.releasesApiUrl(v),
+            'disagreement on ' + JSON.stringify(v));
+    });
+});
+
+test('checkOnStartup, like every other switch, must be a real boolean', () => {
+    assert.deepEqual(UI.checkOnStartupProblems(true), []);
+    assert.deepEqual(UI.checkOnStartupProblems(false), []);
+    ['true', 1, 0, null, undefined, {}].forEach((v) => {
+        assert.equal(UI.checkOnStartupProblems(v).length, 1, String(v));
+    });
+});
+
+// ------------------------------------------ READ_ERRORS is a partial success
+
+test('a non-fatal outcome is a partial success, and a real failure is not', () => {
+    assert.equal(UI.isPartial(Errors.create('READ_ERRORS', 'some files were unreadable')), true);
+    assert.equal(UI.isPartial(Errors.create('CANCELLED', 'stopped')), true);
+    ['GENERIC', 'NO_SPACE', 'NETWORK', 'REPO_LOCKED', 'WRONG_PASSWORD',
+        'REPO_MISSING', 'GO_RUNTIME', 'UNKNOWN'].forEach((kind) => {
+        assert.equal(UI.isPartial(Errors.create(kind, 'x')), false, kind);
+    });
+    // An untyped throw is a failure by default — never quietly downgraded.
+    assert.equal(UI.isPartial(new Error('boom')), false);
+    assert.equal(UI.isPartial(null), false);
+    assert.equal(UI.isPartial('READ_ERRORS'), false);
+});
+
+test('the unreadable file list is read from every shape a producer uses', () => {
+    const at = (detail) => UI.unreadableFrom(Errors.create('READ_ERRORS', 'x', detail));
+    assert.deepEqual(at(['/a', '/b']), ['/a', '/b']);
+    assert.deepEqual(at({ errors: ['/c'] }), ['/c']);
+    assert.deepEqual(at({ files: ['/d'] }), ['/d']);
+    assert.deepEqual(at({ unreadable: ['/e'] }), ['/e']);
+    // restic names the file in `item` and the reason in `message`.
+    assert.deepEqual(at([{ item: '/var/lib/x' }, { path: '/var/lib/y' }, { message: 'z' }]),
+        ['/var/lib/x', '/var/lib/y', 'z']);
+});
+
+test('the unreadable file list is deduplicated and free of junk', () => {
+    const at = (detail) => UI.unreadableFrom(Errors.create('READ_ERRORS', 'x', detail));
+    assert.deepEqual(at(['/a', '/a', '  /a  ', '', '   ', null, undefined, {}]), ['/a']);
+    assert.deepEqual(at({ errors: 'not a list' }), []);
+    assert.deepEqual(at(undefined), []);
+    assert.deepEqual(UI.unreadableFrom(null), []);
+    assert.deepEqual(UI.unreadableFrom(new Error('no detail')), []);
+});
+
+test('routeError sends a partial to the warning slot and a failure to the red one', () => {
+    const partial = Errors.create('READ_ERRORS', 'some files were unreadable');
+    const failure = Errors.create('NO_SPACE', 'no space left on device');
+    assert.deepEqual(UI.routeError(partial), { error: null, partial: partial });
+    assert.deepEqual(UI.routeError(failure), { error: failure, partial: null });
+    assert.deepEqual(UI.routeError(null), { error: null, partial: null });
+});
+
+test('a partial read renders as a warning listing the files, never as a failure', async () => {
+    const partial = Errors.create('READ_ERRORS', 'some settings could not be read',
+        { files: ['/etc/hangar/config.json', '/etc/hangar/config.d/10-site.json'] });
+    const c = UI.hangarSettingsUi(stubDeps({
+        config: {
+            mergeGlobal: Config.mergeGlobal,
+            readGlobal: () => Promise.reject(partial),
+            writeGlobal: () => Promise.resolve()
+        }
+    }));
+    await c.load();
+
+    assert.equal(c.error, null, 'a partial success must never fill the failure slot');
+    assert.equal(c.partial, partial);
+    assert.deepEqual(c.unreadable(),
+        ['/etc/hangar/config.json', '/etc/hangar/config.d/10-site.json']);
+    // The screen still works: defaults are shown and the form is usable.
+    assert.equal(c.form.mountRoot, DEFAULTS.mountRoot);
+    assert.equal(c.loading, false);
+});
+
+test('a partial write is a warning too, and the edit stays in the form', async () => {
+    const partial = Errors.create('READ_ERRORS', 'config was written, one include was not',
+        ['/etc/hangar/config.d/10-site.json']);
+    const c = UI.hangarSettingsUi(stubDeps({
+        config: {
+            mergeGlobal: Config.mergeGlobal,
+            readGlobal: () => Promise.resolve(Config.mergeGlobal({})),
+            writeGlobal: () => Promise.reject(partial)
+        }
+    }));
+    await c.load();
+    c.form.mountRoot = '/srv/mnt';
+    assert.equal(await c.save(), false);
+    assert.equal(c.error, null);
+    assert.equal(c.partial, partial);
+    assert.deepEqual(c.unreadable(), ['/etc/hangar/config.d/10-site.json']);
+    assert.equal(c.form.mountRoot, '/srv/mnt', 'the edit must survive');
+});
+
+test('the template renders the partial as amber and the failure as red', () => {
+    // Design rule, asserted rather than eyeballed: the two outcomes are two
+    // different boxes, and the warning names the files.
+    // The toggle and the styling are allowed to sit on nested elements: x-show must
+    // NOT share a tag with a Bootstrap display utility, because those are !important
+    // and defeat the inline `display: none` x-show sets. So match across the wrapper.
+    assert.match(UI.TEMPLATE, /x-show="error"[\s\S]{0,160}alert-danger/);
+    assert.match(UI.TEMPLATE, /x-show="partial"[\s\S]{0,160}alert-warning/);
+    assert.doesNotMatch(UI.TEMPLATE, /x-show="partial"[^>]*alert-danger/);
+    assert.ok(UI.TEMPLATE.includes('x-for="f in unreadable()"'),
+        'the warning must list the files it could not read');
+});
+
+test('a partial probe names the files in the diagnostics note', async () => {
+    const c = UI.hangarSettingsUi(stubDeps({
+        provision: {
+            detectFamilyLive: () => Promise.resolve('debian'),
+            probeAll: () => Promise.reject(Errors.create('READ_ERRORS',
+                'some tools could not be inspected', { files: ['/usr/bin/restic'] }))
+        }
+    }));
+    await c.load();
+    const info = await c.loadDiagnostics();
+    assert.equal(info.notes.length, 1);
+    assert.match(info.notes[0], /some tools could not be inspected \(\/usr\/bin\/restic\)/);
+    assert.match(c.report(), /\/usr\/bin\/restic/);
+});
+
+// ------------------------------------------------------------- remediations
+
+test('every failure kind with a remediation offers it as an action, on read and on write', async () => {
+    const cases = [
+        ['REPO_LOCKED', 'unlock'],
+        ['WRONG_PASSWORD', 'reprompt'],
+        ['REPO_MISSING', 'init'],
+        ['NO_SPACE', 'free-space'],
+        ['NETWORK', 'retry']
+    ];
+
+    for (const [kind, slug] of cases) {
+        const err = Errors.create(kind, kind.toLowerCase());
+
+        const onRead = UI.hangarSettingsUi(stubDeps({
+            config: {
+                mergeGlobal: Config.mergeGlobal,
+                readGlobal: () => Promise.reject(err),
+                writeGlobal: () => Promise.resolve()
+            }
+        }));
+        await onRead.load();
+        assert.equal(onRead.error, err, kind + ' on read');
+        assert.equal(onRead.errorRemediation(), slug, kind + ' remediation on read');
+        assert.notEqual(onRead.remediationText(), '', kind + ' has no button label');
+        assert.equal(onRead.remediationText(), UI.REMEDIATION_LABEL[slug]);
+
+        const onWrite = UI.hangarSettingsUi(stubDeps({
+            config: {
+                mergeGlobal: Config.mergeGlobal,
+                readGlobal: () => Promise.resolve(Config.mergeGlobal({})),
+                writeGlobal: () => Promise.reject(err)
+            }
+        }));
+        await onWrite.load();
+        onWrite.form.mountRoot = '/srv/mnt';
+        assert.equal(await onWrite.save(), false);
+        assert.equal(onWrite.errorRemediation(), slug, kind + ' remediation on write');
+    }
+});
+
+test('a failure with no one-click fix offers no button rather than a dead one', async () => {
+    const c = UI.hangarSettingsUi(stubDeps({
+        config: {
+            mergeGlobal: Config.mergeGlobal,
+            readGlobal: () => Promise.reject(Errors.create('GENERIC', 'could not read')),
+            writeGlobal: () => Promise.resolve()
+        }
+    }));
+    await c.load();
+    assert.equal(c.errorRemediation(), null);
+    // The label is still never empty, so the button can never render nameless if
+    // it is shown for a kind this screen has not met yet.
+    assert.equal(c.remediationText(), 'Try again');
+    assert.match(UI.TEMPLATE, /x-show="errorRemediation\(\)"/);
+});
+
+test('the remediation button retries the save, and does not reload over the edit', async () => {
+    // The bug this pins: wiring the action to load() discarded everything the
+    // user had typed, while the button claimed to be freeing space.
+    const write = flaky(Errors.create('NO_SPACE', 'no space left on device'));
+    let reads = 0;
+    const c = UI.hangarSettingsUi(stubDeps({
+        config: {
+            mergeGlobal: Config.mergeGlobal,
+            readGlobal: () => { reads++; return Promise.resolve(Config.mergeGlobal({})); },
+            writeGlobal: write.fn
+        }
+    }));
+    await c.load();
+    assert.equal(reads, 1);
+
+    c.form.mountRoot = '/srv/mnt';
+    c.form.mountIdleTimeoutSec = 1800;
+    assert.equal(await c.save(), false);
+    assert.equal(c.errorRemediation(), 'free-space');
+
+    write.disarm();
+    assert.equal(await c.remediate(), true);
+    assert.equal(reads, 1, 'remediating a failed save must not re-read the config');
+    assert.equal(c.form.mountRoot, '/srv/mnt');
+    assert.equal(c.form.mountIdleTimeoutSec, 1800);
+    assert.equal(c.error, null);
+    assert.equal(c.dirty(), false);
+    assert.equal(write.calls.length, 2);
+    assert.equal(write.calls[1].mountRoot, '/srv/mnt');
+});
+
+test('the remediation button re-reads when it was the read that failed', async () => {
+    const read = flaky(Errors.create('NETWORK', 'the config filesystem is not responding'));
+    let writes = 0;
+    const c = UI.hangarSettingsUi(stubDeps({
+        config: {
+            mergeGlobal: Config.mergeGlobal,
+            readGlobal: () => read.fn().then(() => Config.mergeGlobal({ mountRoot: '/srv/x' })),
+            writeGlobal: () => { writes++; return Promise.resolve(); }
+        }
+    }));
+    await c.load();
+    assert.equal(c.errorRemediation(), 'retry');
+
+    read.disarm();
+    assert.equal(await c.remediate(), true);
+    assert.equal(c.error, null);
+    assert.equal(c.form.mountRoot, '/srv/x');
+    assert.equal(writes, 0, 'remediating a failed read must not write anything');
+});
+
+test('a remediation that fails again leaves the error and its action in place', async () => {
+    const err = Errors.create('REPO_LOCKED', 'still locked');
+    const c = UI.hangarSettingsUi(stubDeps({
+        config: {
+            mergeGlobal: Config.mergeGlobal,
+            readGlobal: () => Promise.reject(err),
+            writeGlobal: () => Promise.resolve()
+        }
+    }));
+    await c.load();
+    assert.equal(await c.remediate(), false);
+    assert.equal(c.error, err);
+    assert.equal(c.errorRemediation(), 'unlock');
+    assert.equal(c.loading, false);
+});
+
+test('a successful save clears a previous failure and its warning', async () => {
+    const write = flaky(Errors.create('NO_SPACE', 'no space'));
+    const c = UI.hangarSettingsUi(stubDeps({
+        config: {
+            mergeGlobal: Config.mergeGlobal,
+            readGlobal: () => Promise.resolve(Config.mergeGlobal({})),
+            writeGlobal: write.fn
+        }
+    }));
+    await c.load();
+    c.form.mountRoot = '/srv/mnt';
+    await c.save();
+    assert.ok(c.error);
+
+    write.disarm();
+    c.form.mountRoot = '/srv/other';
+    assert.equal(await c.save(), true);
+    assert.equal(c.error, null);
+    assert.equal(c.partial, null);
+});
+
+// ------------------------------------------------------- failures that hang
+
+test('a save already in flight is not started twice', async () => {
+    let release;
+    const gate = new Promise((r) => { release = r; });
+    const seen = [];
+    const c = UI.hangarSettingsUi(stubDeps({
+        config: {
+            mergeGlobal: Config.mergeGlobal,
+            readGlobal: () => Promise.resolve(Config.mergeGlobal({})),
+            writeGlobal: (g) => { seen.push(g); return gate; }
+        }
+    }));
+    await c.load();
+    c.form.mountRoot = '/srv/mnt';
+
+    const first = c.save();
+    assert.equal(c.saving, true);
+    assert.equal(c.canSave(), false, 'Save must be disabled while a save is running');
+    assert.equal(await c.save(), false);
+    release();
+    assert.equal(await first, true);
+    assert.equal(seen.length, 1);
+    assert.equal(c.saving, false);
+});
+
+test('a throwing clock does not leave the diagnostics spinner running forever', async () => {
+    const c = UI.hangarSettingsUi(stubDeps({
+        now: () => { throw new Error('no clock on this host'); }
+    }));
+    await c.load();
+    const info = await c.loadDiagnostics();
+    assert.equal(c.diagLoading, false, 'Re-check would stay disabled for the life of the page');
+    assert.equal(info.generatedAt, '');
+    assert.match(c.report(), /generated: {12}unknown/);
+});
+
+test('a provision dependency that throws synchronously is still only a note', async () => {
+    const c = UI.hangarSettingsUi(stubDeps({
+        readVersion: () => { throw new Error('sync throw'); },
+        provision: {
+            detectFamilyLive: () => { throw new Error('sync throw'); },
+            probeAll: () => { throw new Error('sync throw'); }
+        }
+    }));
+    await c.load();
+    const info = await c.loadDiagnostics();
+    assert.equal(c.diagLoading, false);
+    assert.equal(info.notes.length, 3);
+    assert.deepEqual(info.tools, []);
+    assert.equal(c.fuse().label, 'unknown');
+});
+
+test('a provision dependency missing its methods entirely is still only a note', async () => {
+    const c = UI.hangarSettingsUi(stubDeps({ provision: {} }));
+    await c.load();
+    const info = await c.loadDiagnostics();
+    assert.equal(c.diagLoading, false);
+    assert.equal(info.family, 'unknown');
+    assert.deepEqual(info.tools, []);
+    assert.match(c.report(), /\(no tools were probed\)/);
+});
+
+test('a config dependency that is not there at all is an error, not a blank screen', async () => {
+    const c = UI.hangarSettingsUi({ errors: Errors, config: {}, now: () => 'now' });
+    await c.load();
+    assert.equal(c.loading, false);
+    assert.ok(c.error, 'the failure must be visible');
+    assert.equal(c.form.mountRoot, DEFAULTS.mountRoot);
+    // Saving cannot silently do nothing either.
+    c.form.mountRoot = '/srv/mnt';
+    assert.equal(await c.save(), false);
+    assert.ok(c.error);
+});
+
+test('a clipboard that returns something other than a promise does not break copy', async () => {
+    const c = UI.hangarSettingsUi(stubDeps({ clipboard: { writeText: () => undefined } }));
+    await c.load();
+    await c.loadDiagnostics();
+    assert.equal(await c.copyReport(), true);
+    assert.equal(c.copyState, 'copied');
+
+    const throws = UI.hangarSettingsUi(stubDeps({
+        clipboard: { writeText: () => { throw new Error('denied'); } }
+    }));
+    await throws.load();
+    assert.equal(await throws.copyReport(), false);
+    assert.equal(throws.copyState, 'failed');
+});
+
+test('copyReport before diagnostics have loaded still copies the honest report', async () => {
+    const seen = [];
+    const c = UI.hangarSettingsUi(stubDeps({
+        clipboard: { writeText: (t) => { seen.push(t); return Promise.resolve(); } }
+    }));
+    assert.equal(await c.copyReport(), true);
+    assert.match(seen[0], /^hangar diagnostics\n/);
+    assert.match(seen[0], /\(no tools were probed\)/);
+});
+
+// ------------------------------------------------------------ accessibility
+
+test('every click handler in the template is on a real button', () => {
+    const tags = [...UI.TEMPLATE.matchAll(/<([a-zA-Z0-9-]+)\b([^>]*)>/g)];
+    const clickable = tags.filter((m) => /@click/.test(m[2]));
+    assert.ok(clickable.length >= 4, 'expected the screen to have click handlers');
+    clickable.forEach((m) => {
+        assert.equal(m[1], 'button', '@click is on a <' + m[1] + '>, not a <button>');
+    });
+    assert.doesNotMatch(UI.TEMPLATE, /<div[^>]*@click/);
+    assert.doesNotMatch(UI.TEMPLATE, /<span[^>]*@click/);
+    assert.doesNotMatch(UI.TEMPLATE, /<a[^>]*@click/);
+});
+
+test('every button has a type and a name a screen reader can announce', () => {
+    const buttons = [...UI.TEMPLATE.matchAll(/<button\b([^>]*)>([\s\S]*?)<\/button>/g)];
+    assert.ok(buttons.length >= 4);
+    buttons.forEach((m) => {
+        const attrs = m[1];
+        const body = m[2].replace(/\s+/g, ' ').trim();
+        assert.match(attrs, /type="(submit|button)"/, 'button with no explicit type: ' + attrs);
+        const named = body !== '' || /x-text=/.test(attrs) || /aria-label/.test(attrs);
+        assert.ok(named, 'button has no accessible name: ' + attrs);
+    });
+});
+
+test('every input the screen owns is bound to a label', () => {
+    const inputs = [...UI.TEMPLATE.matchAll(/<input\b([^>]*)>/g)].map((m) => m[1]);
+    assert.ok(inputs.length >= 5, 'expected every setting to have an input');
+    inputs.forEach((attrs) => {
+        const id = /id="([^"]+)"/.exec(attrs);
+        assert.ok(id, 'an input has no id, so no label can point at it: ' + attrs);
+        assert.ok(UI.TEMPLATE.includes('for="' + id[1] + '"'), id[1] + ' has no <label for>');
+    });
+});
+
+test('the plain-text report is a named region, not a label pointing at a <pre>', () => {
+    // <pre> is not a labelable element: a <label for> aimed at one is announced
+    // by nothing at all.
+    assert.doesNotMatch(UI.TEMPLATE, /<label[^>]*for="hangar-diagnostics-report"/);
+    assert.match(UI.TEMPLATE, /<pre[\s\S]*?aria-labelledby="hangar-diagnostics-report-label"/);
+    assert.ok(UI.TEMPLATE.includes('id="hangar-diagnostics-report-label"'));
+    assert.match(UI.TEMPLATE, /<pre[^>]*tabindex="0"/);
+});
+
+test('the failure box announces itself and the warning box does not shout', () => {
+    // Nested wrapper allowed — see the note above about x-show and .d-flex.
+    assert.match(UI.TEMPLATE, /x-show="error"[\s\S]{0,160}role="alert"/);
+    assert.match(UI.TEMPLATE, /x-show="partial"[\s\S]{0,160}role="status"/);
+});
+
+test('nothing anywhere in this screen says Time Machine', () => {
+    const fs = require('node:fs');
+    const path = require('node:path');
+    // The whole shipped file, not just the template: a comment or a variable name
+    // that used the old name would ship too. This test file is deliberately not
+    // scanned — it can only forbid the phrase by naming it.
+    const source = fs.readFileSync(
+        path.join(__dirname, '../..', 'js/features/settings-ui.js'), 'utf8');
+    assert.doesNotMatch(source, /time\s*machine/i);
+    // The screen names the feature, and it names it Logbook.
+    assert.match(UI.TEMPLATE, /Logbook/);
+});

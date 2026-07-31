@@ -765,3 +765,1019 @@ test('mount fills an empty container exactly once', () => {
 test('mount with no container and no document is a no-op', () => {
     assert.equal(UI.mount(null), false);
 });
+
+// ==========================================================================
+// Adversarial hardening: error states, hostile input, and the partial-success
+// rule. Everything below assumes the screen is wrong until it proves it is not.
+// ==========================================================================
+
+const NUL = String.fromCharCode(0);
+
+// --- load-time purity -----------------------------------------------------
+
+test('the module reads no cockpit global at load time', () => {
+    const touched = [];
+    Object.defineProperty(globalThis, 'cockpit', {
+        configurable: true,
+        get() { touched.push('read'); throw new Error('cockpit was read at load time'); }
+    });
+    const id = require.resolve('../../js/features/logbook-ui.js');
+    try {
+        delete require.cache[id];
+        const fresh = require('../../js/features/logbook-ui.js');
+        assert.equal(typeof fresh.hangarLogbookUi, 'function');
+        assert.deepEqual(touched, [], 'cockpit must not be touched while the module loads');
+    } finally {
+        delete globalThis.cockpit;
+        delete require.cache[id];
+        require('../../js/features/logbook-ui.js');
+    }
+});
+
+test('a document that exists but is empty does not mount or throw at load time', () => {
+    const asked = [];
+    globalThis.document = {
+        readyState: 'complete',
+        getElementById(x) { asked.push(x); return null; }
+    };
+    const id = require.resolve('../../js/features/logbook-ui.js');
+    try {
+        delete require.cache[id];
+        const fresh = require('../../js/features/logbook-ui.js');
+        // It may look for its own container; it must not assume one is there.
+        assert.ok(asked.every((a) => a === 'hangar-logbook'));
+        assert.equal(typeof fresh.template(), 'string');
+    } finally {
+        delete globalThis.document;
+        delete require.cache[id];
+        require('../../js/features/logbook-ui.js');
+    }
+});
+
+test('every pure export survives being called with nothing at all', () => {
+    // Nothing here may throw a bare TypeError; the two that reject hostile input
+    // do it with a typed HangarError.
+    const tolerant = ['treeRowsFor', 'selectionSummary', 'timelineModel', 'momentFor',
+        'lsEntriesFor', 'parseFindOutput', 'breadcrumbsFor', 'parentOf', 'joinPath',
+        'normalizePath', 'formatBytes', 'absoluteLabel', 'clockLabel', 'badgeClassFor',
+        'remediationLabel', 'errorView', 'includePathsFrom', 'errorAlertClass',
+        'noticeAlertClass', 'unreadableFromMessages', 'unreadableFromError'];
+    tolerant.forEach((name) => {
+        assert.doesNotThrow(() => UI[name](undefined, undefined), `${name} threw on undefined`);
+        assert.doesNotThrow(() => UI[name](null, null), `${name} threw on null`);
+    });
+    ['listDirArgv', 'restorePlan'].forEach((name) => {
+        try {
+            UI[name](null, null, null, null);
+        } catch (e) {
+            assert.equal(e.name, 'HangarError', `${name} threw an untyped error`);
+        }
+    });
+});
+
+// --- hostile input to the pure layer --------------------------------------
+
+test('a value whose toString throws becomes empty rather than an untyped crash', () => {
+    const hostile = { path: { toString() { throw new Error('nope'); } } };
+    assert.doesNotThrow(() => UI.includePathsFrom([hostile]));
+    assert.deepEqual(UI.includePathsFrom([hostile]), []);
+    assert.equal(UI.normalizePath({ toString() { throw new Error('nope'); } }), '/');
+});
+
+test('absoluteLabel refuses a time outside the Date range instead of printing NaN', () => {
+    // 1e20 is past the 8.64e15 Date ceiling; the Invalid Date it makes is truthy,
+    // so an unchecked path prints 'NaN undefined NaN NaN:NaN'.
+    assert.equal(UI.absoluteLabel(1e20), 'unknown');
+    assert.equal(UI.absoluteLabel('99999999999999999999'), 'unknown');
+    assert.equal(UI.absoluteLabel(Number.MAX_VALUE), 'unknown');
+    assert.equal(UI.clockLabel(1e20), '--:--');
+    assert.ok(!/NaN|undefined/.test(UI.absoluteLabel(-1e20)));
+});
+
+test('absoluteLabel copes with zero and negative epoch values', () => {
+    // Before 1970 is a real mtime on restored archives, so it is rendered rather
+    // than treated as missing.
+    assert.equal(UI.absoluteLabel(0), '1 Jan 1970 00:00');
+    assert.equal(UI.absoluteLabel(-1), '31 Dec 1969 23:59');
+    assert.equal(UI.absoluteLabel(''), 'unknown');
+});
+
+test('formatBytes never reaches exponential notation, however large the claim', () => {
+    [1e300, Number.MAX_VALUE, 1e21].forEach((n) => {
+        const label = UI.formatBytes(n);
+        assert.ok(!/e\+/.test(label), `exponential leaked: ${label}`);
+        assert.ok(!/NaN/.test(label), `NaN leaked: ${label}`);
+        assert.match(label, /PB$/);
+    });
+});
+
+test('formatBytes rejects wrong types rather than guessing', () => {
+    [[], {}, true, false, '12 kB', NaN, -Infinity].forEach((v) => {
+        assert.equal(UI.formatBytes(v), '0 B', `formatBytes(${String(v)})`);
+    });
+});
+
+test('path helpers keep quotes, newlines and unicode instead of mangling them', () => {
+    assert.equal(UI.normalizePath('/data/"quoted"/x'), '/data/"quoted"/x');
+    assert.equal(UI.normalizePath("/data/it's/x"), "/data/it's/x");
+    assert.equal(UI.joinPath('/data', 'a\nb'), '/data/a\nb');
+    assert.equal(UI.joinPath('/data', 'Ünlü — çığ'), '/data/Ünlü — çığ');
+    assert.equal(UI.parentOf('/данные/файл'), '/данные');
+});
+
+test('breadcrumbsFor survives a path made of separators alone', () => {
+    assert.deepEqual(UI.breadcrumbsFor('////'), [{ label: 'Snapshot root', path: '/' }]);
+    assert.deepEqual(UI.breadcrumbsFor(undefined), [{ label: 'Snapshot root', path: '/' }]);
+});
+
+test('listDirArgv refuses a directory name that would split the reply it parses back', () => {
+    // The reply is parsed line by line, so a newline in the path would attribute
+    // entries to a directory the breadcrumb is not pointing at.
+    assert.throws(() => UI.listDirArgv('/mnt/a\nb'),
+        (e) => e.name === 'HangarError' && /cannot list/.test(e.message));
+    assert.throws(() => UI.listDirArgv('/mnt/a' + NUL + 'b'), (e) => e.name === 'HangarError');
+    assert.throws(() => UI.listDirArgv('/mnt/a\rb'), (e) => e.name === 'HangarError');
+});
+
+test('listDirArgv passes a name with quotes and spaces straight through', () => {
+    // argv, never a shell string: quoting is not this layer's problem.
+    const argv = UI.listDirArgv('/mnt/it\'s "here"/x');
+    assert.equal(argv[1], '/mnt/it\'s "here"/x');
+});
+
+test('parseFindOutput refuses to invent sizes from hostile fields', () => {
+    const out = UI.parseFindOutput([
+        'f\tnonsense\t0\ta',
+        'f\t-500\t0\tb',
+        'f\t1e309\t0\tc',
+        'f\t\t\t'
+    ].join('\n'), '/x');
+    const byName = {};
+    out.forEach((e) => { byName[e.name] = e; });
+    assert.equal(byName.a.size, 0);
+    assert.equal(byName.b.size, -500);              // find said so; do not lie about it
+    assert.equal(byName.c.size, 0);                 // Infinity is not a size
+    assert.equal(out.length, 3, 'a nameless row is no row');
+});
+
+test('parseFindOutput keeps unicode and quotes in names', () => {
+    const out = UI.parseFindOutput('f\t10\t0\tÜnlü "belge".txt\n', '/docs');
+    assert.equal(out[0].name, 'Ünlü "belge".txt');
+    assert.equal(out[0].path, '/docs/Ünlü "belge".txt');
+});
+
+test('parseFindOutput ignores a directory argument of the wrong type', () => {
+    assert.equal(UI.parseFindOutput('f\t1\t0\tx\n', null)[0].path, '/x');
+    assert.equal(UI.parseFindOutput('f\t1\t0\tx\n', 42)[0].path, '42/x');
+});
+
+test('lsEntriesFor is not confused by prototype-shaped paths or huge sizes', () => {
+    const nodes = [
+        { name: '__proto__', type: 'file', path: '/__proto__', size: 1 },
+        { name: 'constructor', type: 'dir', path: '/constructor', size: 0 },
+        { name: 'big', type: 'file', path: '/big', size: 1e308 }
+    ];
+    const out = UI.lsEntriesFor(nodes, '/');
+    assert.deepEqual(out.map((e) => e.name).sort(), ['__proto__', 'big', 'constructor']);
+    assert.equal({}.polluted, undefined);
+});
+
+test('lsEntriesFor tolerates nodes whose fields are the wrong type', () => {
+    const out = UI.lsEntriesFor([
+        { name: 42, type: 7, path: '/x', size: 'big' },
+        { path: '/y' },
+        { name: 'z', path: null }
+    ], '/');
+    assert.deepEqual(out.map((e) => e.name), ['42', 'y']);
+    assert.equal(out[0].size, 0);
+    assert.equal(out[0].type, 'file');
+});
+
+test('treeRowsFor survives an mtime no calendar can hold', () => {
+    const rows = UI.treeRowsFor([{ name: 'x', type: 'file', path: '/x', mtime: 1e20 }], {});
+    assert.equal(rows[0].mtimeLabel, 'unknown');
+});
+
+test('treeRowsFor does not choke on a badge map that is not a map', () => {
+    ['string', 42, true, []].forEach((badges) => {
+        assert.doesNotThrow(() => UI.treeRowsFor(ENTRIES, badges));
+    });
+});
+
+test('compareEntries orders unicode names without throwing', () => {
+    const rows = UI.treeRowsFor([
+        { name: 'çilek', type: 'file', path: '/a' },
+        { name: 'Ada', type: 'file', path: '/b' },
+        { name: 'ada', type: 'file', path: '/c' }
+    ], {});
+    assert.equal(rows.length, 3);
+    assert.equal(rows[0].name.toLowerCase(), 'ada');
+});
+
+test('selectionSummary ignores negative and absurd sizes', () => {
+    assert.equal(UI.selectionSummary([{ type: 'file', size: -100 }]), '1 file');
+    assert.equal(UI.selectionSummary([{ type: 'file', size: 1e309 }]), '1 file');
+});
+
+test('timelineModel refuses a snapshot list that is not a list', () => {
+    assert.throws(() => UI.timelineModel('nope', NOW), (e) => e.name === 'HangarError');
+});
+
+test('timelineModel keeps undated snapshots reachable rather than dropping them', () => {
+    // A snapshot the user cannot reach is a file the user cannot restore.
+    const bands = UI.timelineModel([{ id: 'x', time: 'not a date' }], NOW);
+    assert.equal(bands.length, 1);
+    assert.equal(bands[0].moments[0].id, 'x');
+    assert.equal(bands[0].moments[0].absolute, 'unknown');
+});
+
+test('momentFor tolerates a snapshot that is not an object', () => {
+    assert.equal(UI.momentFor(null, NOW).id, '');
+    assert.equal(UI.momentFor('2026-08-01T12:00:00Z', NOW).relative, 'just now');
+    assert.deepEqual(UI.momentFor({ paths: 'not-a-list' }, NOW).paths, []);
+});
+
+// --- the selection cannot silently become "everything" --------------------
+
+test('includePathsFrom drops entries that name nothing', () => {
+    // normalizePath(null) is '/', so coercing a hole in the selection would turn
+    // it into the snapshot root — the whole system, in original mode.
+    assert.deepEqual(UI.includePathsFrom([null, undefined, '', '   ', {}, { path: '' }]), []);
+});
+
+test('includePathsFrom keeps a genuine root selection', () => {
+    assert.deepEqual(UI.includePathsFrom([{ path: '/' }]), ['/']);
+});
+
+test('restorePlan with a hole in the selection does not restore the whole snapshot', () => {
+    const plan = UI.restorePlan([null, { path: '' }], 'original', '', { snapshot: 'abc' });
+    assert.deepEqual(plan.include, []);
+    assert.equal(plan.valid, false);
+    assert.ok(!plan.warnings.some((w) => /whole snapshot/.test(w)));
+});
+
+test('restorePlan refuses a target containing a line break or a NUL', () => {
+    ['/var/tmp/a\nb', '/var/tmp/a' + NUL + 'b', '/var/tmp/a\rb'].forEach((target) => {
+        const plan = UI.restorePlan(SEL, 'alternate', target, { snapshot: 'abc' });
+        assert.equal(plan.valid, false, `accepted ${JSON.stringify(target)}`);
+        assert.ok(plan.problems.some((p) => /control characters/.test(p)));
+        assert.equal(plan.target, '');
+    });
+});
+
+test('restorePlan keeps quotes and unicode in an otherwise valid target', () => {
+    const plan = UI.restorePlan(SEL, 'alternate', '/var/tmp/"geri yükle"', { snapshot: 'abc' });
+    assert.equal(plan.valid, true);
+    assert.equal(plan.target, '/var/tmp/"geri yükle"');
+});
+
+test('restorePlan rejects every wrong-typed mode with a typed error', () => {
+    [0, 42, [], {}, true].forEach((mode) => {
+        assert.throws(() => UI.restorePlan(SEL, mode, '/var/tmp', { snapshot: 'a' }),
+            (e) => e.name === 'HangarError', `mode ${String(mode)} was accepted`);
+    });
+});
+
+test('restorePlan treats a missing opts bag as no snapshot rather than crashing', () => {
+    const plan = UI.restorePlan(SEL, 'alternate', '/var/tmp');
+    assert.equal(plan.valid, false);
+    assert.ok(plan.problems.some((p) => /moment/.test(p)));
+});
+
+// --- errors become buttons, and non-fatal ones become warnings ------------
+
+test('errorAlertClass never paints a partial success as a failure', () => {
+    const partial = UI.errorView(Errors.create('READ_ERRORS', 'some files were unreadable'));
+    const fatal = UI.errorView(Errors.create('REPO_LOCKED', 'locked'));
+    assert.equal(UI.errorAlertClass(partial), 'alert alert-warning');
+    assert.equal(UI.errorAlertClass(fatal), 'alert alert-danger');
+    assert.equal(UI.errorAlertClass(null), '');
+});
+
+test('a cancelled operation is neutral, not a failure', () => {
+    const view = UI.errorView(Errors.create('CANCELLED', 'Operation was cancelled'));
+    assert.equal(view.fatal, false);
+    assert.equal(UI.errorAlertClass(view), 'alert alert-warning');
+    assert.equal(view.action, null);
+});
+
+test('noticeAlertClass maps the three notice kinds and defaults to success', () => {
+    assert.equal(UI.noticeAlertClass('warning'), 'alert alert-warning');
+    assert.equal(UI.noticeAlertClass('info'), 'alert alert-info');
+    assert.equal(UI.noticeAlertClass('success'), 'alert alert-success');
+    assert.equal(UI.noticeAlertClass(undefined), 'alert alert-success');
+});
+
+test('unreadableFromMessages names the file and the reason, once each', () => {
+    const out = UI.unreadableFromMessages([
+        { message_type: 'error', item: '/var/lib/x', message: 'permission denied' },
+        { message_type: 'error', item: '/var/lib/x', message: 'permission denied' },
+        { message_type: 'error', item: '/var/lib/y' },
+        { message_type: 'error', message: 'no item recorded' },
+        null,
+        'a bare string'
+    ]);
+    assert.deepEqual(out, [
+        '/var/lib/x — permission denied',
+        '/var/lib/y',
+        'no item recorded',
+        'a bare string'
+    ]);
+});
+
+test('unreadableFromMessages tolerates junk instead of rendering "undefined"', () => {
+    assert.deepEqual(UI.unreadableFromMessages(null), []);
+    assert.deepEqual(UI.unreadableFromMessages('not a list'), []);
+    assert.deepEqual(UI.unreadableFromMessages([{}, { item: '   ' }]), []);
+});
+
+test('unreadableFromError recovers the file list out of a typed read error', () => {
+    const stderr = [
+        '{"message_type":"error","item":"/proc/1/mem","message":"permission denied"}',
+        'restic: some plain noise',
+        '{"message_type":"exit_error","code":3,"message":"read errors"}'
+    ].join('\n');
+    const e = Errors.create('READ_ERRORS', 'some files were unreadable', { stderr: stderr });
+    assert.deepEqual(UI.unreadableFromError(e), ['/proc/1/mem — permission denied']);
+});
+
+test('unreadableFromError returns nothing when there is nothing to list', () => {
+    assert.deepEqual(UI.unreadableFromError(null), []);
+    assert.deepEqual(UI.unreadableFromError(new Error('boom')), []);
+    assert.deepEqual(UI.unreadableFromError(Errors.create('READ_ERRORS', 'x')), []);
+});
+
+// --- typed failures reaching the screen ------------------------------------
+
+test('a locked repository offers Unlock rather than a toast', async () => {
+    const c = attached();
+    await withCockpit(spawnFailure(11, ''), () => c.loadSnapshots());
+    assert.equal(c.error.kind, 'REPO_LOCKED');
+    assert.equal(c.error.action, 'unlock');
+    assert.equal(c.error.actionLabel, 'Unlock repository');
+    assert.equal(c.errorClass(), 'alert alert-danger');
+    assert.equal(c.busy, false);
+});
+
+test('a wrong password offers a re-prompt', async () => {
+    const c = attached();
+    await withCockpit(spawnFailure(12, ''), () => c.loadSnapshots());
+    assert.equal(c.error.kind, 'WRONG_PASSWORD');
+    assert.equal(c.error.action, 'reprompt');
+    assert.equal(c.error.actionLabel, 'Enter password');
+});
+
+test('a missing repository offers to initialise it', async () => {
+    const c = attached();
+    await withCockpit(spawnFailure(10, ''), () => c.loadSnapshots());
+    assert.equal(c.error.kind, 'REPO_MISSING');
+    assert.equal(c.error.action, 'init');
+});
+
+test('a full destination offers the free-space remediation', async () => {
+    const c = attached();
+    await withCockpit(spawnFailure(1, 'save: write /srv/backup: no space left on device'),
+        () => c.loadSnapshots());
+    assert.equal(c.error.kind, 'NO_SPACE');
+    assert.equal(c.error.action, 'free-space');
+});
+
+test('an unreachable backend offers retry', async () => {
+    const c = attached();
+    await withCockpit(spawnFailure(1, 'dial tcp 10.0.0.9:22: connection refused'),
+        () => c.loadSnapshots());
+    assert.equal(c.error.kind, 'NETWORK');
+    assert.equal(c.error.action, 'retry');
+});
+
+test('read errors reaching the screen render as a warning listing the files', async () => {
+    // The design rule: exit 3 is a PARTIAL SUCCESS. It must never wear the
+    // failure colour, and it must name what could not be read.
+    const c = attached();
+    const stderr = '{"message_type":"error","item":"/srv/x","message":"permission denied"}';
+    await withCockpit(spawnFailure(3, stderr), () => c.loadSnapshots());
+    assert.equal(c.error.kind, 'READ_ERRORS');
+    assert.equal(c.error.fatal, false);
+    assert.equal(c.errorClass(), 'alert alert-warning');
+    assert.deepEqual(c.unreadable, ['/srv/x — permission denied']);
+    assert.equal(c.unreadableTitle, 'Some files could not be read.');
+    assert.equal(c.showUnreadable, true, 'a partial result lists what it skipped');
+});
+
+test('a repository definition restic cannot use fails typed, not with a raw TypeError', async () => {
+    const c = UI.hangarLogbookUi();
+    c.repoId = 'nas';
+    c.repo = { id: 'nas', kind: 'nonsense-backend' };
+    await c.loadSnapshots();
+    assert.ok(c.error, 'an unusable repository must surface');
+    assert.match(c.error.message, /repository kind/i);
+    assert.equal(c.busy, false);
+});
+
+test('a repository id that is not a legal filename fails typed', async () => {
+    const c = UI.hangarLogbookUi();
+    c.repoId = '../../etc/shadow';
+    c.repo = LOCAL_REPO;
+    await c.loadSnapshots();
+    assert.ok(c.error);
+    assert.equal(c.busy, false);
+});
+
+test('a channel that throws when it opens rejects rather than escaping the try', async () => {
+    const c = attached();
+    await withCockpit(() => { throw new Error('no superuser bridge'); }, () => c.loadSnapshots());
+    assert.ok(c.error);
+    assert.match(c.error.message, /superuser bridge/);
+    assert.equal(c.busy, false);
+});
+
+test('unparseable snapshot output fails typed instead of rendering an empty scrubber', async () => {
+    const c = attached();
+    await withCockpit(() => Promise.resolve('<html>proxy error</html>'), () => c.loadSnapshots());
+    assert.ok(c.error, 'garbage must not silently become "no snapshots"');
+    assert.deepEqual(c.bands, []);
+});
+
+// --- the listing is partial, not silently short ---------------------------
+
+test('one unreadable repository definition warns instead of vanishing', async () => {
+    await withPatched(Config, {
+        listRepos: () => Promise.resolve(['nas', 'broken']),
+        readRepo: (id) => id === 'nas'
+            ? Promise.resolve({ kind: 'local', path: '/srv/backup' })
+            : Promise.reject(Errors.create('GENERIC', 'Could not read /etc/hangar/repos/broken.json'))
+    }, async () => {
+        const c = UI.hangarLogbookUi();
+        await withCockpit(spawnFailure(10, ''), () => c.loadRepos());
+        assert.deepEqual(c.repos.map((r) => r.id), ['nas'], 'the readable one still lists');
+        assert.equal(c.unreadable.length, 1);
+        assert.match(c.unreadable[0], /broken\.json/);
+        assert.match(c.unreadableTitle, /could not be read/);
+        c.clearIdle();
+    });
+});
+
+test('an empty repository definition is reported, not treated as absent', async () => {
+    await withPatched(Config, {
+        listRepos: () => Promise.resolve(['hollow']),
+        readRepo: () => Promise.resolve(null)
+    }, async () => {
+        const c = UI.hangarLogbookUi();
+        await c.loadRepos();
+        assert.deepEqual(c.repos, []);
+        assert.equal(c.unreadable.length, 1);
+        assert.match(c.unreadable[0], /empty/);
+    });
+});
+
+test('a listing that fails outright surfaces as an error with a remediation', async () => {
+    await withPatched(Config, {
+        listRepos: () => Promise.reject(Errors.create('REPO_LOCKED', 'locked'))
+    }, async () => {
+        const c = UI.hangarLogbookUi();
+        await c.loadRepos();
+        assert.equal(c.error.action, 'unlock');
+        assert.equal(c.busy, false);
+    });
+});
+
+// --- the file tree ---------------------------------------------------------
+
+test('a tree that cannot be read leaves a breadcrumb the user can climb out of', async () => {
+    const c = attached();
+    c.moment = { id: 'abc', snapshot: { id: 'abc', time: '2026-08-01T10:00:00Z' } };
+    c.cwd = '/var/log';
+    c.reader = 'ls';
+    await withCockpit(spawnFailure(11, ''), () => c.loadTree());
+    assert.equal(c.error.action, 'unlock');
+    assert.deepEqual(c.rows, []);
+    assert.deepEqual(c.crumbs.map((x) => x.path), ['/', '/var', '/var/log']);
+    assert.equal(c.busy, false);
+});
+
+test('losing the diff costs badges, never the file tree', async () => {
+    const c = attached();
+    c.bands = UI.timelineModel(SNAPS, NOW);
+    c.moment = c.bands[0].moments[0];
+    await withCockpit(spawnFailure(11, ''), () => c.loadBadges());
+    assert.deepEqual(c.badges, {});
+    assert.equal(c.error, null, 'a decorative failure must not become a screen error');
+});
+
+test('a backend needing credentials falls back before mounting, with a reason', async () => {
+    const c = UI.hangarLogbookUi();
+    c.repoId = 'off';
+    c.repo = { id: 'off', kind: 's3', endpoint: 's3.eu.amazonaws.com', bucket: 'b',
+        accessKeyId: 'AK', secretAccessKey: 'S' };
+    assert.equal(await c.ensureMount(), false);
+    assert.equal(c.reader, 'ls');
+    assert.match(c.fallbackReason, /credentials/);
+});
+
+test('a mount that cannot be made falls back rather than failing the screen', async () => {
+    await withPatched(Core, {
+        isMounted: () => Promise.reject(Errors.create('GENERIC', 'fuse3 is not installed'))
+    }, async () => {
+        const c = attached();
+        assert.equal(await c.ensureMount(), false);
+        assert.equal(c.reader, 'ls');
+        assert.equal(c.fallbackReason, 'fuse3 is not installed');
+        assert.equal(c.error, null);
+    });
+});
+
+test('the mount runtime cap is always the positive integer systemd insists on', async () => {
+    const seen = [];
+    await withPatched(Core, {
+        isMounted: () => Promise.resolve({ mounted: false }),
+        mount: (o) => { seen.push(o); return Promise.resolve({}); },
+        mountPoint: () => '/run/hangar/mnt/nas'
+    }, async () => {
+        for (const idle of [900, 100.3, 1e12, -5, 'nonsense', 0]) {
+            const c = attached();
+            c.idleSec = idle;
+            await c.ensureMount();
+            c.clearIdle();
+        }
+        assert.equal(seen.length, 6);
+        seen.forEach((o) => {
+            assert.ok(Number.isInteger(o.maxRuntimeSec), `not an integer: ${o.maxRuntimeSec}`);
+            assert.ok(o.maxRuntimeSec > 0, `not positive: ${o.maxRuntimeSec}`);
+        });
+    });
+});
+
+test('an unmount that fails is swallowed rather than blocking the screen', async () => {
+    await withPatched(Core, {
+        unmount: () => Promise.reject(new Error('unit not loaded'))
+    }, async () => {
+        const c = attached();
+        c.reader = 'mount';
+        await c.releaseMount();
+        assert.equal(c.reader, 'none');
+        assert.equal(c.error, null);
+    });
+});
+
+// --- the idle timer --------------------------------------------------------
+
+test('an absurd idle timeout cannot collapse to an instant unmount', () => {
+    // setTimeout clamps anything past the 32-bit ceiling to 1ms, which would drop
+    // the mount the moment the screen opened.
+    const c = UI.hangarLogbookUi();
+    [1e12, Number.MAX_VALUE, Infinity].forEach((v) => {
+        c.idleSec = v;
+        assert.ok(c.idleMs() <= 86400 * 1000, `not clamped: ${c.idleMs()}`);
+        assert.ok(c.idleMs() >= 60 * 1000);
+    });
+});
+
+test('a nonsense or negative idle timeout falls back to something usable', () => {
+    const c = UI.hangarLogbookUi();
+    [-5, 0, NaN, 'nonsense', null, undefined, {}].forEach((v) => {
+        c.idleSec = v;
+        const ms = c.idleMs();
+        assert.ok(Number.isFinite(ms) && ms >= 60 * 1000, `bad idleMs for ${String(v)}: ${ms}`);
+    });
+});
+
+// --- remediation actually remediates --------------------------------------
+
+test('Unlock runs restic unlock and then reloads the scrubber', async () => {
+    const ops = [];
+    await withPatched(Restic, { run: (op) => { ops.push(op); return Promise.resolve({ status: 'ok' }); } },
+        async () => {
+            const c = attached();
+            c.error = UI.errorView(Errors.create('REPO_LOCKED', 'locked'));
+            await withCockpit(() => Promise.resolve('[]'), () => c.remediate());
+            assert.deepEqual(ops, ['unlock']);
+            assert.equal(c.error, null);
+            assert.equal(c.busy, false);
+            c.clearIdle();
+        });
+});
+
+test('Initialise runs restic init', async () => {
+    const ops = [];
+    await withPatched(Restic, { run: (op) => { ops.push(op); return Promise.resolve({ status: 'ok' }); } },
+        async () => {
+            const c = attached();
+            c.error = UI.errorView(Errors.create('REPO_MISSING', 'missing'));
+            await withCockpit(() => Promise.resolve('[]'), () => c.remediate());
+            assert.deepEqual(ops, ['init']);
+            assert.equal(c.error, null);
+            c.clearIdle();
+        });
+});
+
+test('a remediation that itself fails replaces the error rather than clearing it', async () => {
+    await withPatched(Restic, { run: () => Promise.reject(Errors.create('WRONG_PASSWORD', 'wrong password')) },
+        async () => {
+            const c = attached();
+            c.error = UI.errorView(Errors.create('REPO_LOCKED', 'locked'));
+            await c.remediate();
+            assert.equal(c.error.kind, 'WRONG_PASSWORD');
+            assert.equal(c.error.action, 'reprompt');
+            assert.equal(c.busy, false);
+        });
+});
+
+test('the password re-prompt stores the new password and clears the error', async () => {
+    const written = [];
+    await withPatched(Secrets, { writeKey: (id, pw) => { written.push([id, pw]); return Promise.resolve(); } },
+        () => withDialogs({ passwordDialog: () => Promise.resolve('hünkar') }, async () => {
+            const c = attached();
+            c.error = UI.errorView(Errors.create('WRONG_PASSWORD', 'wrong password'));
+            await withCockpit(() => Promise.resolve('[]'), () => c.remediate());
+            assert.deepEqual(written, [['nas', 'hünkar']]);
+            assert.equal(c.error, null);
+            c.clearIdle();
+        }));
+});
+
+test('dismissing the password prompt leaves the error standing', async () => {
+    // Clearing it would claim a password was accepted when none was entered.
+    const written = [];
+    await withPatched(Secrets, { writeKey: (id, pw) => { written.push(pw); return Promise.resolve(); } },
+        () => withDialogs({ passwordDialog: () => Promise.resolve(null) }, async () => {
+            const c = attached();
+            c.error = UI.errorView(Errors.create('WRONG_PASSWORD', 'wrong password'));
+            await c.remediate();
+            assert.deepEqual(written, []);
+            assert.ok(c.error, 'the error must survive a dismissed prompt');
+            assert.equal(c.error.kind, 'WRONG_PASSWORD');
+            assert.equal(c.busy, false);
+        }));
+});
+
+test('a missing password dialog is a typed failure, not "is not a function"', async () => {
+    const c = attached();
+    c.error = UI.errorView(Errors.create('WRONG_PASSWORD', 'wrong password'));
+    await c.remediate();
+    assert.ok(c.error);
+    assert.match(c.error.message, /password dialog/i);
+    assert.ok(!/is not a function/.test(c.error.message));
+    assert.equal(c.busy, false);
+});
+
+test('the free-space remediation names the destination and keeps the error', async () => {
+    const c = attached();
+    c.error = UI.errorView(Errors.create('NO_SPACE', 'no space left on the backup destination'));
+    await c.remediate();
+    assert.equal(c.noticeKind, 'warning');
+    assert.match(c.notice, /\/srv\/backup/);
+    assert.ok(c.error, 'hangar cannot free the space, so the condition still stands');
+});
+
+test('the retry remediation clears the error and reloads', async () => {
+    const c = attached();
+    c.error = UI.errorView(Errors.create('NETWORK', 'connection refused'));
+    await withCockpit(() => Promise.resolve('[]'), () => c.remediate());
+    assert.equal(c.error, null);
+    assert.deepEqual(c.snapshots, []);
+    c.clearIdle();
+});
+
+test('the list-unreadable remediation reveals a list, and says so when there is none', async () => {
+    const c = attached();
+    c.error = UI.errorView(Errors.create('READ_ERRORS', 'some files were unreadable'));
+    await c.remediate();
+    assert.equal(c.showUnreadable, true);
+    assert.equal(c.unreadable.length, 1);
+    assert.match(c.unreadable[0], /journald/);
+    await c.remediate();
+    assert.equal(c.showUnreadable, false, 'the button toggles');
+});
+
+test('every remediation the errors module can emit is handled by the screen', async () => {
+    await withPatched(Restic, { run: () => Promise.resolve({ status: 'ok' }) },
+        () => withPatched(Secrets, { writeKey: () => Promise.resolve() },
+            () => withDialogs({ passwordDialog: () => Promise.resolve('pw') }, async () => {
+                for (const kind of Object.keys(Errors.REMEDIATION)) {
+                    const c = attached();
+                    c.error = UI.errorView(Errors.create(kind, kind));
+                    assert.ok(c.error.actionLabel, `no button label for ${kind}`);
+                    await withCockpit(() => Promise.resolve('[]'), () => c.remediate());
+                    // Handled means something observably happened: the error was
+                    // cleared, a notice explained why it could not be, or the
+                    // unreadable list opened.
+                    const acted = c.error === null || c.notice !== '' || c.showUnreadable;
+                    assert.ok(acted, `remediation for ${kind} did nothing`);
+                    c.clearIdle();
+                }
+            })));
+});
+
+test('remediate does nothing at all when the error carries no action', async () => {
+    const c = attached();
+    c.error = UI.errorView(Errors.create('GO_RUNTIME', 'restic crashed'));
+    assert.equal(c.error.action, null);
+    await c.remediate();
+    assert.ok(c.error, 'an error with no one-click fix stays on screen');
+    assert.equal(c.busy, false);
+});
+
+// --- restore outcomes ------------------------------------------------------
+
+const PLAN = { snapshot: 'abc', target: '/var/tmp/hangar-restore', include: ['/etc/hosts'], verify: false };
+
+test('a partial restore is a warning naming the unreadable files, never a failure', async () => {
+    // Design §8: exit 3 wrote what it could read. Reporting it as a failure would
+    // train the user to ignore the failures that matter.
+    await withPatched(Restic, {
+        run: () => Promise.resolve({
+            status: 'partial',
+            errors: [
+                { message_type: 'error', item: '/etc/shadow', message: 'permission denied' },
+                { message_type: 'error', item: '/proc/1/mem', message: 'operation not permitted' }
+            ],
+            summary: {}, progress: null
+        })
+    }, async () => {
+        const c = attached();
+        await c.runRestore(PLAN);
+        assert.equal(c.error, null, 'a partial success must not be an error');
+        assert.equal(c.noticeKind, 'warning');
+        assert.equal(c.noticeClass(), 'alert alert-warning');
+        assert.match(c.notice, /some files could not be read/i);
+        assert.deepEqual(c.unreadable, [
+            '/etc/shadow — permission denied',
+            '/proc/1/mem — operation not permitted'
+        ]);
+        assert.equal(c.showUnreadable, true, 'the list is opened, not hidden behind a click');
+        assert.equal(c.unreadableTitle, 'Some files could not be read.');
+        assert.equal(c.busy, false);
+    });
+});
+
+test('a cancelled restore is neutral, not an error and not a success', async () => {
+    await withPatched(Restic, { run: () => Promise.resolve({ status: 'cancelled', errors: [] }) },
+        async () => {
+            const c = attached();
+            await c.runRestore(PLAN);
+            assert.equal(c.error, null);
+            assert.equal(c.noticeKind, 'info');
+            assert.equal(c.noticeClass(), 'alert alert-info');
+            assert.match(c.notice, /cancelled/);
+        });
+});
+
+test('a successful restore says where the files went', async () => {
+    await withPatched(Restic, { run: () => Promise.resolve({ status: 'ok', errors: [] }) },
+        async () => {
+            const c = attached();
+            await c.runRestore(PLAN);
+            assert.equal(c.noticeKind, 'success');
+            assert.match(c.notice, /\/var\/tmp\/hangar-restore/);
+            assert.deepEqual(c.unreadable, []);
+        });
+});
+
+test('a failed restore surfaces the remediation and drops the stale success notice', async () => {
+    await withPatched(Restic, { run: () => Promise.reject(Errors.create('NO_SPACE', 'no space left')) },
+        async () => {
+            const c = attached();
+            c.notice = 'Restored to /somewhere.';
+            await c.runRestore(PLAN);
+            assert.equal(c.notice, '', 'a previous success must not sit next to a failure');
+            assert.equal(c.error.action, 'free-space');
+            assert.equal(c.errorClass(), 'alert alert-danger');
+            assert.equal(c.busy, false);
+            assert.equal(c.progress, null);
+        });
+});
+
+test('a restore result of an unexpected shape does not crash the screen', async () => {
+    for (const result of [null, undefined, {}, 'ok']) {
+        await withPatched(Restic, { run: () => Promise.resolve(result) }, async () => {
+            const c = attached();
+            await c.runRestore(PLAN);
+            assert.equal(c.busy, false);
+            assert.equal(c.error, null);
+        });
+    }
+});
+
+test('restore progress is rendered rather than merely stored', () => {
+    const c = attached();
+    assert.equal(c.progressLabel(), '');
+    c.progress = { message_type: 'status', percent_done: 0.4213, bytes_done: 2400000, total_bytes: 3e9 };
+    assert.equal(c.progressLabel(), '42% · 2.4 MB of 3 GB');
+});
+
+test('progressLabel refuses to render a nonsense percentage', () => {
+    const c = UI.hangarLogbookUi();
+    c.progress = { percent_done: 'nonsense', bytes_done: -1 };
+    assert.equal(c.progressLabel(), '');
+    c.progress = { percent_done: 7, bytes_done: 0 };
+    assert.equal(c.progressLabel(), '100%');       // clamped, never '700%'
+    c.progress = { percent_done: -3 };
+    assert.equal(c.progressLabel(), '0%');
+});
+
+test('the restore button reports a missing dialog instead of hanging on it', async () => {
+    // Without the partial there is no listener, so the await would never settle
+    // and the button would look broken with nothing said.
+    const c = attached();
+    c.moment = { id: 'abc', absolute: '1 Aug 2026 10:00' };
+    c.selected = [{ path: '/etc/hosts', name: 'hosts', isDir: false, size: 1 }];
+    await c.restore();
+    assert.ok(c.error);
+    assert.match(c.error.message, /restore dialog/i);
+});
+
+test('restore does nothing when nothing is selected or no moment is chosen', async () => {
+    const c = attached();
+    c.moment = { id: 'abc' };
+    await c.restore();
+    assert.equal(c.error, null);
+    c.selected = [{ path: '/x' }];
+    c.moment = null;
+    await c.restore();
+    assert.equal(c.error, null);
+});
+
+// --- selection guards ------------------------------------------------------
+
+test('a row with no path cannot be selected', () => {
+    const c = UI.hangarLogbookUi();
+    [null, undefined, {}, { path: '' }, 'string'].forEach((r) => c.toggle(r));
+    assert.deepEqual(c.selected, []);
+    assert.equal(c.isSelected(null), false);
+    c.clearIdle();
+});
+
+test('a selection that survived from an older render cannot summarise to nonsense', () => {
+    const c = UI.hangarLogbookUi();
+    c.selected = [null, { path: '/a', type: 'file', size: 1000 }];
+    assert.equal(c.selectionLabel(), '1 file (1 kB)');
+});
+
+// --- the restore dialog ----------------------------------------------------
+
+test('the dialog lists exactly the paths the plan will restore', () => {
+    const d = UI.hangarRestore();
+    d.selection = [{ path: '/etc/hosts' }, null, { path: '' }, { name: 'orphan' }, { path: '/etc/hosts' }];
+    // Entries that name nothing are gone, duplicates are collapsed, and what
+    // remains is character-for-character what restic will be handed.
+    assert.deepEqual(d.selectionPaths(), ['/etc/hosts', 'orphan']);
+    assert.deepEqual(d.selectionPaths(), d.plan().include);
+});
+
+test('a destructive restore fails closed when the confirmation dialog is missing', async () => {
+    let got = 'untouched';
+    const d = UI.hangarRestore();
+    d.selection = SEL;
+    d.snapshot = 'abc';
+    d.mode = 'original';
+    d._resolve = (v) => { got = v; };
+    await d.submit();
+    assert.equal(got, 'untouched', 'nothing may be restored without the confirmation');
+    assert.match(d.dialogError, /confirmation dialog/i);
+    assert.equal(d.open, false);
+});
+
+test('a confirmation dialog that throws stops the restore and says why', async () => {
+    await withDialogs({ confirmDialog: () => Promise.reject(new Error('modal is gone')) }, async () => {
+        let got = 'untouched';
+        const d = UI.hangarRestore();
+        d.selection = SEL;
+        d.snapshot = 'abc';
+        d.mode = 'original';
+        d._resolve = (v) => { got = v; };
+        await d.submit();
+        assert.equal(got, 'untouched');
+        assert.equal(d.dialogError, 'modal is gone');
+    });
+});
+
+test('a safe restore never consults the danger dialog at all', async () => {
+    let asked = 0;
+    await withDialogs({ confirmDialog: () => { asked++; return Promise.resolve(true); } }, async () => {
+        const d = UI.hangarRestore();
+        d.selection = SEL;
+        d.snapshot = 'abc';
+        d.target = '/var/tmp/restore';
+        d._resolve = () => {};
+        await d.submit();
+        assert.equal(asked, 0);
+    });
+});
+
+test('a target of "/" is treated as destructive by the dialog too', async () => {
+    const asked = [];
+    await withDialogs({ confirmDialog: (o) => { asked.push(o); return Promise.resolve(true); } },
+        async () => {
+            let got = null;
+            const d = UI.hangarRestore();
+            d.selection = SEL;
+            d.snapshot = 'abc';
+            d.target = '/';
+            d._resolve = (v) => { got = v; };
+            await d.submit();
+            assert.equal(asked.length, 1, 'restoring into "/" overwrites the originals');
+            assert.equal(asked[0].danger, true);
+            assert.ok(got.destructive);
+        });
+});
+
+test('the dialog reports a plan it cannot build without a destructive fallback', () => {
+    const d = UI.hangarRestore();
+    d.selection = SEL;
+    d.mode = 'sideways';
+    const plan = d.plan();
+    assert.equal(plan.valid, false);
+    assert.equal(plan.destructive, false, 'an unbuildable plan must never look destructive-ready');
+});
+
+// --- accessibility ---------------------------------------------------------
+
+function tagsWithClick(html) {
+    return [...html.matchAll(/<([a-zA-Z-]+)[^>]*?@click/g)].map((m) => m[1].toLowerCase());
+}
+
+test('every click target in the screen is a real button', () => {
+    const tags = tagsWithClick(UI.template());
+    assert.ok(tags.length >= 4);
+    tags.forEach((tag) => {
+        assert.equal(tag, 'button', `@click on <${tag}> — keyboard users cannot reach it`);
+    });
+});
+
+test('every click target in the restore modal is a real button', () => {
+    const tags = tagsWithClick(RESTORE_HTML);
+    assert.ok(tags.length >= 2);
+    tags.forEach((tag) => {
+        assert.equal(tag, 'button', `@click on <${tag}> in restore.html`);
+    });
+});
+
+test('every form control in the screen has a label bound to it', () => {
+    const html = UI.template();
+    // Static ids...
+    [...html.matchAll(/<(?:input|select|textarea)[^>]*\bid="([^"]+)"/g)].forEach((m) => {
+        assert.ok(html.includes(`for="${m[1]}"`), `no label for #${m[1]}`);
+    });
+    // ...and Alpine-bound ones, where the expression itself has to match.
+    const bound = [...html.matchAll(/<(?:input|select|textarea)[^>]*:id="([^"]+)"/g)];
+    assert.ok(bound.length >= 1);
+    bound.forEach((m) => {
+        assert.ok(html.includes(`:for="${m[1]}"`), `no bound label for :id="${m[1]}"`);
+    });
+});
+
+test('every form control in the restore modal has a label bound to it', () => {
+    const ids = [...RESTORE_HTML.matchAll(/<(?:input|select|textarea)[^>]*?\bid="([^"]+)"/g)];
+    assert.ok(ids.length >= 3);
+    ids.forEach((m) => {
+        assert.ok(RESTORE_HTML.includes(`for="${m[1]}"`), `no label for #${m[1]}`);
+    });
+});
+
+test('the only control with no visible text carries an aria-label', () => {
+    // btn-close renders an icon, so its name has to come from aria-label.
+    assert.match(RESTORE_HTML, /class="btn-close"[\s\S]*?aria-label="Close"/);
+});
+
+test('the scrubber owns its options through labelled groups, not orphaned divs', () => {
+    const html = UI.template();
+    assert.ok(html.includes('role="listbox"'));
+    assert.ok(html.includes('role="group"'), 'options directly under a listbox need a group wrapper');
+    assert.ok(html.includes('role="option"'));
+    assert.ok(html.includes(':aria-label="band.label"'));
+    // The visible band heading would otherwise be announced twice.
+    assert.ok(html.includes('aria-hidden="true"'));
+});
+
+test('status and failure regions announce themselves', () => {
+    const html = UI.template();
+    assert.ok(html.includes('role="alert"'), 'the error region must be a live alert');
+    assert.ok(html.includes('role="status"'), 'progress and notices must be announced');
+    assert.ok(html.includes('aria-live="polite"'));
+    assert.ok(html.includes(':aria-expanded="showUnreadable"'), 'the disclosure state must be exposed');
+});
+
+test('the error region takes its colour from the fatality of the error', () => {
+    const html = UI.template();
+    assert.ok(html.includes(':class="errorClass()"'),
+        'a hardcoded alert-danger would paint a partial success as a failure');
+    assert.ok(!/x-show="error"[^>]*alert-danger/.test(html));
+    assert.ok(html.includes(':class="noticeClass()"'));
+});
+
+// --- the feature is called Logbook -----------------------------------------
+
+test('neither the screen nor its modal mentions "Time Mach" + "ine"', () => {
+    // Spelled apart so this assertion cannot itself trip the smoke test.
+    const re = /time\s*machine/i;
+    assert.ok(!re.test(SRC), 'js/features/logbook-ui.js');
+    assert.ok(!re.test(RESTORE_HTML), 'html/modals/restore.html');
+});
+
+test('the source carries no stray NUL or carriage return', () => {
+    // A control character in a plain script loaded by Cockpit is a silent and very
+    // confusing failure.
+    assert.ok(SRC.indexOf(NUL) < 0, 'NUL byte in the source');
+    assert.ok(SRC.indexOf('\r') < 0, 'carriage return in the source');
+    assert.ok(RESTORE_HTML.indexOf(NUL) < 0);
+});

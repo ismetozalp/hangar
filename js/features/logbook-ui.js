@@ -107,6 +107,8 @@
     // Decimal units, matching cockpit.format_bytes, so a size shown here reads
     // the same as the same size shown anywhere else in the console.
     function formatBytes(bytes) {
+        // Number(true) is 1, so an unguarded boolean would render as a 1-byte file.
+        if (typeof bytes === 'boolean') return '0 B';
         const raw = Number(bytes);
         if (!Number.isFinite(raw) || raw <= 0) return '0 B';
         // Clamped rather than divided down: past MAX_SAFE_INTEGER the division
@@ -551,6 +553,11 @@
             return Promise.reject(e);
         }
         return spawnText(argv).catch((ex) => {
+            // An already-typed failure is one restic never got to see — the channel
+            // was refused, or there is no cockpit. Passing it through classifyExit
+            // would relabel it 'restic exited with an unexpected status' and lose
+            // the only sentence that told the user what actually went wrong.
+            if (E.isHangarError(ex)) throw ex;
             throw R.classifyExit(ex && ex.exit_status, (ex && (ex.message || ex.problem)) || '');
         });
     }
@@ -673,6 +680,10 @@
                     if (files.length) {
                         this.unreadable = files;
                         this.unreadableTitle = 'Some files could not be read.';
+                        // Open, not folded away: the rule is that a partial result
+                        // *lists* what it skipped. The remediation button then
+                        // folds it back once the user has read it.
+                        this.showUnreadable = true;
                     }
                 }
                 return view;

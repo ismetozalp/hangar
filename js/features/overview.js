@@ -125,18 +125,28 @@
     // owns the masking rules; this is the one place the UI has to remember them.
     function redactText(v, deps) {
         const S = (deps && deps.secrets) || Secrets;
-        let text;
-        try { text = v === null || v === undefined ? '' : String(v); } catch (e) { text = ''; }
-        if (!S || typeof S.redact !== 'function') return text;
-        try { return S.redact(text); } catch (e) { return text; }
+        const raw = v === null || v === undefined ? '' : text(v);
+        if (!S || typeof S.redact !== 'function') return raw;
+        // The redactor runs on the failure path; a failure inside it must not
+        // replace the message with nothing.
+        try { return S.redact(raw); } catch (e) { return raw; }
     }
+
+    // Last resort wording. An error alert that renders as an empty box with only a
+    // button is worse than a vague sentence: the user cannot tell what failed, and
+    // cannot tell whether the blank space is a bug or the message.
+    const UNDESCRIBED = 'The reason was not reported.';
 
     function errorMessage(e, deps) {
         if (!e) return '';
         let raw = '';
-        try { raw = (typeof e.message === 'string' && e.message) ? e.message : String(e); }
+        // A getter that throws is a real shape: cockpit channel errors are plain
+        // objects, and so is whatever a third-party promise rejected with.
+        try { raw = (typeof e.message === 'string' && e.message) ? e.message : text(e); }
         catch (x) { raw = ''; }
-        return redactText(raw, deps);
+        const out = redactText(raw, deps);
+        // Redaction can also empty a message that was entirely a secret.
+        return (typeof out === 'string' && out.trim() !== '') ? out : UNDESCRIBED;
     }
 
     // A typed error even when errors.js never loaded: an untyped TypeError escaping
@@ -495,7 +505,10 @@
         const E = d.restic || Restic;
         // A module that failed to load must not surface as "Cannot read properties
         // of null" in an alert box — every failure this screen shows is typed.
-        if (!R || !S || !E) throw failure(d, 'A core module required to read repository health is missing.');
+        if (!R || typeof R.buildUrl !== 'function' ||
+            !S || typeof S.keyPath !== 'function' ||
+            !E || typeof E.buildArgs !== 'function')
+            throw failure(d, 'A core module required to read repository health is missing.');
         return ['restic'].concat(E.buildArgs('stats', {
             repoUrl: R.buildUrl(repo),
             passwordFile: S.keyPath(obj(repo) ? repo.id : repo),
@@ -708,14 +721,16 @@
             // The engine still owns both restic-specific decisions here: buildArgs
             // makes the command line, parseStats reads the answer.
             async fetchStats(repo) {
-                if (!this.hasCockpit())
-                    throw failure(D, 'cockpit is not available.');
-                // statsArgv throws a typed error for a repository whose definition
-                // cannot produce a URL — an unknown kind, a missing bucket, an id
-                // that is not a legal filename. Left outside the try so it is not
-                // reclassified as a restic exit status it never had.
+                // The definition is checked before cockpit is: a repository with an
+                // unknown kind is broken whether or not a channel is available, and
+                // saying "cockpit is not available" about it sends the user looking
+                // in the wrong place. Both throws are typed, and both are outside the
+                // try below so neither is reclassified as a restic exit status it
+                // never had.
                 const argv = statsArgv(repo, D);
                 const environ = environList(repo, D);
+                if (!this.hasCockpit())
+                    throw failure(D, 'cockpit is not available.');
                 try {
                     const out = await cockpit.spawn(argv, {
                         superuser: 'require',
@@ -923,12 +938,18 @@
 
         // Whole-screen failure. Reading the configuration is the only thing that can
         // fail here, so retrying the read is the only honest action to offer.
-        '  <div x-show="error" class="alert alert-danger d-flex align-items-center gap-3" role="alert">',
-        '    <div class="flex-grow-1">',
-        '      <strong>Could not read the backup configuration.</strong>',
-        '      <div class="small" x-text="errorText(error)"></div>',
+        // x-show sets an inline `display: none`, but Bootstrap's `.d-flex` is
+        // `display: flex !important` and wins — so the two must never share an
+        // element or the box is permanently visible. The toggle goes on a plain
+        // wrapper; the flex layout stays inside it.
+        '  <div x-show="error">',
+        '    <div class="alert alert-danger d-flex align-items-center gap-3" role="alert">',
+        '      <div class="flex-grow-1">',
+        '        <strong>Could not read the backup configuration.</strong>',
+        '        <div class="small" x-text="errorText(error)"></div>',
+        '      </div>',
+        '      <button type="button" class="btn btn-sm btn-danger" @click="refresh()">Try again</button>',
         '    </div>',
-        '    <button type="button" class="btn btn-sm btn-danger" @click="refresh()">Try again</button>',
         '  </div>',
 
         // A partial listing: some files were unreadable, the rest are below. Amber
@@ -945,14 +966,16 @@
         '  </div>',
 
         // An action that failed carries its remediation with it, as a button.
-        '  <div x-show="actionError" class="alert alert-danger d-flex align-items-center gap-2 py-2 px-3"',
-        '       role="alert">',
-        '    <div class="flex-grow-1 small" x-text="errorText(actionError)"></div>',
-        '    <button type="button" class="btn btn-sm btn-danger" x-show="actionRemediation()"',
-        '            @click="runActionRemediation()"',
-        '            x-text="remediationLabel(actionRemediation())"></button>',
-        '    <button type="button" class="btn-close" aria-label="Dismiss this error"',
-        '            @click="clearAction()"></button>',
+        // Same rule as above: the x-show toggle must not carry `.d-flex`.
+        '  <div x-show="actionError">',
+        '    <div class="alert alert-danger d-flex align-items-center gap-2 py-2 px-3" role="alert">',
+        '      <div class="flex-grow-1 small" x-text="errorText(actionError)"></div>',
+        '      <button type="button" class="btn btn-sm btn-danger" x-show="actionRemediation()"',
+        '              @click="runActionRemediation()"',
+        '              x-text="remediationLabel(actionRemediation())"></button>',
+        '      <button type="button" class="btn-close" aria-label="Dismiss this error"',
+        '              @click="clearAction()"></button>',
+        '    </div>',
         '  </div>',
 
         // Empty state.

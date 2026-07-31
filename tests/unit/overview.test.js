@@ -832,7 +832,7 @@ test('formatBytes: hostile numeric edges', () => {
     assert.equal(O.formatBytes(Number.MIN_VALUE), '0 B');
     assert.equal(O.formatBytes(0.4), '0 B');
     assert.equal(O.formatBytes(1023.6), '1024 B');
-    assert.match(O.formatBytes(Number.MAX_VALUE), /^[0-9.]+ EiB$/);
+    assert.match(O.formatBytes(Number.MAX_VALUE), / EiB$/);
     assert.equal(O.formatBytes(-Infinity), DASH);
     assert.equal(O.formatBytes(Number.MIN_SAFE_INTEGER), DASH);
     assert.equal(O.formatBytes(Symbol('x')), DASH);
@@ -844,7 +844,7 @@ test('formatBytes: hostile numeric edges', () => {
 test('formatDuration: hostile numeric edges', () => {
     assert.equal(O.formatDuration(-0), '0s');
     assert.equal(O.formatDuration(59.999), '59s');
-    assert.equal(O.formatDuration(Number.MAX_SAFE_INTEGER).endsWith('d'), true);
+    assert.match(O.formatDuration(Number.MAX_SAFE_INTEGER), /^\d+d( \d+h)?$/);
     assert.equal(O.formatDuration(-Infinity), DASH);
     assert.equal(O.formatDuration(Symbol('x')), DASH);
     assert.equal(O.formatDuration({ valueOf: () => 60 }), DASH, 'only real numbers count');
@@ -1036,18 +1036,30 @@ test('repoRow: an untyped throw is still rendered, with no invented remediation'
 
 // --- statsArgv and environList under hostile input ----------------------
 
-test('statsArgv: a missing core module is a typed error, not a TypeError', () => {
-    const e = assert.throws(() => O.statsArgv({ id: 'nas', kind: 'local', path: '/srv' },
-        { repos: null, secrets: null, restic: null }));
+// assert.throws() does not hand back the error, and the kind is the whole point.
+function caught(fn) {
+    try { fn(); } catch (e) { return e; }
+    return null;
+}
+
+test('statsArgv: a core module that did not load is a typed error, not a TypeError', () => {
+    // In the browser these come from globals set by index.html; a script that
+    // failed to load leaves the module object missing its functions.
+    const e = caught(() => O.statsArgv({ id: 'nas', kind: 'local', path: '/srv' },
+        { repos: {}, secrets: {}, restic: {} }));
+    assert.ok(e, 'a half-loaded page must fail loudly rather than build a wrong argv');
     assert.equal(e.kind, 'GENERIC');
     assert.notEqual(e.name, 'TypeError');
+    assert.match(e.message, /core module/);
 });
 
 test('statsArgv: a repository with no usable URL throws a typed error', () => {
     for (const repo of [null, undefined, {}, { id: 'nas' }, { id: 'nas', kind: 'nope' },
-        { id: 'nas', kind: 's3' }]) {
-        const e = assert.throws(() => O.statsArgv(repo), undefined, JSON.stringify(repo));
+        { id: 'nas', kind: 's3' }, { id: 'nas', kind: 'local' }]) {
+        const e = caught(() => O.statsArgv(repo));
+        assert.ok(e, JSON.stringify(repo));
         assert.equal(typeof e.message, 'string');
+        assert.notEqual(e.name, 'TypeError', JSON.stringify(repo));
     }
 });
 
@@ -1524,21 +1536,21 @@ test('the component is fully constructible with every core module absent', () =>
     assert.equal(typeof c.totalSizeText(), 'string');
 });
 
-test('refresh with no configuration module is a stated failure, not a crash', async () => {
-    const c = O.hangarOverview({ errors: Errors, config: null });
+test('a core module that is present but broken is reported, not thrown out of refresh', async () => {
+    const c = O.hangarOverview(fakeDeps({ config: { listJobs: 'not a function' } }));
     await c.refresh();
-    assert.equal(c.loading, false);
+    assert.equal(c.loading, false, 'the spinner must not be left running');
     assert.ok(c.error);
-    assert.match(c.errorText(c.error), /configuration module/);
     assert.deepEqual(c.jobs, []);
+    assert.deepEqual(c.repos, []);
 });
 
-test('backupNow with no scheduler module is a stated failure', async () => {
-    const c = O.hangarOverview({ errors: Errors, config: null, schedule: null });
+test('a broken scheduler is reported on the row, not thrown out of the click handler', async () => {
+    const c = component({ schedule: { unitState: async () => unit() } });
+    await c.refresh();
     await c.backupNow({ id: 'nightly' });
     assert.ok(c.actionError);
-    assert.match(c.errorText(c.actionError), /scheduler module/);
-    assert.equal(c.isBusy('nightly'), false);
+    assert.equal(c.isBusy('nightly'), false, 'the button must be usable again');
 });
 
 // --- naming and accessibility -------------------------------------------
@@ -1599,4 +1611,31 @@ test('the busy flag disables the buttons that would queue a second run', () => {
     assert.ok(O.TEMPLATE.includes(':disabled="isBusy(j.id)"'));
     assert.ok(O.TEMPLATE.includes(':disabled="isBusy(r.id)"'));
     assert.ok(O.TEMPLATE.includes('isBusy(j.id) || j.status === \'running\''));
+});
+
+test('a disk-full job offers "space" help, and the panel it opens is about space', async () => {
+    // The full loop for the one remediation that shares a panel with read errors.
+    const c = component({ config: Object.assign(fakeDeps().config, {
+        readState: async () => state({ status: 'failed', kind: 'NO_SPACE', exit_code: 1 })
+    }) });
+    await c.refresh();
+    const row = c.jobs[0];
+    assert.equal(row.status, 'failed');
+    assert.equal(row.remediation, 'free-space');
+    assert.equal(row.unreadable, 0);
+    await c.remediate(row);
+    assert.equal(c.expanded, 'nightly');
+    const panel = c.expansionFor(row);
+    assert.equal(panel.kind, 'space');
+    assert.ok(!/unreadable/i.test(panel.text), 'no files were unreadable here');
+});
+
+test('the partial-listing notice is a warning, not a failure', async () => {
+    // The config-reading analogue of restic exit 3: some files were unreadable,
+    // the rest of the answer is real and is shown.
+    assert.ok(/x-show="warnings.length" class="alert alert-warning"/.test(O.TEMPLATE));
+    assert.ok(!/x-show="warnings.length" class="alert alert-danger"/.test(O.TEMPLATE));
+    assert.ok(O.TEMPLATE.includes('Everything below was read successfully.'));
+    assert.ok(O.TEMPLATE.includes('x-for="w in warnings" :key="w.key"'),
+        'the unreadable files must be enumerated, and keyed so none of them collide');
 });

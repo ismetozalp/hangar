@@ -107,14 +107,13 @@
 
     function isObj(v) { return !!v && typeof v === 'object' && !Array.isArray(v); }
 
+    // Only a JSON number or a form string is a number. Everything else is refused
+    // rather than coerced: Number([]) and Number(null) are both 0, i.e. a reading
+    // the user never gave us, rendered as though restic had reported it.
     function num(v) {
-        if (typeof v === 'boolean' || v === '' || v === null || v === undefined) return null;
-        let n;
-        try {
-            n = Number(v);          // Number(symbol) throws, as does a null-prototype object
-        } catch (e) {
-            return null;
-        }
+        if (typeof v !== 'number' && typeof v !== 'string') return null;
+        if (typeof v === 'string' && v.trim() === '') return null;
+        const n = Number(v);
         return isFinite(n) ? n : null;
     }
 
@@ -601,8 +600,30 @@
         }
     }
 
+    // The banner headline per operation. Kept here, keyed by the same `op` the
+    // remediation dispatch uses, so a failure can never be titled "Backup did not
+    // complete" when what actually failed was a save.
+    const FAILURE_TITLES = {
+        backup: 'Backup of "{name}" did not complete',
+        save: 'The job was not saved',
+        toggle: 'The schedule for "{name}" was not changed',
+        delete: 'The job "{name}" was not fully deleted',
+        edit: 'The job "{name}" cannot be edited',
+        confirm: 'Nothing was deleted: the confirmation could not be shown'
+    };
+
+    function failureTitle(op, name) {
+        const key = Object.prototype.hasOwnProperty.call(FAILURE_TITLES, str(op)) ? str(op) : 'backup';
+        return FAILURE_TITLES[key].replace('{name}', str(name) || 'this job');
+    }
+
+    // Own-property lookup only: REMEDIATION_LABELS['__proto__'] would otherwise
+    // answer with Object.prototype, which is truthy — and would be rendered into
+    // the action button as "[object Object]".
     function remediationLabel(remediation) {
-        return REMEDIATION_LABELS[remediation] || '';
+        if (typeof remediation !== 'string') return '';
+        return Object.prototype.hasOwnProperty.call(REMEDIATION_LABELS, remediation)
+            ? REMEDIATION_LABELS[remediation] : '';
     }
 
     // Options for HangarRestic.run('backup', …) built from a stored job.
@@ -906,13 +927,17 @@
                 } catch (e) {
                     return out;
                 }
-                for (let i = 0; i < ids.length; i++) {
+                for (let i = 0; i < (Array.isArray(ids) ? ids.length : 0); i++) {
                     try {
                         const repo = await Config.readRepo(ids[i]);
-                        if (repo) out.push(Object.assign({ id: ids[i] }, repo));
+                        // Same reasoning as loadJob: listed but empty means its real
+                        // definition is unknown, and a job pointing at it must not be
+                        // backed up against a guess.
+                        if (!isObj(repo)) throw err('GENERIC', 'The repository file is empty or malformed.');
+                        out.push(Object.assign({ id: ids[i] }, repo));
                     } catch (e) {
                         // One unreadable repository must not hide the others.
-                        out.push({ id: ids[i], unreadable: true });
+                        out.push({ id: ids[i], unreadable: true, error: e });
                     }
                 }
                 return out;
@@ -1036,7 +1061,6 @@
                 if (row && row.unreadable) {
                     this.failure = this.failureFor(row.job, null,
                         (row.error || err('GENERIC', 'This job could not be read.')), 'edit');
-                    this.failure.title = 'This job cannot be edited';
                     return Promise.resolve(null);
                 }
                 return this.openEditor(jobToFormState(row && row.job));
@@ -1084,7 +1108,6 @@
                     }
                 } catch (e) {
                     this.failure = this.failureFor(form, null, e, 'save');
-                    this.failure.title = 'The job was not saved';
                 } finally {
                     this.working = false;
                 }
@@ -1111,8 +1134,6 @@
                     }
                 } catch (e) {
                     this.failure = this.failureFor(job, null, e, 'toggle');
-                    this.failure.title = (enable ? 'Could not enable "' : 'Could not disable "') +
-                        (job.name || job.id) + '"';
                 } finally {
                     this.working = false;
                 }
@@ -1131,8 +1152,7 @@
                 if (!Dialogs) {
                     this.failure = this.failureFor(job, null,
                         err('GENERIC', 'The confirmation dialog is unavailable, so nothing was deleted.'),
-                        'delete');
-                    this.failure.title = 'Could not confirm the deletion';
+                        'confirm');
                     return;
                 }
                 try {
@@ -1147,8 +1167,7 @@
                     });
                 } catch (e) {
                     // A dialog that failed to open is not consent.
-                    this.failure = this.failureFor(job, null, e, 'delete');
-                    this.failure.title = 'Could not confirm the deletion';
+                    this.failure = this.failureFor(job, null, e, 'confirm');
                     return;
                 }
 
@@ -1172,7 +1191,6 @@
                     await Schedule.daemonReload();
                 } catch (e) {
                     this.failure = this.failureFor(job, null, e, 'delete');
-                    this.failure.title = 'The job was not fully deleted';
                 } finally {
                     this.working = false;
                 }
@@ -1182,22 +1200,25 @@
             // ---- running ------------------------------------------------
 
             runNow(row) {
-                return this.startBackup(row.job);
+                return this.startBackup(row && row.job);
             },
 
             async startBackup(job) {
                 const Restic = M('HangarRestic');
                 const Repos = M('HangarRepos');
                 const Secrets = M('HangarSecrets');
-                const Errors = M('HangarErrors');
+                const j = isObj(job) ? job : {};
 
-                const repo = this.repos.filter((r) => r.id === job.repo)[0];
-                if (!repo) {
+                const repo = this.repos.filter((r) => r && r.id === j.repo)[0];
+                if (!repo || repo.unreadable) {
                     this.failure = {
-                        jobId: job.id, repoId: job.repo,
-                        title: 'Repository not found',
-                        message: 'The job points at repository "' + job.repo + '", which no longer exists.',
-                        remediation: null
+                        jobId: j.id, repoId: j.repo, op: 'backup',
+                        title: 'Repository not usable',
+                        message: repo
+                            ? 'The definition of repository "' + str(j.repo) + '" could not be read.'
+                            : 'The job points at repository "' + str(j.repo) + '", which no longer exists.',
+                        remediation: null,
+                        error: null
                     };
                     return;
                 }
@@ -1205,26 +1226,37 @@
                 this.failure = null;
                 this.partial = null;
                 this.working = true;
-                this.run = { jobId: job.id, percent: null, label: 'Starting…' };
+                this.run = { jobId: j.id, percent: null, label: 'Starting…' };
 
                 try {
-                    const opts = backupOpts(job, Repos.buildUrl(repo), Secrets.keyPath(repo.id));
+                    if (!Restic || !Repos || !Secrets) throw err('GENERIC', 'A required module is not loaded.');
+                    const opts = backupOpts(j, Repos.buildUrl(repo), Secrets.keyPath(repo.id));
                     const self = this;
                     const result = await Restic.run('backup', opts, (status) => {
                         // restic emits a status line several times a second; assigning
-                        // two scalars keeps Alpine's re-render cheap.
+                        // two scalars keeps Alpine's re-render cheap. The run can have
+                        // been cleared already if the channel closed mid-stream.
+                        if (!self.run) return;
                         self.run.percent = progressPercent(status);
                         self.run.label = progressLabel(status);
                     });
 
-                    if (result.status === 'partial') {
-                        this.partial = { jobId: job.id, files: unreadableFiles(result) };
-                    } else if (result.status === 'failed') {
-                        const err = result.error || Errors.create('GENERIC', 'The backup failed.');
-                        this.failure = this.failureFor(job, repo, err);
+                    const outcome = isObj(result) ? result : {};
+                    const status = str(outcome.status);
+                    if (status === 'partial' || isReadErrors(outcome.error)) {
+                        // Exit 3: the snapshot exists. Warning listing what was missed.
+                        this.partial = this.partialFor(j, outcome);
+                    } else if (status === 'cancelled' || isCancelled(outcome.error)) {
+                        this.partial = null;    // the user asked for it; neutral, not an error
+                    } else if (status === 'failed') {
+                        this.failure = this.failureFor(j, repo,
+                            outcome.error || err('GENERIC', 'The backup failed.'), 'backup');
                     }
                 } catch (e) {
-                    this.failure = this.failureFor(job, repo, e);
+                    // The engine only rejects with fatal errors, but a future engine or
+                    // a callback fault must not turn a written snapshot into "failed".
+                    if (isReadErrors(e)) this.partial = this.partialFor(j, e);
+                    else if (!isCancelled(e)) this.failure = this.failureFor(j, repo, e, 'backup');
                 } finally {
                     this.run = null;
                     this.working = false;
@@ -1232,33 +1264,70 @@
                 await this.reload();
             },
 
-            failureFor(job, repo, error) {
-                const Errors = M('HangarErrors');
+            // A partial is a SUCCESS with a list attached, so it always carries the
+            // list — and says so plainly when restic named nothing.
+            partialFor(job, source) {
+                const j = isObj(job) ? job : {};
+                const files = unreadableFiles(source);
+                const error = isObj(source) && source.error ? source.error : source;
                 return {
-                    jobId: job.id,
-                    repoId: repo ? repo.id : job.repo,
-                    title: 'Backup of "' + (job.name || job.id) + '" did not complete',
-                    message: (error && error.message) || String(error),
-                    remediation: Errors.remediationFor(error),
+                    jobId: j.id,
+                    files: files,
+                    message: files.length ? '' : str(error && error.message)
+                };
+            },
+
+            failureFor(job, repo, error, op) {
+                const Errors = M('HangarErrors');
+                const j = isObj(job) ? job : {};
+                const message = str(error && error.message);
+                return {
+                    jobId: j.id,
+                    repoId: repo ? repo.id : j.repo,
+                    op: op || 'backup',
+                    title: failureTitle(op, j.name || j.id),
+                    message: message || str(error) || 'The reason was not reported.',
+                    remediation: (Errors && Errors.remediationFor(error)) || null,
                     error: error
                 };
             },
 
             async applyRemediation() {
                 const f = this.failure;
-                if (!f) return;
+                if (!f || !f.remediation) return;
                 const Restic = M('HangarRestic');
                 const Repos = M('HangarRepos');
                 const Secrets = M('HangarSecrets');
                 const Dialogs = M('HangarDialogs');
 
-                const repo = this.repos.filter((r) => r.id === f.repoId)[0];
-                const row = this.jobs.filter((r) => r.id === f.jobId)[0];
-                if (!repo || !row) { this.failure = null; return; }
+                // Listing the unreadable files needs no repository at all, so it is
+                // answered before anything that could fail.
+                if (f.remediation === 'list-unreadable') {
+                    this.partial = this.partialFor({ id: f.jobId }, f.error);
+                    this.failure = null;
+                    return;
+                }
 
-                const opts = { repoUrl: Repos.buildUrl(repo), passwordFile: Secrets.keyPath(repo.id) };
+                const repo = this.repos.filter((r) => r && r.id === f.repoId)[0];
+                const row = this.jobs.filter((r) => r && r.id === f.jobId)[0];
+                // Silently clearing the banner would look like the fix worked.
+                if (!repo) {
+                    this.failure = Object.assign({}, f, {
+                        title: 'That repository is no longer configured',
+                        message: 'Repository "' + str(f.repoId) + '" is gone, so "' +
+                            remediationLabel(f.remediation).toLowerCase() + '" cannot run.',
+                        remediation: null
+                    });
+                    return;
+                }
+
                 this.working = true;
                 try {
+                    if (!Restic || !Repos || !Secrets) throw err('GENERIC', 'A required module is not loaded.');
+                    // buildUrl and keyPath both throw on a repository definition that
+                    // no longer validates, and that has to become the banner, not an
+                    // unhandled rejection out of a click handler.
+                    const opts = { repoUrl: Repos.buildUrl(repo), passwordFile: Secrets.keyPath(repo.id) };
                     switch (f.remediation) {
                     case 'unlock':
                         await Restic.run('unlock', opts);
@@ -1267,30 +1336,30 @@
                         await Restic.run('init', opts);
                         break;
                     case 'reprompt': {
-                        const password = Dialogs ? await Dialogs.passwordDialog({
+                        if (!Dialogs) throw err('GENERIC', 'The password dialog is unavailable.');
+                        const password = await Dialogs.passwordDialog({
                             title: 'Repository password',
                             repoLabel: repo.id
-                        }) : '';
-                        if (!password) { this.working = false; return; }
+                        });
+                        if (!password) { this.working = false; return; }   // cancelled: leave the banner
                         await Secrets.writeKey(repo.id, password);
                         break;
                     }
-                    case 'list-unreadable':
-                        this.partial = { jobId: f.jobId, files: unreadableFiles(f.error && f.error.detail) };
-                        this.failure = null;
-                        this.working = false;
-                        return;
                     default:
-                        break;      // 'free-space' and 'retry' just retry the backup
+                        break;      // 'free-space' and 'retry' just repeat the operation
                     }
                 } catch (e) {
-                    this.failure = this.failureFor(row.job, repo, e);
+                    this.failure = this.failureFor((row && row.job) || { id: f.jobId }, repo, e, f.op);
                     this.working = false;
                     return;
                 }
                 this.working = false;
                 this.failure = null;
-                await this.startBackup(row.job);
+                // Only a backup is safe to repeat unattended. A failed save or delete
+                // is repeated by the user, from a list that now shows what is really
+                // on disk.
+                if (f.op === 'backup' && row) await this.startBackup(row.job);
+                else await this.reload();
             }
         };
     }
@@ -1311,6 +1380,9 @@
                 if (!root.addEventListener) return;
                 root.addEventListener(EDIT_EVENT, (ev) => {
                     const detail = (ev && ev.detail) || {};
+                    // A second open while one is pending would strand the first
+                    // caller's promise, and with it the save it was waiting to run.
+                    if (this._resolve) this._resolve(null);
                     this.form = isObj(detail.form) ? detail.form : emptyForm();
                     this.repos = Array.isArray(detail.repos) ? detail.repos : [];
                     this.taken = Array.isArray(detail.taken) ? detail.taken : [];
@@ -1321,16 +1393,19 @@
                 });
             },
 
+            // Custom is always offered: with no retention module loaded it is the
+            // only honest option, since no preset can be named.
             presetNames() {
                 const R = M('HangarRetention');
-                return Object.keys(R.PRESETS).concat(['custom']);
+                return (R && R.PRESETS ? Object.keys(R.PRESETS) : []).concat(['custom']);
             },
 
-            presetLabel(name) {
-                if (name === 'custom') return 'Custom';
+            presetLabel(raw) {
+                const name = str(raw);
+                if (name === 'custom' || name === '') return 'Custom';
                 const R = M('HangarRetention');
                 return name.charAt(0).toUpperCase() + name.slice(1).replace(/-/g, ' ') +
-                    (name === R.DEFAULT_PRESET ? ' (recommended)' : '');
+                    (R && name === R.DEFAULT_PRESET ? ' (recommended)' : '');
             },
 
             // Switching to Custom seeds the fields from the preset the user was
@@ -1350,10 +1425,14 @@
 
             retentionPolicy() { return formRetention(this.form); },
 
-            retentionText() { return M('HangarRetention').describe(this.retentionPolicy()); },
+            retentionText() {
+                const R = M('HangarRetention');
+                return R ? R.describe(this.retentionPolicy()) : '';
+            },
 
             retentionEstimate() {
-                const n = M('HangarRetention').estimateCount(this.retentionPolicy());
+                const R = M('HangarRetention');
+                const n = R ? R.estimateCount(this.retentionPolicy()) : 0;
                 if (!n) return '';
                 // Upper bound, not a prediction — restic's buckets overlap.
                 return 'At most about ' + plural(n, 'snapshot') + ' are kept.';
@@ -1362,7 +1441,8 @@
             keepsNothing() { return keepsNothing(this.form); },
 
             scheduleText() {
-                return M('HangarSchedule').describeSchedule(formCalendar(this.form));
+                const S = M('HangarSchedule');
+                return S ? S.describeSchedule(formCalendar(this.form)) : '';
             },
 
             calendarPreview() { return formCalendar(this.form); },
@@ -1421,8 +1501,9 @@
         emptyForm, presetFields, formRetention, presetNameFor, keepsNothing,
         formCalendar, scheduleModeFor, formSource, mergeFilesystemSources,
         formStateToJob, jobToFormState,
-        validateForm, hasErrors, problemsFor,
-        formatBytes, progressPercent, progressLabel, unreadableFiles,
+        validateForm, hasErrors, problemsFor, failureTitle, FAILURE_TITLES,
+        formatBytes, progressPercent, progressLabel, unreadableFiles, MAX_UNREADABLE,
+        isReadErrors, isCancelled,
         lastResultLabel, remediationLabel, backupOpts,
         splitLines, joinLines, splitTags, joinTags,
         // components

@@ -108,7 +108,12 @@
 
             async initUpdate(settings) {
                 this.installedVersion = await this.readInstalledVersion();
-                if (settings && settings.updateCheckOnStartup) await this.checkForUpdate(false);
+                // settings must be forwarded: checkForUpdate reads the repository from
+                // it, and without it the check silently resolves to "no repository
+                // configured" instead of contacting GitHub.
+                if (settings && settings.updateCheckOnStartup && settings.updateRepo) {
+                    await this.checkForUpdate(false, settings);
+                }
             },
 
             async readInstalledVersion() {

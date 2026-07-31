@@ -964,6 +964,70 @@ test('redact: a long unbroken token does not stall the UI thread', () => {
     assert.ok(ms < 5000, 'redact took ' + ms + 'ms on a long token');
 });
 
+test('redact: masks an assignment nested inside another one', () => {
+    // A journal line is `unit[pid]: <message>`, so almost every secret hangar
+    // could log arrives as the value of something else.
+    assert.equal(S.redact('stderr: password=hunter2'), 'stderr: password=***');
+    assert.equal(S.redact('stderr: password="hunter2"'), 'stderr: password="***"');
+    assert.equal(S.redact('log line: password = hunter2'), 'log line: password = ***');
+    assert.equal(S.redact('msg: env: RESTIC_PASSWORD=hunter2'), 'msg: env: RESTIC_PASSWORD=***');
+    assert.equal(S.redact('a=b=password=hunter2'), 'a=b=password=***');
+});
+
+test('redact: masks a secret nested inside a JSON object', () => {
+    assert.equal(S.redact('{"user":"bob","nested":{"password":"hunter2"}}'),
+        '{"user":"bob","nested":{"password":"***"}}');
+});
+
+test('redact: masks one logfmt field and leaves the others byte for byte', () => {
+    assert.equal(S.redact('level=error msg="repository open failed" password=hunter2 repo=sftp://u:p@h/x'),
+        'level=error msg="repository open failed" password=*** repo=sftp://u:***@h/x');
+});
+
+test('redact: a journald line keeps everything but the secret', () => {
+    assert.equal(S.redact('Jun 01 12:00:01 host hangar[1]: backing up /srv with token=abc123'),
+        'Jun 01 12:00:01 host hangar[1]: backing up /srv with token=***');
+});
+
+test('redact: a generated unit file loses its secrets and nothing else', () => {
+    const unit = [
+        '[Service]',
+        'Type=oneshot',
+        'ExecStart=/usr/bin/restic backup --password-file /etc/hangar/repos/home.key /srv',
+        'LoadCredential=hangar-repo-home:/etc/hangar/repos/home.key',
+        'Environment=RESTIC_PASSWORD_FILE=%d/hangar-repo-home',
+        'Environment=RESTIC_REPOSITORY=sftp://backup:hunter2@nas.local/srv',
+        'Environment=AWS_SECRET_ACCESS_KEY=hunter2',
+        'SetCredential=hangar-repo-home:hunter2'
+    ].join('\n');
+    assert.equal(S.redact(unit), [
+        '[Service]',
+        'Type=oneshot',
+        'ExecStart=/usr/bin/restic backup --password-file /etc/hangar/repos/home.key /srv',
+        'LoadCredential=hangar-repo-home:/etc/hangar/repos/home.key',
+        'Environment=RESTIC_PASSWORD_FILE=%d/hangar-repo-home',
+        'Environment=RESTIC_REPOSITORY=sftp://backup:***@nas.local/srv',
+        'Environment=AWS_SECRET_ACCESS_KEY=***',
+        'SetCredential=hangar-repo-home:***'
+    ].join('\n'));
+});
+
+test('redact: descending into a value changes nothing when nothing below is secret', () => {
+    ['a=b=c=d', 'level=info msg="no parent snapshot found"', 'rest:https://backup.example:8000/repo',
+        'files_new=12 data_added=1024 snapshot_id=3a1b2c', '{"user":"bob","host":"nas.local"}'
+    ].forEach((s) => assert.equal(S.redact(s), s, 'descent damaged ' + s));
+});
+
+test('redact: a chain of assignments does not stall the scan', () => {
+    // The nested descent re-reads the value it descends into; unbudgeted, this
+    // input makes that quadratic.
+    const started = Date.now();
+    const out = S.redact('a=b='.repeat(50000) + ' password=hunter2');
+    const ms = Date.now() - started;
+    assert.equal(out.indexOf('hunter2'), -1);
+    assert.ok(ms < 5000, 'redact took ' + ms + 'ms on a chained assignment');
+});
+
 test('redact: is idempotent for quoted and truncated forms too', () => {
     ['password="hunter2', "password='hunter2", '{"password":"hun\\"ter2"}',
         'Environment="RESTIC_PASSWORD=hunter2"', 'SetCredential=n:v'

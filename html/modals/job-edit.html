@@ -28,7 +28,7 @@
                             <label class="form-label" for="hangar-job-id">Job id</label>
                             <input id="hangar-job-id" class="form-control hangar-mono"
                                    x-model="form.id" :disabled="!form.isNew"
-                                   :aria-invalid="invalid('id')" :aria-describedby="'hangar-job-id-help'"
+                                   :aria-invalid="invalid('id')" aria-describedby="hangar-job-id-help"
                                    autocomplete="off" spellcheck="false">
                             <div id="hangar-job-id-help" class="form-text">
                                 <span x-show="!invalid('id')">
@@ -41,8 +41,9 @@
                         <div class="col-sm-6">
                             <label class="form-label" for="hangar-job-name">Name</label>
                             <input id="hangar-job-name" class="form-control" x-model="form.name"
-                                   autocomplete="off">
-                            <div class="form-text" x-text="messageFor('name')"></div>
+                                   autocomplete="off" aria-describedby="hangar-job-name-help">
+                            <div id="hangar-job-name-help" class="form-text"
+                                 x-text="messageFor('name')"></div>
                         </div>
                     </div>
 
@@ -50,13 +51,13 @@
                     <div class="mb-3">
                         <label class="form-label" for="hangar-job-repo">Repository</label>
                         <select id="hangar-job-repo" class="form-select" x-model="form.repo"
-                                :aria-invalid="invalid('repo')">
+                                :aria-invalid="invalid('repo')" aria-describedby="hangar-job-repo-help">
                             <option value="">Choose a repository…</option>
                             <template x-for="r in repos" :key="r.id">
                                 <option :value="r.id" x-text="r.name || r.id"></option>
                             </template>
                         </select>
-                        <div class="form-text text-danger" x-show="invalid('repo')"
+                        <div id="hangar-job-repo-help" class="form-text text-danger" x-show="invalid('repo')"
                              x-text="messageFor('repo')"></div>
                         <div class="form-text" x-show="!repos.length">
                             No repositories are configured yet. Create one on the Repositories tab first.
@@ -70,8 +71,9 @@
                         <label class="form-label" for="hangar-job-paths">Paths to back up</label>
                         <textarea id="hangar-job-paths" class="form-control hangar-mono" rows="4"
                                   x-model="form.paths" :aria-invalid="invalid('paths')"
+                                  aria-describedby="hangar-job-paths-help"
                                   spellcheck="false" placeholder="/home&#10;/etc"></textarea>
-                        <div class="form-text">
+                        <div id="hangar-job-paths-help" class="form-text">
                             <span x-show="!invalid('paths')">One absolute path per line.</span>
                             <span class="text-danger" x-show="invalid('paths')" x-text="messageFor('paths')"></span>
                         </div>
@@ -81,8 +83,9 @@
                         <label class="form-label" for="hangar-job-excludes">Exclude patterns</label>
                         <textarea id="hangar-job-excludes" class="form-control hangar-mono" rows="3"
                                   x-model="form.excludes" :aria-invalid="invalid('excludes')"
+                                  aria-describedby="hangar-job-excludes-help"
                                   spellcheck="false" placeholder="*.tmp&#10;/home/*/.cache"></textarea>
-                        <div class="form-text">
+                        <div id="hangar-job-excludes-help" class="form-text">
                             <span x-show="!invalid('excludes')">One pattern per line. Optional.</span>
                             <span class="text-danger" x-show="invalid('excludes')"
                                   x-text="messageFor('excludes')"></span>
@@ -94,15 +97,19 @@
                             <label class="form-label" for="hangar-job-exclude-file">Exclude file</label>
                             <input id="hangar-job-exclude-file" class="form-control hangar-mono"
                                    x-model="form.excludeFile" autocomplete="off" spellcheck="false"
+                                   :aria-invalid="invalid('excludeFile')"
+                                   aria-describedby="hangar-job-exclude-file-help"
                                    placeholder="/etc/hangar/excludes.txt">
-                            <div class="form-text text-danger" x-show="invalid('excludeFile')"
-                                 x-text="messageFor('excludeFile')"></div>
+                            <div id="hangar-job-exclude-file-help" class="form-text text-danger"
+                                 x-show="invalid('excludeFile')" x-text="messageFor('excludeFile')"></div>
                         </div>
                         <div class="col-sm-6">
                             <label class="form-label" for="hangar-job-tags">Snapshot tags</label>
                             <input id="hangar-job-tags" class="form-control" x-model="form.tags"
-                                   autocomplete="off" placeholder="nightly, laptop">
-                            <div class="form-text">
+                                   autocomplete="off" placeholder="nightly, laptop"
+                                   :aria-invalid="invalid('tags')"
+                                   aria-describedby="hangar-job-tags-help">
+                            <div id="hangar-job-tags-help" class="form-text">
                                 <span x-show="!invalid('tags')">Comma separated. Optional.</span>
                                 <span class="text-danger" x-show="invalid('tags')"
                                       x-text="messageFor('tags')"></span>
@@ -124,7 +131,9 @@
                     <div class="mb-3">
                         <label class="form-label" for="hangar-job-retention">Retention</label>
                         <select id="hangar-job-retention" class="form-select"
-                                x-model="form.retentionPreset" @change="onPresetChange()">
+                                x-model="form.retentionPreset" @change="onPresetChange()"
+                                :aria-invalid="invalid('retention')"
+                                aria-describedby="hangar-job-retention-help">
                             <template x-for="p in presetNames()" :key="p">
                                 <option :value="p" x-text="presetLabel(p)"></option>
                             </template>
@@ -155,7 +164,7 @@
                     </div>
 
                     <!-- What the policy MEANS, live, before anything is saved. -->
-                    <div class="alert py-2 px-3 mb-3"
+                    <div id="hangar-job-retention-help" class="alert py-2 px-3 mb-3"
                          :class="keepsNothing() ? 'alert-danger' : 'alert-secondary'">
                         <div x-text="retentionText()"></div>
                         <div class="small mt-1" x-show="!keepsNothing()" x-text="retentionEstimate()"></div>
@@ -184,8 +193,9 @@
                         <label class="form-label" for="hangar-job-calendar">OnCalendar expression</label>
                         <input id="hangar-job-calendar" class="form-control hangar-mono"
                                x-model="form.calendar" :aria-invalid="invalid('calendar')"
+                               aria-describedby="hangar-job-calendar-help"
                                autocomplete="off" spellcheck="false" placeholder="Mon..Fri 02:30">
-                        <div class="form-text">
+                        <div id="hangar-job-calendar-help" class="form-text">
                             <span x-show="!invalid('calendar')">
                                 systemd calendar syntax, exactly as <code>systemd.time(7)</code> defines it.
                             </span>
@@ -215,8 +225,10 @@
                         <label class="form-label" for="hangar-job-pre">Before the backup</label>
                         <input id="hangar-job-pre" class="form-control hangar-mono" x-model="form.preHook"
                                autocomplete="off" spellcheck="false"
+                               :aria-invalid="invalid('preHook')"
+                               aria-describedby="hangar-job-pre-help"
                                placeholder="/usr/local/bin/dump-database.sh">
-                        <div class="form-text">
+                        <div id="hangar-job-pre-help" class="form-text">
                             <span x-show="!invalid('preHook')">
                                 Optional shell command. A non-zero exit stops the backup.
                             </span>
@@ -228,8 +240,10 @@
                     <div class="mb-0">
                         <label class="form-label" for="hangar-job-post">After the backup</label>
                         <input id="hangar-job-post" class="form-control hangar-mono" x-model="form.postHook"
-                               autocomplete="off" spellcheck="false">
-                        <div class="form-text">
+                               autocomplete="off" spellcheck="false"
+                               :aria-invalid="invalid('postHook')"
+                               aria-describedby="hangar-job-post-help">
+                        <div id="hangar-job-post-help" class="form-text">
                             <span x-show="!invalid('postHook')">
                                 Optional shell command. Runs whether or not files were unreadable.
                             </span>
@@ -241,7 +255,8 @@
                 </div>
 
                 <div class="modal-footer">
-                    <div class="me-auto small text-danger" x-show="submitted &amp;&amp; !canSave()">
+                    <div class="me-auto small text-danger" role="alert"
+                         x-show="submitted &amp;&amp; !canSave()">
                         Fix the highlighted fields before saving.
                     </div>
                     <button type="button" class="btn btn-secondary" data-bs-dismiss="modal"

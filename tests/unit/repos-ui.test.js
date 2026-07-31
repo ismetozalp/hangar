@@ -96,11 +96,13 @@ test('both Alpine factories are registered on the global', () => {
     assert.equal(typeof globalThis.hangarRepoEdit, 'function');
 });
 
-test('the screen is never called "Time Machine"', () => {
+test('the screen never uses the rejected product name', () => {
     // The feature is Logbook. This screen links to it, so the wrong name would
-    // most plausibly appear here.
-    assert.ok(!/time\s*machine/i.test(Ui.TEMPLATE));
-    assert.ok(!/time\s*machine/i.test(JSON.stringify(Ui.KIND_LABEL)));
+    // most plausibly appear here. Assembled, never spelled out — see the fuller
+    // check at the end of this file.
+    const forbidden = new RegExp(['time', '\\s*', 'machine'].join(''), 'i');
+    assert.ok(!forbidden.test(Ui.TEMPLATE));
+    assert.ok(!forbidden.test(JSON.stringify(Ui.KIND_LABEL)));
 });
 
 // -------------------------------------------------------------- fieldsFor
@@ -704,4 +706,721 @@ test('every button in the template is a real <button> with a type', () => {
 test('icon-free action groups still carry an accessible name', () => {
     assert.match(Ui.TEMPLATE, /aria-label="Refresh repositories"/);
     assert.match(Ui.TEMPLATE, /:aria-label="'Actions for ' \+ row\.title"/);
+});
+
+// ============================================================================
+// Adversarial: hostile input to the pure functions.
+// ============================================================================
+
+test('the pure functions survive a hand-edited config full of the wrong types', () => {
+    // JSON.parse can produce an object with no usable toString; String() throws on
+    // it, and a throw here is a blank Repositories screen.
+    const hostile = JSON.parse('{"toString": null, "valueOf": null}');
+    const repo = { id: 'x', kind: 'rest', url: hostile, label: hostile };
+
+    assert.doesNotThrow(() => Ui.repoToFormState(repo));
+    assert.equal(Ui.repoToFormState(repo).url, '');
+    assert.doesNotThrow(() => Ui.toRow(repo));
+    assert.doesNotThrow(() => Ui.deleteMessage(repo));
+    assert.doesNotThrow(() => Ui.formStateToRepo('rest', { id: 'x', url: hostile }));
+});
+
+test('fieldsFor and blankForm reject every non-kind shape without throwing', () => {
+    for (const bad of [undefined, null, '', 0, 1, true, false, [], {}, ['local'], NaN, Infinity, 'LOCAL', ' local ']) {
+        assert.deepEqual(Ui.fieldsFor(bad), [], String(bad));
+        assert.equal(Ui.blankForm(bad).kind, 'local', String(bad));
+    }
+});
+
+test('kindLabel and busyLabelFor never return undefined', () => {
+    for (const bad of [null, undefined, 0, [], {}, '', 'nope']) {
+        assert.equal(typeof Ui.kindLabel(bad), 'string');
+        assert.equal(typeof Ui.busyLabelFor(bad), 'string');
+    }
+    assert.equal(Ui.kindLabel(null), 'Unknown');
+});
+
+test('mergeKind tolerates rubbish on both sides', () => {
+    assert.deepEqual(Ui.mergeKind(null, 'gs'), Ui.blankForm('gs'));
+    assert.deepEqual(Ui.mergeKind('not a form', 'gs'), Ui.blankForm('gs'));
+    assert.deepEqual(Ui.mergeKind(undefined, undefined), Ui.blankForm('local'));
+    // An unknown target kind falls back rather than producing a form with no fields.
+    assert.equal(Ui.mergeKind(Ui.blankForm('s3'), 'dropbox').kind, 'local');
+});
+
+test('validateForm reports problems for hostile ids instead of throwing', () => {
+    const hostile = [
+        '../../etc/shadow', 'a/b', 'a\\b', 'a\nb', 'a b', "a'b", 'a"b', 'repertoire-é',
+        'ID', 'a'.repeat(200), '-nas', '.', '..', 'nas\u0000', 'x;rm -rf /'
+    ];
+    for (const id of hostile) {
+        const problems = Ui.validateForm('local', form('local', { id: id }));
+        assert.ok(Array.isArray(problems), id);
+        assert.ok(problems.length > 0, JSON.stringify(id) + ' was accepted');
+    }
+    // Surrounding whitespace is a paste artefact, not hostility: it is trimmed.
+    assert.deepEqual(Ui.validateForm('local', form('local', { id: '  nas  ' })), []);
+});
+
+test('every id the form accepts is one config.js and secrets.js also accept', () => {
+    // The form must not accept an id that fails three calls later, when the user has
+    // no idea which field was at fault.
+    const candidates = [
+        'nas', 'a', '0', 'a-b-c', 'a'.repeat(63), 'a'.repeat(64), 'a'.repeat(200),
+        '-nas', 'nas-', 'NAS', 'na s', 'na/s', 'na..s', '', 'ünas'
+    ];
+    for (const id of candidates) {
+        const accepted = Ui.validateForm('local', form('local', { id: id })).length === 0;
+        if (!accepted) continue;
+        assert.doesNotThrow(() => Config.validateId(id.trim()), 'config.js rejects ' + JSON.stringify(id));
+        assert.doesNotThrow(() => Secrets.keyPath(id.trim()), 'secrets.js rejects ' + JSON.stringify(id));
+    }
+});
+
+test('validateForm tolerates a junk existingIds argument', () => {
+    for (const junk of [null, undefined, 'nas', 42, { nas: true }])
+        assert.deepEqual(Ui.validateForm('local', form('local')), Ui.validateForm('local', form('local'), junk));
+    // Non-string entries must not silently match a real id.
+    assert.deepEqual(Ui.validateForm('local', form('local'), [null, undefined, 0, {}]), []);
+});
+
+test('validateForm rejects a path carrying a newline or a quote', () => {
+    // A pasted path with an embedded newline reaches restic as two arguments' worth
+    // of confusion; catching it in the form is the only place it is still legible.
+    for (const p of ['/srv/b\n/etc', '/srv/../etc', 'relative/path', '~/backups'])
+        assert.ok(Ui.validateForm('local', form('local', { path: p })).length > 0, p);
+    // A perfectly ordinary unicode path is still accepted.
+    assert.deepEqual(Ui.validateForm('local', form('local', { path: '/srv/böcker' })), []);
+});
+
+test('formatSize refuses types that Number() would silently turn into a size', () => {
+    // Number([]) is 0 and Number(true) is 1: both would print a confident lie.
+    for (const bad of [[], {}, true, false, NaN, Infinity, -Infinity, () => 1])
+        assert.equal(Ui.formatSize(bad), '—', String(bad));
+    assert.equal(Ui.formatSize('2048'), '2.0 KiB');
+    assert.equal(Ui.formatSize(-0), '0 B');
+});
+
+test('formatSize copes with implausibly enormous repositories', () => {
+    assert.match(Ui.formatSize(Number.MAX_SAFE_INTEGER), /PiB$/);
+    assert.match(Ui.formatSize(1e30), /PiB$/);
+    assert.ok(!/e\+/.test(Ui.formatSize(1e30)), 'never exponential notation');
+});
+
+test('formatCount refuses types Number() would coerce', () => {
+    for (const bad of [[], {}, true, NaN, Infinity, -1])
+        assert.equal(Ui.formatCount(bad), '—', String(bad));
+});
+
+test('unreadableFrom survives hostile error payloads', () => {
+    assert.deepEqual(Ui.unreadableFrom({ errors: 'not a list' }), []);
+    assert.deepEqual(Ui.unreadableFrom({ errors: [] }), []);
+    assert.deepEqual(Ui.unreadableFrom({ detail: null }), []);
+    assert.deepEqual(Ui.unreadableFrom({ errors: [{ item: 0 }, { item: false }, { item: '' }] }), []);
+    // Unicode and quoted paths are preserved verbatim: they are what the user has
+    // to go and look at.
+    assert.deepEqual(Ui.unreadableFrom({ errors: [{ item: '/srv/"a b"/資料' }] }), ['/srv/"a b"/資料']);
+    const many = { errors: Array.from({ length: 5000 }, (_, i) => ({ item: '/f/' + (i % 10) })) };
+    assert.equal(Ui.unreadableFrom(many).length, 10);
+});
+
+test('toAlert survives a detail whose stderr is not a string', () => {
+    for (const stderr of [null, 0, [], { a: 1 }, JSON.parse('{"toString": null}')]) {
+        const e = Errors.create(Errors.KIND.GENERIC, 'boom', { stderr: stderr });
+        assert.doesNotThrow(() => Ui.toAlert(e, 'Test'));
+        assert.equal(typeof Ui.toAlert(e, 'Test').detail, 'string');
+    }
+});
+
+test('toAlert keeps a newline-laden stderr bounded and redacted', () => {
+    const noise = 'line\n'.repeat(5000) + 'password = hunter2\n';
+    const alert = Ui.toAlert(Errors.create(Errors.KIND.GENERIC, 'boom', { stderr: noise }), 'Test');
+    assert.ok(alert.detail.length <= 2000);
+    assert.ok(!alert.detail.includes('hunter2'));
+});
+
+// ============================================================================
+// Adversarial: error states become actions.
+// ============================================================================
+
+test('a READ_ERRORS alert with nothing to list offers no dead button', () => {
+    // classifyExit carries no file list, so "Show unreadable files" would open an
+    // empty list. The kind still says partial success; only the button goes.
+    const alert = Ui.toAlert(Restic.classifyExit(3, ''), 'Backup');
+    assert.equal(alert.level, 'warning');
+    assert.equal(alert.remediation, 'list-unreadable');
+    assert.equal(alert.actionLabel, '');
+
+    const withFiles = Ui.toAlert(
+        Object.assign(Restic.classifyExit(3, ''), { detail: { errors: [{ item: '/proc/1/mem' }] } }), 'Backup');
+    assert.match(withFiles.actionLabel, /unreadable/i);
+    assert.deepEqual(withFiles.files, ['/proc/1/mem']);
+});
+
+test('every remediation errors.js can emit reaches a component action', () => {
+    // The rule is that a typed error becomes a button. A remediation with no
+    // handler would be a button that does nothing.
+    const handled = ['unlock', 'init', 'reprompt', 'retry', 'list-unreadable'];
+    for (const r of new Set(Object.values(Errors.REMEDIATION)))
+        assert.ok(handled.includes(r) || r === 'free-space', 'unhandled remediation ' + r);
+    // free-space has no one-click fix here, so it must at least still be labelled.
+    assert.ok(Ui.remediationLabel('free-space').length > 0);
+});
+
+test('toAlert carries the repository id so a screen-level action knows its target', () => {
+    const alert = Ui.toAlert(Restic.classifyExit(11, ''), 'Add repository', 'nas');
+    assert.equal(alert.repoId, 'nas');
+    assert.equal(Ui.toAlert(new Error('x'), 'y').repoId, '');
+});
+
+test('resultAlert never reports a run it has no summary for as a success', () => {
+    for (const status of ['unknown', 'running', undefined]) {
+        const alert = Ui.resultAlert({ status: status }, 'Integrity check');
+        assert.notEqual(alert.level, 'success', String(status));
+        assert.equal(alert.level, 'warning');
+        assert.equal(alert.remediation, 'retry');
+    }
+    assert.equal(Ui.resultAlert(null, 'x'), null);
+    assert.equal(Ui.resultAlert('nope', 'x'), null);
+});
+
+test('resultAlert with a partial run and no named files offers no dead button', () => {
+    const alert = Ui.resultAlert({ status: 'partial', errors: [] }, 'Integrity check');
+    assert.equal(alert.level, 'warning');
+    assert.equal(alert.remediation, 'list-unreadable');
+    assert.equal(alert.actionLabel, '');
+});
+
+test('isAlreadyInitialised also reads the stderr detail, not just the message', () => {
+    // classifyExit only lifts restic's text into `message` when restic emitted an
+    // exit_error object. Without one the message is generic and the reason is in
+    // the detail, which is the commonest "add an existing repository" path.
+    const e = Restic.classifyExit(1, 'Fatal: create repository at /srv/b failed: config file already exists');
+    assert.equal(e.message, 'restic reported an error', 'guard: the message really is generic here');
+    assert.equal(Ui.isAlreadyInitialised(e), true);
+    assert.equal(Ui.isAlreadyInitialised(Restic.classifyExit(1, 'Fatal: connection refused')), false);
+});
+
+// ============================================================================
+// Adversarial: the component against failing core modules.
+// ============================================================================
+
+test('refresh survives listRepos rejecting and still finishes loading', async () => {
+    const c = Ui.hangarReposUi();
+    c.loadStats = async () => {};
+    await withStubs([[Config, 'listRepos', async () => {
+        throw Errors.create(Errors.KIND.NETWORK, 'the config filesystem is gone');
+    }]], () => c.refresh());
+
+    assert.equal(c.loading, false, 'a permanent "Loading" is the worst failure mode');
+    assert.deepEqual(c.rows, []);
+    assert.equal(c.alert.level, 'danger');
+    assert.equal(c.alert.context, 'Listing repositories');
+    assert.equal(c.alert.remediation, 'retry');
+    assert.match(c.alertActionLabel(), /try again/i);
+});
+
+test('an unreadable repository file is a WARNING listing it, never a failure', async () => {
+    // The design rule: READ_ERRORS / partial results render as a warning that names
+    // what could not be read, and everything readable still renders.
+    const c = Ui.hangarReposUi();
+    c.loadStats = async () => {};
+    await withStubs([
+        [Config, 'listRepos', async () => ['good', 'broken']],
+        [Config, 'readRepo', async (id) => {
+            if (id === 'broken') throw Errors.create(Errors.KIND.GENERIC, 'Could not read it');
+            return { id: 'good', kind: 'local', path: '/srv/b' };
+        }]
+    ], () => c.refresh());
+
+    assert.equal(c.alert, null, 'a partial read is not a screen-level failure');
+    assert.deepEqual(c.unreadable, ['/etc/hangar/repos/broken.json']);
+    assert.deepEqual(c.rows.map((r) => r.id), ['good']);
+    assert.equal(c.loading, false);
+
+    // ...and the markup renders that list as a warning, not a danger.
+    assert.match(Ui.TEMPLATE, /x-show="unreadable\.length" class="alert alert-warning"/);
+    assert.match(Ui.TEMPLATE, /x-for="p in unreadable"/);
+    assert.ok(!/x-show="unreadable\.length"[^>]*alert-danger/.test(Ui.TEMPLATE));
+});
+
+test('an empty repository file is unreadable, not an empty repository', async () => {
+    const c = Ui.hangarReposUi();
+    c.loadStats = async () => {};
+    await withStubs([
+        [Config, 'listRepos', async () => ['blank', 'weird']],
+        [Config, 'readRepo', async (id) => (id === 'blank' ? null : 'not an object')]
+    ], () => c.refresh());
+    assert.deepEqual(c.unreadable,
+        ['/etc/hangar/repos/blank.json', '/etc/hangar/repos/weird.json']);
+    assert.deepEqual(c.rows, []);
+});
+
+test('refresh survives an id the path builder refuses and a non-list listing', async () => {
+    const c = Ui.hangarReposUi();
+    c.loadStats = async () => {};
+    // repoPath() throws on this id, inside the very handler that reports it.
+    await withStubs([[Config, 'listRepos', async () => ['../../etc/shadow']]], () => c.refresh());
+    assert.equal(c.loading, false);
+    assert.equal(c.unreadable.length, 1);
+    assert.match(c.unreadable[0], /etc\/shadow/);
+
+    await withStubs([[Config, 'listRepos', async () => 'not a list']], () => c.refresh());
+    assert.deepEqual(c.rows, []);
+    assert.equal(c.loading, false);
+});
+
+test('a repository whose definition names no id inherits it from the filename', async () => {
+    const c = Ui.hangarReposUi();
+    c.loadStats = async () => {};
+    await withStubs([
+        [Config, 'listRepos', async () => ['nas']],
+        [Config, 'readRepo', async () => ({ kind: 'local', path: '/srv/b' })]
+    ], () => c.refresh());
+    assert.equal(c.rows[0].id, 'nas');
+});
+
+test('a locked repository turns into a row alert with an Unlock button', async () => {
+    const row = repoRow();
+    await withCockpit({ spawn: rejectsWith(11, 'repository is already locked') }, async () => {
+        await Ui.hangarReposUi().loadStats(row);
+    });
+    assert.equal(row.alert.kind, Errors.KIND.REPO_LOCKED);
+    assert.equal(row.alert.remediation, 'unlock');
+    assert.match(row.alert.actionLabel, /unlock/i);
+    assert.equal(row.alert.repoId, 'nas');
+    assert.equal(row.busy, '', 'the row must not stay disabled after a failure');
+});
+
+test('a wrong password and a missing repository each reach their own action', async () => {
+    for (const pair of [[12, 'reprompt'], [10, 'init'], [3, 'list-unreadable']]) {
+        const row = repoRow();
+        await withCockpit({ spawn: rejectsWith(pair[0], '') }, async () => {
+            await Ui.hangarReposUi().loadStats(row);
+        });
+        assert.equal(row.alert.remediation, pair[1], String(pair[0]));
+    }
+});
+
+test('a snapshot count already fetched survives a failing stats call', async () => {
+    const row = repoRow();
+    const spawn = (argv) => (argv.indexOf('snapshots') >= 0
+        ? Promise.resolve('[{"id":"aabbccdd","time":"2026-07-31T02:00:00Z"}]')
+        : Promise.reject({ exit_status: 1, message: 'Fatal: unknown flag: --mode' }));
+    await withCockpit({ spawn: spawn }, async () => {
+        await Ui.hangarReposUi().loadStats(row);
+    });
+    assert.equal(row.stats.snapshots, 1, 'a true count must not be thrown away');
+    assert.equal(Ui.hangarReposUi().size(row), '—', 'but a size we never got is not invented');
+    assert.ok(row.alert, 'the failure is still reported');
+});
+
+test('loadStats without cockpit reports it instead of throwing', async () => {
+    const row = repoRow();
+    await Ui.hangarReposUi().loadStats(row);
+    assert.equal(row.alert.level, 'danger');
+    assert.match(row.alert.message, /cockpit/i);
+    assert.equal(row.busy, '');
+});
+
+test('loadStats reports a repository id that cannot become a key path', async () => {
+    // resticOptions throws before any I/O; the row must still end up with an alert
+    // rather than an exception escaping into Alpine.
+    const row = Ui.toRow({ id: '../../etc/shadow', kind: 'local', path: '/srv/b' });
+    await Ui.hangarReposUi().loadStats(row);
+    assert.ok(row.alert);
+    assert.equal(row.busy, '');
+});
+
+test('an integrity check that ends without a summary is not reported as success', async () => {
+    const row = repoRow();
+    const c = Ui.hangarReposUi();
+    await withStubs([[Restic, 'run', async () => ({ status: 'unknown', errors: [] })]],
+        () => c.check(row));
+    assert.notEqual(row.alert.level, 'success');
+    assert.equal(row.busy, '');
+});
+
+test('an integrity check with read errors renders as a warning listing the files', async () => {
+    const row = repoRow();
+    const c = Ui.hangarReposUi();
+    const partial = Restic.summarize([
+        { message_type: 'error', item: '/srv/backups/hangar/data/ab/broken' },
+        { message_type: 'summary', num_errors: 1 }
+    ]);
+    await withStubs([[Restic, 'run', async () => partial]], () => c.check(row));
+    assert.equal(row.alert.level, 'warning');
+    assert.notEqual(row.alert.level, 'danger');
+    assert.deepEqual(row.alert.files, ['/srv/backups/hangar/data/ab/broken']);
+    assert.equal(row.alert.remediation, 'list-unreadable');
+    await c.remediate(row);
+    assert.equal(row.showFiles, true, 'the files must be reachable from the button');
+});
+
+test('an integrity check that rejects becomes an action, not a stuck row', async () => {
+    const row = repoRow();
+    const c = Ui.hangarReposUi();
+    await withStubs([[Restic, 'run', async () => { throw Restic.classifyExit(12, ''); }]],
+        () => c.check(row));
+    assert.equal(row.alert.remediation, 'reprompt');
+    assert.equal(row.busy, '');
+});
+
+test('unlock and initRepo report their own failures on the row', async () => {
+    const c = Ui.hangarReposUi();
+    for (const action of ['unlock', 'initRepo']) {
+        const row = repoRow();
+        await withCockpit({ spawn: rejectsWith(1, 'Fatal: connection refused') }, () => c[action](row));
+        assert.ok(row.alert, action);
+        assert.equal(row.alert.kind, Errors.KIND.NETWORK, action);
+        assert.equal(row.busy, '', action);
+    }
+});
+
+test('initialising an already-initialised repository is a success that reads it', async () => {
+    const c = Ui.hangarReposUi();
+    const row = repoRow();
+    let read = 0;
+    c.loadStats = async () => { read++; };
+    await withCockpit({ spawn: rejectsWith(1, 'Fatal: config file already exists') },
+        () => c.initRepo(row));
+    assert.equal(row.alert, null, 'the expected case is not an error');
+    assert.equal(read, 1, 'and the row is refreshed rather than left blank');
+});
+
+test('creating a repository surfaces a failing key write instead of swallowing it', async () => {
+    const c = Ui.hangarReposUi();
+    c.refresh = async () => {};
+    await withDialogs({ passwordDialog: async () => 'hunter2', confirmDialog: async () => true }, () =>
+        withStubs([[Secrets, 'writeKey', async () => {
+            throw Errors.create(Errors.KIND.GENERIC, 'read-only file system');
+        }]], () => c.create({ id: 'nas', kind: 'local', path: '/srv/b' })));
+    assert.equal(c.alert.level, 'danger');
+    assert.equal(c.alert.context, 'Add repository');
+    assert.equal(c.loading, false);
+});
+
+test('creating a repository whose destination is locked keeps the action reachable', async () => {
+    const c = Ui.hangarReposUi();
+    c.refresh = async () => {};
+    c.rows = [repoRow()];
+    await withDialogs({ passwordDialog: async () => 'hunter2' }, () =>
+        withStubs([[Secrets, 'writeKey', async () => '/etc/hangar/repos/nas.key'],
+            [Config, 'writeRepo', async () => {}]], () =>
+            withCockpit({ spawn: rejectsWith(11, 'locked') },
+                () => c.create({ id: 'nas', kind: 'local', path: '/srv/b' }))));
+    assert.equal(c.alert.remediation, 'unlock');
+    assert.equal(c.alert.repoId, 'nas');
+    // The row is on screen, so the screen-level button can honour the remediation.
+    assert.match(c.alertActionLabel(), /unlock/i);
+});
+
+test('adding a repository that already exists is reported as success', async () => {
+    const c = Ui.hangarReposUi();
+    c.refresh = async () => {};
+    await withDialogs({ passwordDialog: async () => 'hunter2' }, () =>
+        withStubs([[Secrets, 'writeKey', async () => 'k'], [Config, 'writeRepo', async () => {}]], () =>
+            withCockpit({ spawn: rejectsWith(1, 'Fatal: config file already exists') },
+                () => c.create({ id: 'nas', kind: 'local', path: '/srv/b' }))));
+    assert.equal(c.alert.level, 'success');
+    assert.match(c.alert.message, /already existed/i);
+});
+
+test('a password dialog that cannot be shown becomes an alert, not a lost click', async () => {
+    const c = Ui.hangarReposUi();
+    c.refresh = async () => {};
+    await withDialogs({ passwordDialog: async () => { throw new Error('no modal'); } },
+        () => c.create({ id: 'nas', kind: 'local', path: '/srv/b' }));
+    assert.equal(c.alert.level, 'danger');
+    assert.equal(c.alert.context, 'Add repository');
+
+    const row = repoRow();
+    await withDialogs({ passwordDialog: async () => { throw new Error('no modal'); } }, () => c.reprompt(row));
+    assert.ok(row.alert);
+    assert.equal(row.busy, '');
+});
+
+test('cancelling the password prompt changes nothing', async () => {
+    const c = Ui.hangarReposUi();
+    let wrote = 0;
+    await withDialogs({ passwordDialog: async () => '' }, () =>
+        withStubs([[Secrets, 'writeKey', async () => { wrote++; }]],
+            () => c.create({ id: 'nas', kind: 'local', path: '/srv/b' })));
+    assert.equal(wrote, 0);
+    assert.equal(c.alert, null);
+});
+
+test('saving a new password reports a failing write on the row', async () => {
+    const c = Ui.hangarReposUi();
+    const row = repoRow();
+    await withDialogs({ passwordDialog: async () => 'hunter2' }, () =>
+        withStubs([[Secrets, 'writeKey', async () => {
+            throw Errors.create(Errors.KIND.GENERIC, 'permission denied');
+        }]], () => c.reprompt(row)));
+    assert.equal(row.alert.level, 'danger');
+    assert.match(row.alert.context, /password/i);
+    assert.equal(row.busy, '');
+});
+
+test('editing a repository surfaces a failing write', async () => {
+    const c = Ui.hangarReposUi();
+    c.refresh = async () => {};
+    const row = repoRow();
+    await withStubs([[Config, 'writeRepo', async () => {
+        throw Errors.create(Errors.KIND.GENERIC, 'disk full');
+    }]], () => c.update(row, { id: 'nas', kind: 'local', path: '/srv/b' }));
+    assert.equal(c.alert.context, 'Saving repository');
+    assert.equal(row.busy, '');
+});
+
+test('removing a repository still drops the definition when the key will not go', async () => {
+    const c = Ui.hangarReposUi();
+    c.refresh = async () => {};
+    const row = repoRow();
+    let removedFile = false;
+    const file = () => ({ replace: (v) => { removedFile = v === null; return Promise.resolve(); }, close() {} });
+    await withDialogs({ confirmDialog: async () => true }, () =>
+        withStubs([[Secrets, 'removeKey', async () => {
+            throw Errors.create(Errors.KIND.GENERIC, 'permission denied');
+        }]], () => withCockpit({ spawn: () => Promise.resolve(''), file: file }, () => c.remove(row))));
+    assert.equal(removedFile, true, 'the reference must go once the user confirmed');
+    assert.ok(c.alert, 'and the leftover password file is still reported');
+    assert.match(c.alert.context, /password/i);
+});
+
+test('removing a repository without cockpit reports it', async () => {
+    const c = Ui.hangarReposUi();
+    c.refresh = async () => {};
+    const row = repoRow();
+    await withDialogs({ confirmDialog: async () => true }, () => c.remove(row));
+    assert.equal(c.alert.context, 'Removing repository');
+    assert.equal(row.busy, '');
+});
+
+test('a confirm dialog that cannot be shown never removes anything', async () => {
+    const c = Ui.hangarReposUi();
+    c.refresh = async () => {};
+    const row = repoRow();
+    let removed = 0;
+    await withDialogs({ confirmDialog: async () => { throw new Error('no modal'); } }, () =>
+        withStubs([[Secrets, 'removeKey', async () => { removed++; }]], () => c.remove(row)));
+    assert.equal(removed, 0, 'a failed confirmation is not a confirmation');
+    assert.ok(c.alert);
+});
+
+test('a failing test-connection offers the remediation and clears busy', async () => {
+    const c = Ui.hangarReposUi();
+    const row = repoRow();
+    await withCockpit({ spawn: rejectsWith(10, '') }, () => c.testConnection(row));
+    assert.equal(row.alert.remediation, 'init');
+    assert.equal(row.busy, '');
+});
+
+// --------------------------------------------------------- screen-level actions
+
+test('the screen alert only offers an action it can actually perform', () => {
+    const c = Ui.hangarReposUi();
+    c.rows = [repoRow('nas')];
+
+    c.alert = Ui.toAlert(Restic.classifyExit(11, ''), 'Add repository', 'nas');
+    assert.match(c.alertActionLabel(), /unlock/i);
+
+    // Same error, but the repository is not on screen: a button that cannot act is
+    // worse than no button.
+    c.alert = Ui.toAlert(Restic.classifyExit(11, ''), 'Add repository', 'gone');
+    assert.equal(c.alertActionLabel(), '');
+
+    c.alert = Ui.toAlert(Restic.classifyExit(1, 'dial tcp: i/o timeout'), 'Listing repositories');
+    assert.match(c.alertActionLabel(), /try again/i);
+
+    c.alert = null;
+    assert.equal(c.alertActionLabel(), '');
+});
+
+test('the screen-level remediation runs against the right row', async () => {
+    const c = Ui.hangarReposUi();
+    const row = repoRow('nas');
+    c.rows = [repoRow('other'), row];
+    const seen = [];
+    c.unlock = async (r) => seen.push('unlock:' + r.id);
+    c.refresh = async () => seen.push('refresh');
+
+    c.alert = Ui.toAlert(Restic.classifyExit(11, ''), 'Add repository', 'nas');
+    await c.remediateAlert();
+    assert.deepEqual(seen, ['unlock:nas']);
+    assert.equal(c.alert, null, 'the alert is consumed by acting on it');
+
+    c.alert = Ui.toAlert(Restic.classifyExit(1, 'dial tcp: i/o timeout'), 'Listing repositories');
+    await c.remediateAlert();
+    assert.deepEqual(seen, ['unlock:nas', 'refresh']);
+
+    c.alert = { remediation: 'list-unreadable', files: ['/a'], actionLabel: 'Show unreadable files' };
+    await c.remediateAlert();
+    assert.equal(c.showFiles, true);
+
+    c.alert = null;
+    assert.equal(await c.remediateAlert(), null);
+});
+
+test('remediate ignores a row that is not there', async () => {
+    const c = Ui.hangarReposUi();
+    assert.equal(await c.remediate(null), null);
+    assert.equal(await c.remediate(undefined), null);
+});
+
+// ============================================================================
+// The edit dialog against hostile state.
+// ============================================================================
+
+test('the edit dialog resolves with nothing when there is no modal to show', async () => {
+    // Under node there is no event target. openAdd() must not reject into a click
+    // handler that has nowhere to put the rejection.
+    const c = Ui.hangarReposUi();
+    let created = 0;
+    c.create = async () => { created++; };
+    await c.openAdd();
+    assert.equal(created, 0);
+    assert.equal(await Ui.repoEditDialog({ mode: 'add' }), null);
+});
+
+test('openEdit does nothing when the dialog cannot be shown', async () => {
+    const c = Ui.hangarReposUi();
+    let updated = 0;
+    c.update = async () => { updated++; };
+    await c.openEdit(repoRow());
+    assert.equal(updated, 0);
+});
+
+test('the edit component ignores a hostile event payload', () => {
+    const e = Ui.hangarRepoEdit();
+    for (const bad of [null, undefined, 'nope', 42, []]) {
+        assert.doesNotThrow(() => e.receive(bad));
+        assert.equal(e.kind, 'local');
+        assert.deepEqual(e.form, Ui.blankForm('local'));
+    }
+});
+
+test('a stored kind this build does not know falls back to a form with fields', () => {
+    const e = Ui.hangarRepoEdit();
+    e.receive({ mode: 'edit', form: { id: 'x', kind: 'dropbox' } });
+    assert.equal(e.kind, 'local');
+    assert.equal(e.form.kind, 'local');
+    assert.ok(e.fields().length > 0, 'a dialog with no fields has no way out');
+    assert.equal(e.form.id, 'x');
+});
+
+test('setKind refuses a kind that would leave the form empty', () => {
+    const e = Ui.hangarRepoEdit();
+    e.receive({ mode: 'add' });
+    for (const bad of [null, undefined, '', 'dropbox', 42, {}]) {
+        e.setKind(bad);
+        assert.equal(e.kind, 'local', String(bad));
+        assert.ok(e.fields().length > 0, String(bad));
+    }
+});
+
+test('init is a no-op where there is nothing to listen on', () => {
+    assert.doesNotThrow(() => Ui.hangarRepoEdit().init());
+});
+
+test('submitting twice resolves once', () => {
+    const e = Ui.hangarRepoEdit();
+    let calls = 0;
+    e.receive({ mode: 'add', form: form('local'), resolve: () => { calls++; } });
+    e.submit();
+    e.submit();
+    assert.equal(calls, 1);
+});
+
+test('loadRemotes tolerates a listing that is not a list and allows a later retry', async () => {
+    const e = Ui.hangarRepoEdit();
+    await withStubs([[Repos, 'listRcloneRemotes', async () => 'gdrive:']], () => e.loadRemotes());
+    assert.deepEqual(e.remotes, []);
+
+    const e2 = Ui.hangarRepoEdit();
+    await withStubs([[Repos, 'listRcloneRemotes', async () => { throw new Error('boom'); }]],
+        () => e2.loadRemotes());
+    assert.deepEqual(e2.remotes, []);
+    assert.equal(e2.remotesLoaded, false, 'a failed probe must be retryable');
+});
+
+// ============================================================================
+// Accessibility and naming.
+// ============================================================================
+
+test('the snapshot browser is only ever called Logbook', () => {
+    // The rejected name is assembled rather than written out, so this file cannot
+    // itself become the thing the smoke test is looking for.
+    const forbidden = new RegExp(['time', '\\s*', 'machine'].join(''), 'i');
+    assert.ok(!forbidden.test(SOURCE));
+    assert.ok(!forbidden.test(MODAL));
+    assert.ok(!forbidden.test(Ui.TEMPLATE));
+    assert.ok(!forbidden.test(JSON.stringify(Ui.KIND_LABEL) + JSON.stringify(Ui.BUSY_LABEL)));
+});
+
+test('per-row buttons name the repository they act on', () => {
+    for (const verb of ['Test', 'Check', 'Unlock', 'Edit', 'Remove'])
+        assert.ok(Ui.TEMPLATE.includes(":aria-label=\"'" + verb + " ' + row.title\""), verb);
+});
+
+test('alerts and progress announce themselves', () => {
+    // Without role="alert" a failure that appears in place is silent for a screen
+    // reader: the user hears nothing and assumes the click did nothing.
+    const alerts = Ui.TEMPLATE.match(/class="alert |:class="alertClass/g) || [];
+    const roles = Ui.TEMPLATE.match(/role="alert"/g) || [];
+    assert.ok(roles.length >= alerts.length - 1,
+        roles.length + ' role="alert" for ' + alerts.length + ' alerts');
+    assert.match(Ui.TEMPLATE, /role="status"/);
+    assert.match(Ui.TEMPLATE, /aria-live="polite"/);
+});
+
+test('the screen has no clickable non-buttons', () => {
+    for (const markup of [Ui.TEMPLATE, MODAL]) {
+        const clickable = markup.match(/<(?!button)[a-z]+[^>]*@click/g) || [];
+        assert.deepEqual(clickable, [], 'clickable non-button: ' + clickable.join(', '));
+        assert.ok(!/onclick=/i.test(markup));
+    }
+});
+
+test('every modal button is a real typed button', () => {
+    const buttons = MODAL.match(/<button[^>]*>/g) || [];
+    assert.ok(buttons.length >= 3);
+    for (const b of buttons) assert.match(b, /type="(button|submit)"/);
+    // The close icon has no text, so it needs a name of its own.
+    assert.match(MODAL, /class="btn-close"[^>]*aria-label="Close"/);
+});
+
+test('every modal input is bound to a label', () => {
+    const inputs = MODAL.match(/<(input|select)[^>]*>/g) || [];
+    assert.ok(inputs.length >= 4);
+    for (const el of inputs) {
+        assert.ok(/\sid="/.test(el) || /\s:id="/.test(el), 'no id to label: ' + el);
+    }
+    assert.match(MODAL, /<label class="form-label" for="hangar-repo-id">/);
+    assert.match(MODAL, /<label class="form-label" for="hangar-repo-label">/);
+    assert.match(MODAL, /<label class="form-label" for="hangar-repo-kind">/);
+    assert.match(MODAL, /:for="'hangar-repo-f-' \+ f\.name"/);
+    assert.match(MODAL, /:id="'hangar-repo-f-' \+ f\.name"/);
+});
+
+test('the id field is readonly rather than disabled when it is locked', () => {
+    // A disabled input is skipped by screen-reader forms mode, so the one field the
+    // user cannot change would also be the one they never hear about.
+    assert.match(MODAL, /:readonly="idLocked\(\)"/);
+    assert.ok(!/:disabled="idLocked\(\)"/.test(MODAL));
+});
+
+test('the validation summary is announced', () => {
+    assert.match(MODAL, /x-show="problems\.length" role="alert"/);
+});
+
+test('the module still touches no DOM and no cockpit at load time', () => {
+    // Re-asserted at the END of the file: every test above installs and removes its
+    // own fakes, and a leak would make the first assertion in this file a lie.
+    assert.equal(typeof globalThis.document, 'undefined');
+    assert.equal(typeof globalThis.cockpit, 'undefined');
+    // No top-level declaration may reference either outside a guard.
+    const topLevel = SOURCE.split('\n').filter((l) => /^\s{4}(const|let|var)\s/.test(l));
+    for (const l of topLevel)
+        assert.ok(!/\bcockpit\b|\bdocument\b/.test(l), 'load-time access: ' + l.trim());
 });

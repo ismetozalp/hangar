@@ -115,8 +115,10 @@
         return str(v).trim();
     }
 
+    // typeof first: String(['local']) is 'local', and an array that happens to
+    // stringify to a backend name must not be treated as that backend.
     function isKind(kind) {
-        return Repos.KINDS.indexOf(str(kind)) >= 0;
+        return typeof kind === 'string' && Repos.KINDS.indexOf(kind) >= 0;
     }
 
     function kindLabel(kind) {
@@ -210,6 +212,16 @@
         return next;
     }
 
+    // config.js caps the id at 63 characters because it becomes a filename and a
+    // systemd unit instance name. repos.js has no length opinion, so without this
+    // the form accepts an id that the save then rejects.
+    const MAX_ID_LEN = 63;
+
+    // A line break or a NUL in a pasted value is always an accident, and every one
+    // of these strings ends up in an argv element, a JSON file or a unit file where
+    // it produces a failure nobody can read back to the box they typed it in.
+    const CONTROL_RE = /[\u0000-\u001f\u007f]/;
+
     function validateForm(kind, form, existingIds) {
         const repo = formStateToRepo(kind, form);
         const problems = Repos.validate(repo);
@@ -219,6 +231,12 @@
         // command line. Catch it in the form rather than three calls later.
         if (repo.id !== '' && /^-/.test(repo.id))
             problems.push('Repository id must start with a letter or a digit.');
+
+        if (repo.id.length > MAX_ID_LEN)
+            problems.push('Repository id must be at most ' + MAX_ID_LEN + ' characters.');
+
+        if (Object.keys(repo).some(function (k) { return CONTROL_RE.test(str(repo[k])); }))
+            problems.push('Values must not contain line breaks or control characters.');
 
         const taken = Array.isArray(existingIds) ? existingIds.map(trimmed) : [];
         if (repo.id !== '' && taken.indexOf(repo.id) >= 0)

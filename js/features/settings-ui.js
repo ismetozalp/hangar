@@ -1,9 +1,9 @@
 // features/settings-ui.js — global settings, and the diagnostics a bug report needs.
 //
-// Two screens in one, deliberately. The settings themselves are three fields; on
-// their own they would not justify a tab. But Settings is where a user goes when
-// something is wrong, so this is also where hangar answers "what does this machine
-// actually have installed?" in a form that can be pasted into an issue.
+// Two screens in one, deliberately. The settings themselves are a handful of
+// fields; on their own they would not justify a tab. But Settings is where a user
+// goes when something is wrong, so this is also where hangar answers "what does
+// this machine actually have installed?" in a form that can be pasted into an issue.
 //
 // Everything that decides an answer — validation, dirty detection, the diagnostics
 // report — is a pure function at the top of the file. The Alpine component below
@@ -123,17 +123,45 @@
         return ['Notify on failure must be true or false.'];
     }
 
+    // index.html loads update.js AFTER this file, so HangarUpdate cannot be
+    // resolved at load time. The require is guarded because a settings form that
+    // will not render is a worse outcome than an update check that cannot be
+    // configured.
+    function updateModule() {
+        if (root.HangarUpdate) return root.HangarUpdate;
+        if (!req) return null;
+        try { return req('./update.js'); } catch (e) { return null; }
+    }
+
+    // The same grammar update.js accepts, restated here so the field is still
+    // validated when HangarUpdate is absent. Falling back to "accept anything"
+    // is the worse failure: it saves a repository hangar can never check, and
+    // the user finds out months later by never being offered an update.
+    const OWNER_NAME_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
+    const MAX_REPO_LEN = 200;
+    const BAD_REPO = 'Update repository must be "owner/name" or a GitHub repository URL.';
+
+    function looksLikeRepo(s) {
+        return OWNER_NAME_RE.test(str(s)
+            .replace(/^https?:\/\/(www\.)?github\.com\//i, '')
+            .replace(/\.git$/i, '')
+            .replace(/^\/+|\/+$/g, ''));
+    }
+
     // Empty is valid and is the default: with no repository set, hangar never
     // contacts GitHub at all. A non-empty value must be a real owner/name, since a
     // wrong one would silently never find an update.
     function updateRepoProblems(value) {
         const s = trimmed(value);
         if (s === '') return [];
-        const Update = root.HangarUpdate ||
-            (typeof require === 'function' ? require('../features/update.js') : null);
-        if (Update && !Update.releasesApiUrl(s))
-            return ['Update repository must be "owner/name" or a GitHub repository URL.'];
-        return [];
+        // Bounded and control-character-free before anything downstream builds a
+        // curl argv out of it — checked here rather than trusted to the consumer.
+        if (s.length > MAX_REPO_LEN || /[\x00-\x1f\x7f]/.test(s)) return [BAD_REPO];
+        const Update = updateModule();
+        const ok = (Update && typeof Update.releasesApiUrl === 'function')
+            ? !!Update.releasesApiUrl(s)
+            : looksLikeRepo(s);
+        return ok ? [] : [BAD_REPO];
     }
 
     function checkOnStartupProblems(value) {
@@ -385,6 +413,49 @@
         return str(e.message) || str(e);
     }
 
+    // ------------------------------------------------- pure: failure routing
+
+    // A non-fatal outcome — READ_ERRORS above all — is a PARTIAL SUCCESS: the
+    // operation did what it could. Rendering it in the red box is exactly the
+    // mistake that teaches an operator to ignore the red box, so this is the one
+    // place that decides which of the two boxes an outcome lands in.
+    function isPartial(err) {
+        return !!Errors && Errors.isHangarError(err) && !Errors.isFatal(err);
+    }
+
+    // The producer decides the shape of `detail`; all of them are accepted so no
+    // caller has to reshape a non-failure into a failure just to report it.
+    // "Partial" without the list of files is unactionable.
+    function unreadableFrom(err) {
+        const d = err && err.detail;
+        let list = null;
+        if (Array.isArray(d)) list = d;
+        else if (d && typeof d === 'object') {
+            list = Array.isArray(d.errors) ? d.errors
+                : Array.isArray(d.files) ? d.files
+                    : Array.isArray(d.unreadable) ? d.unreadable : null;
+        }
+        if (!list) return [];
+
+        const seen = Object.create(null);
+        const out = [];
+        list.forEach(function (f) {
+            const text = trimmed(f && typeof f === 'object'
+                ? (f.item || f.path || f.message) : f);
+            if (text === '' || seen[text]) return;
+            seen[text] = true;
+            out.push(text);
+        });
+        return out;
+    }
+
+    function routeError(err) {
+        if (!err) return { error: null, partial: null };
+        return isPartial(err)
+            ? { error: null, partial: err }
+            : { error: err, partial: null };
+    }
+
     // "900 seconds" means nothing at a glance; "15 minutes" does.
     function describeTimeout(value) {
         const n = toNumber(value);
@@ -436,12 +507,20 @@
     function hangarSettingsUi(deps) {
         const D = resolveDeps(deps);
 
+        // An injected clock is still someone else's code. A throwing now() must
+        // not be the reason the diagnostics spinner never stops.
+        function nowText() {
+            try { return str(D.now()); } catch (e) { return ''; }
+        }
+
         return {
             loading: true,
             saving: false,
             saved: null,            // last known on-disk settings
             form: formFromSettings(null),
-            error: null,            // load or save failure
+            error: null,            // fatal load or save failure
+            partial: null,          // non-fatal outcome — a warning, never a failure
+            errorFrom: '',          // 'load' | 'save' — which operation the error belongs to
             savedAt: null,          // set on a successful write, cleared on edit
             diag: null,             // gathered diagnostics
             diagLoading: false,
@@ -461,14 +540,19 @@
             async load() {
                 this.loading = true;
                 this.error = null;
+                this.partial = null;
                 try {
                     const settings = await D.config.readGlobal();
                     this.saved = settings;
                     this.form = formFromSettings(settings);
                 } catch (e) {
                     // Unreadable settings are not a dead screen: defaults still let
-                    // the user see what hangar would use, and fix it.
-                    this.error = e;
+                    // the user see what hangar would use, and fix it. A partial read
+                    // lands in the warning slot, not the failure slot.
+                    const routed = routeError(e);
+                    this.error = routed.error;
+                    this.partial = routed.partial;
+                    this.errorFrom = 'load';
                     this.saved = formFromSettings(null);
                     this.form = formFromSettings(null);
                 } finally {
@@ -486,6 +570,10 @@
             canSave() { return !this.saving && this.dirty() && this.problems().length === 0; },
             canRevert() { return !this.saving && this.dirty(); },
             errorRemediation() { return this.error && D.errors ? D.errors.remediationFor(this.error) : null; },
+            // Never empty, so the action button always has an accessible name even
+            // if a future error kind arrives with a slug this screen has no word for.
+            remediationText() { return remediationLabel(this.errorRemediation()) || 'Try again'; },
+            unreadable() { return unreadableFrom(this.partial); },
 
             // --- actions -------------------------------------------------
 
@@ -496,11 +584,22 @@
                 this.copyState = '';
             },
 
+            // The remediation button retries the operation that actually failed.
+            // Wiring it to load() unconditionally silently discarded the user's
+            // unsaved edits every time a save failed, while the button's label
+            // claimed to be doing something else entirely.
+            async remediate() {
+                if (this.errorFrom === 'save') return this.save();
+                await this.load();
+                return !this.error;
+            },
+
             async save() {
                 if (this.problems().length) return false;
                 if (this.saving) return false;
                 this.saving = true;
                 this.error = null;
+                this.partial = null;
                 try {
                     const next = settingsFromForm(this.form);
                     await D.config.writeGlobal(next);
@@ -508,13 +607,18 @@
                     // what the screen shows is what a reader of the file would get.
                     this.saved = D.config.mergeGlobal(next);
                     this.form = formFromSettings(this.saved);
-                    this.savedAt = D.now();
+                    this.savedAt = nowText();
                     // The report quotes the settings, so it is stale the moment
                     // they change.
                     if (this.diag) this.diag.settings = this.saved;
                     return true;
                 } catch (e) {
-                    this.error = e;
+                    // A non-fatal write outcome is not a red box. The edit stays in
+                    // the form either way, so nothing the user typed is lost.
+                    const routed = routeError(e);
+                    this.error = routed.error;
+                    this.partial = routed.partial;
+                    this.errorFrom = 'save';
                     return false;
                 } finally {
                     this.saving = false;
@@ -528,37 +632,48 @@
 
             // --- diagnostics ---------------------------------------------
 
+            // Every step is individually caught: one probe that cannot run must not
+            // cost the user the answers the others produced. The finally is what
+            // stops a throw anywhere here from leaving "Checking…" on screen and
+            // Re-check disabled for the life of the page.
             async loadDiagnostics() {
                 this.diagLoading = true;
                 this.copyState = '';
                 const notes = [];
                 const info = {
                     version: null, family: UNKNOWN, tools: [],
-                    fuse: null, settings: this.saved, generatedAt: D.now(), notes: notes
+                    fuse: null, settings: this.saved, generatedAt: nowText(), notes: notes
                 };
 
                 try {
-                    info.version = await D.readVersion();
-                } catch (e) {
-                    notes.push('The installed version could not be read.');
-                }
-                try {
-                    info.family = await D.provision.detectFamilyLive();
-                } catch (e) {
-                    info.family = UNKNOWN;
-                    notes.push('The distribution family could not be detected.');
-                }
-                try {
-                    info.tools = await D.provision.probeAll();
-                } catch (e) {
-                    info.tools = [];
-                    notes.push('Installed tools could not be probed: ' + errorText(e));
-                }
+                    try {
+                        info.version = await D.readVersion();
+                    } catch (e) {
+                        notes.push('The installed version could not be read.');
+                    }
+                    try {
+                        info.family = await D.provision.detectFamilyLive();
+                    } catch (e) {
+                        info.family = UNKNOWN;
+                        notes.push('The distribution family could not be detected.');
+                    }
+                    try {
+                        info.tools = await D.provision.probeAll();
+                    } catch (e) {
+                        info.tools = [];
+                        // A partial probe still probed something, and the note has to
+                        // say which — "could not be probed" with no reason is a dead end.
+                        const files = unreadableFrom(e);
+                        notes.push('Installed tools could not be probed: ' + errorText(e) +
+                            (files.length ? ' (' + files.join(', ') + ')' : ''));
+                    }
 
-                info.fuse = fuseState(info.tools);
-                this.diag = info;
-                this.diagLoading = false;
-                return info;
+                    info.fuse = fuseState(info.tools);
+                    this.diag = info;
+                    return info;
+                } finally {
+                    this.diagLoading = false;
+                }
             },
 
             tools() { return toolRows(this.diag && this.diag.tools); },
@@ -605,14 +720,35 @@
         '    <span x-show="loading" class="text-secondary small">Loading…</span>',
         '  </div>',
 
-        '  <div x-show="error" class="alert alert-danger d-flex align-items-center gap-3">',
-        '    <div class="flex-grow-1">',
-        '      <strong>Settings could not be read or written.</strong>',
-        '      <div class="small" x-text="errorText(error)"></div>',
+        // x-show sets an inline `display: none`, but Bootstrap's `.d-flex` is
+        // `display: flex !important` and wins — so the two must never share an
+        // element or the alert is permanently visible. Toggle on a plain wrapper.
+        '  <div x-show="error">',
+        '    <div class="alert alert-danger d-flex align-items-center gap-3" role="alert">',
+        '      <div class="flex-grow-1">',
+        '        <strong>Settings could not be read or written.</strong>',
+        '        <div class="small" x-text="errorText(error)"></div>',
+        '      </div>',
+        // The remediation is the whole point of a typed error: an action, not a
+        // toast. It retries what failed rather than reloading over the user's edits.
+        '      <button type="button" class="btn btn-sm btn-danger"',
+        '              x-show="errorRemediation()"',
+        '              @click="remediate()" x-text="remediationText()"></button>',
         '    </div>',
-        '    <button type="button" class="btn btn-sm btn-danger"',
-        '            x-show="errorRemediation()"',
-        '            @click="load()" x-text="remediationLabel(errorRemediation())"></button>',
+        '  </div>',
+
+        // A non-fatal outcome is a PARTIAL SUCCESS and wears amber, never red —
+        // and it names the files it could not read, because "partial" on its own
+        // gives the user nothing to act on.
+        '  <div x-show="partial" class="alert alert-warning" role="status">',
+        '    <strong>Some settings were read, but not all of them.</strong>',
+        '    <div class="small" x-text="errorText(partial)"></div>',
+        '    <div class="small mt-2" x-show="unreadable().length">These could not be read:</div>',
+        '    <ul class="small mb-0" x-show="unreadable().length">',
+        '      <template x-for="f in unreadable()" :key="f">',
+        '        <li class="hangar-mono" x-text="f"></li>',
+        '      </template>',
+        '    </ul>',
         '  </div>',
 
         // --- the form ---------------------------------------------------
@@ -755,8 +891,12 @@
         '      </table>',
         '    </div>',
 
-        '    <label class="form-label small" for="hangar-diagnostics-report">Plain-text report</label>',
+        // <pre> is not a labelable element, so a <label for> here would be inert
+        // for a screen reader. A named, focusable region is the pattern that
+        // actually works for a scrollable block of text.
+        '    <div class="form-label small" id="hangar-diagnostics-report-label">Plain-text report</div>',
         '    <pre class="hangar-rawlog mb-0" id="hangar-diagnostics-report" tabindex="0"',
+        '         role="region" aria-labelledby="hangar-diagnostics-report-label"',
         '         x-text="report()"></pre>',
         '  </section>',
         '</div>'
@@ -784,15 +924,17 @@
     root.hangarSettingsUi = hangarSettingsUi;
 
     const HangarSettingsUi = {
-        EDITABLE, NEVER_IDLE, MIN_IDLE_SEC, MAX_IDLE_SEC, MAX_PATH_LEN, VERSION_PATH,
-        REMEDIATION_LABEL, STATUS_CLASS, TEMPLATE,
+        EDITABLE, NEVER_IDLE, MIN_IDLE_SEC, MAX_IDLE_SEC, MAX_PATH_LEN, MAX_REPO_LEN,
+        VERSION_PATH, REMEDIATION_LABEL, STATUS_CLASS, TEMPLATE,
         toNumber, pathProblems, timeoutProblems, notifyProblems,
+        updateRepoProblems, checkOnStartupProblems, looksLikeRepo,
         fieldProblems, validateSettings,
         formFromSettings, settingsFromForm,
         sameValue, isDirty, changedFields,
         parseVersionFile, versionText, bannerText, toolStatus, toolRows, fuseState,
         pad, diagnosticsText,
         remediationLabel, errorText, describeTimeout, statusClass,
+        isPartial, unreadableFrom, routeError,
         readInstalledVersion, mount, hangarSettingsUi
     };
     root.HangarSettingsUi = HangarSettingsUi;

@@ -121,14 +121,19 @@
     // credential name (AWS_SECRET_ACCESS_KEY is 21) and a longer run still
     // matches on its tail, so nothing stops being masked.
     //
-    // The value alternation is ordered, and the order is the point. A closing
-    // quote wins first (and may span lines, as a JSON blob does); only when
-    // there is none do we fall back to "quote to end of line", because a log
-    // tail truncated mid-value used to fail every alternative and hand the
-    // secret through unmasked. Escapes are consumed so a password containing a
-    // quote cannot terminate its own string early.
+    // The value alternation is ordered, and the order is the point:
+    //   1,2  a properly closed quoted string, which may span lines as a JSON
+    //        blob does — escapes are consumed so a password containing a quote
+    //        cannot terminate its own string early;
+    //   3    a bare run ending in a quoted string, which is how a nested
+    //        assignment (`stderr: password="x"`) arrives — without it the value
+    //        stops at the quote and the nested pair is never seen;
+    //   4    anything up to an unclosed quote, then the rest of the line,
+    //        because a log tail truncated mid-value used to fail every
+    //        alternative and hand the secret through unmasked;
+    //   5    a bare token.
     const PAIR_RE =
-        /("?)([A-Za-z_][A-Za-z0-9_.-]{0,63})\1(\s*[:=]\s*)("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|"[^\n]*|'[^\n]*|[^\s"']+)/g;
+        /("?)([A-Za-z_][A-Za-z0-9_.-]{0,63})\1(\s*[:=]\s*)("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s"']*(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')|[^\s"']*["'][^\n]+|[^\s"']+)/g;
 
     function isSecretName(name) {
         if (NOT_SECRET_NAME_RE.test(name)) return false;
@@ -137,25 +142,42 @@
     }
 
     // A value can itself be an assignment — systemd's `Environment=` wraps one,
-    // and so does any journal line prefixed `stderr: `. Without descending into
-    // it the outer pair consumes the inner one and the secret is never
-    // inspected. The descent rewrites nothing unless something below it was
-    // actually masked, so a name that is merely assignment-shaped comes back
-    // byte for byte. The depth cap bounds the work on a hostile `a=b=c=...`.
-    const MAX_PAIR_DEPTH = 3;
+    // and so does any journal line prefixed `stderr: `. So this is a scan
+    // rather than a String.replace: on a name that is not a secret the scan
+    // resumes at the first character of its value instead of consuming it,
+    // which is the only way the inner pair is ever looked at. Everything
+    // outside a masked value is copied through byte for byte.
+    //
+    // Descending re-reads the value, so an unbudgeted descent is quadratic on a
+    // hostile `a=b=c=...` line. The budget caps the total re-read at a small
+    // multiple of the input instead of capping any single value, so an ordinary
+    // line keeps its descent however long its value is.
+    const NEST_BUDGET = 4;
 
-    function redactPairs(text, depth) {
-        const left = depth === undefined ? MAX_PAIR_DEPTH : depth;
-        return text.replace(PAIR_RE, (m, q, name, sep, value) => {
-            if (isSecretName(name)) {
+    function redactPairs(text) {
+        let out = '';
+        let taken = 0;
+        let budget = text.length * NEST_BUDGET;
+        let m;
+        PAIR_RE.lastIndex = 0;
+        while ((m = PAIR_RE.exec(text)) !== null) {
+            const value = m[4];
+            const valueAt = m.index + m[0].length - value.length;
+            if (isSecretName(m[2])) {
                 const ch = value.charAt(0);
-                const masked = (ch === '"' || ch === "'") ? ch + MASK + ch : MASK;
-                return q + name + q + sep + masked;
+                out += text.slice(taken, valueAt) +
+                    ((ch === '"' || ch === "'") ? ch + MASK + ch : MASK);
+                taken = m.index + m[0].length;
+                continue;
             }
-            if (left <= 0) return m;
-            const inner = redactPairs(value, left - 1);
-            return inner === value ? m : q + name + q + sep + inner;
-        });
+            // valueAt is always past m.index (a name and a separator precede
+            // it), so the scan cannot stall here.
+            if (value.length <= budget) {
+                budget -= value.length;
+                PAIR_RE.lastIndex = valueAt;
+            }
+        }
+        return out + text.slice(taken);
     }
 
     // The redactor runs on the failure path, on whatever the failure handed us.
@@ -177,8 +199,9 @@
         let out = asText(text);
         out = out.replace(URL_USERINFO_RE, '$1$2:' + MASK + '@');
         out = out.replace(SET_CREDENTIAL_RE, '$1' + MASK);
-        // Environment= wraps a second assignment; without this the outer pair
-        // swallows the inner one and the inner value never gets inspected.
+        // Environment= wraps a second assignment. redactPairs descends into a
+        // value on its own now, so this line is belt to that braces: it is the
+        // one nesting shape this module generates itself.
         out = out.replace(ENVIRONMENT_LINE_RE, (m, head, rest) => head + redactPairs(rest));
         return redactPairs(out);
     }
