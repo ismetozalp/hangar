@@ -1,0 +1,255 @@
+<!-- Backup job editor.
+     Opened by the Jobs screen via the 'hangar:job-edit' event, which carries the
+     form state and a resolver — the same pattern as the shared confirm/password
+     dialogs, and the reason this markup can live outside #hangar-jobs.
+
+     The dialog validates but never writes: it resolves with the form state and
+     js/features/jobs-ui.js performs every write, so there is exactly one place
+     that touches /etc/hangar. -->
+<div class="modal fade" id="hangar-job-edit" tabindex="-1"
+     aria-labelledby="hangar-job-edit-title" aria-hidden="true"
+     x-data="hangarJobEdit()" x-init="init()">
+    <div class="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable">
+        <div class="modal-content">
+            <form @submit.prevent="submit()">
+
+                <div class="modal-header">
+                    <h5 class="modal-title" id="hangar-job-edit-title"
+                        x-text="form.isNew ? 'Create backup job' : 'Edit backup job'"></h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"
+                            @click="cancel()" aria-label="Close"></button>
+                </div>
+
+                <div class="modal-body">
+
+                    <!-- Identity ------------------------------------------------ -->
+                    <div class="row g-3 mb-3">
+                        <div class="col-sm-6">
+                            <label class="form-label" for="hangar-job-id">Job id</label>
+                            <input id="hangar-job-id" class="form-control hangar-mono"
+                                   x-model="form.id" :disabled="!form.isNew"
+                                   :aria-invalid="invalid('id')" :aria-describedby="'hangar-job-id-help'"
+                                   autocomplete="off" spellcheck="false">
+                            <div id="hangar-job-id-help" class="form-text">
+                                <span x-show="!invalid('id')">
+                                    Lower-case letters, digits and dashes. Becomes the systemd unit name.
+                                </span>
+                                <span class="text-danger" x-show="invalid('id')" x-text="messageFor('id')"></span>
+                            </div>
+                        </div>
+
+                        <div class="col-sm-6">
+                            <label class="form-label" for="hangar-job-name">Name</label>
+                            <input id="hangar-job-name" class="form-control" x-model="form.name"
+                                   autocomplete="off">
+                            <div class="form-text" x-text="messageFor('name')"></div>
+                        </div>
+                    </div>
+
+                    <!-- Destination --------------------------------------------- -->
+                    <div class="mb-3">
+                        <label class="form-label" for="hangar-job-repo">Repository</label>
+                        <select id="hangar-job-repo" class="form-select" x-model="form.repo"
+                                :aria-invalid="invalid('repo')">
+                            <option value="">Choose a repository…</option>
+                            <template x-for="r in repos" :key="r.id">
+                                <option :value="r.id" x-text="r.name || r.id"></option>
+                            </template>
+                        </select>
+                        <div class="form-text text-danger" x-show="invalid('repo')"
+                             x-text="messageFor('repo')"></div>
+                        <div class="form-text" x-show="!repos.length">
+                            No repositories are configured yet. Create one on the Repositories tab first.
+                        </div>
+                    </div>
+
+                    <hr>
+
+                    <!-- What gets backed up ------------------------------------- -->
+                    <div class="mb-3">
+                        <label class="form-label" for="hangar-job-paths">Paths to back up</label>
+                        <textarea id="hangar-job-paths" class="form-control hangar-mono" rows="4"
+                                  x-model="form.paths" :aria-invalid="invalid('paths')"
+                                  spellcheck="false" placeholder="/home&#10;/etc"></textarea>
+                        <div class="form-text">
+                            <span x-show="!invalid('paths')">One absolute path per line.</span>
+                            <span class="text-danger" x-show="invalid('paths')" x-text="messageFor('paths')"></span>
+                        </div>
+                    </div>
+
+                    <div class="mb-3">
+                        <label class="form-label" for="hangar-job-excludes">Exclude patterns</label>
+                        <textarea id="hangar-job-excludes" class="form-control hangar-mono" rows="3"
+                                  x-model="form.excludes" :aria-invalid="invalid('excludes')"
+                                  spellcheck="false" placeholder="*.tmp&#10;/home/*/.cache"></textarea>
+                        <div class="form-text">
+                            <span x-show="!invalid('excludes')">One pattern per line. Optional.</span>
+                            <span class="text-danger" x-show="invalid('excludes')"
+                                  x-text="messageFor('excludes')"></span>
+                        </div>
+                    </div>
+
+                    <div class="row g-3 mb-3">
+                        <div class="col-sm-6">
+                            <label class="form-label" for="hangar-job-exclude-file">Exclude file</label>
+                            <input id="hangar-job-exclude-file" class="form-control hangar-mono"
+                                   x-model="form.excludeFile" autocomplete="off" spellcheck="false"
+                                   placeholder="/etc/hangar/excludes.txt">
+                            <div class="form-text text-danger" x-show="invalid('excludeFile')"
+                                 x-text="messageFor('excludeFile')"></div>
+                        </div>
+                        <div class="col-sm-6">
+                            <label class="form-label" for="hangar-job-tags">Snapshot tags</label>
+                            <input id="hangar-job-tags" class="form-control" x-model="form.tags"
+                                   autocomplete="off" placeholder="nightly, laptop">
+                            <div class="form-text">
+                                <span x-show="!invalid('tags')">Comma separated. Optional.</span>
+                                <span class="text-danger" x-show="invalid('tags')"
+                                      x-text="messageFor('tags')"></span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="form-check mb-3">
+                        <input class="form-check-input" type="checkbox" id="hangar-job-onefs"
+                               x-model="form.oneFileSystem">
+                        <label class="form-check-label" for="hangar-job-onefs">
+                            Stay on one filesystem (do not follow mount points)
+                        </label>
+                    </div>
+
+                    <hr>
+
+                    <!-- Retention ----------------------------------------------- -->
+                    <div class="mb-3">
+                        <label class="form-label" for="hangar-job-retention">Retention</label>
+                        <select id="hangar-job-retention" class="form-select"
+                                x-model="form.retentionPreset" @change="onPresetChange()">
+                            <template x-for="p in presetNames()" :key="p">
+                                <option :value="p" x-text="presetLabel(p)"></option>
+                            </template>
+                        </select>
+                    </div>
+
+                    <!-- Custom counts. Shown only when the user asked for them, so the
+                         common case stays a single choice. -->
+                    <div class="row g-2 mb-3" x-show="form.retentionPreset === 'custom'">
+                        <template x-for="k in ['last', 'hourly', 'daily', 'weekly', 'monthly', 'yearly']" :key="k">
+                            <div class="col-6 col-md-4 col-lg-2">
+                                <label class="form-label small text-capitalize"
+                                       :for="'hangar-job-keep-' + k" x-text="'Keep ' + k"></label>
+                                <input class="form-control form-control-sm" type="number" min="0" step="1"
+                                       :id="'hangar-job-keep-' + k" x-model="form.retention[k]">
+                            </div>
+                        </template>
+                        <div class="col-6 col-md-4 col-lg-4">
+                            <label class="form-label small" for="hangar-job-keep-within">Keep everything within</label>
+                            <input id="hangar-job-keep-within" class="form-control form-control-sm"
+                                   x-model="form.retention.within" placeholder="7d" autocomplete="off">
+                        </div>
+                        <div class="col-6 col-md-4 col-lg-4">
+                            <label class="form-label small" for="hangar-job-keep-tags">Always keep tags</label>
+                            <input id="hangar-job-keep-tags" class="form-control form-control-sm"
+                                   x-model="form.retention.tags" placeholder="keep-forever" autocomplete="off">
+                        </div>
+                    </div>
+
+                    <!-- What the policy MEANS, live, before anything is saved. -->
+                    <div class="alert py-2 px-3 mb-3"
+                         :class="keepsNothing() ? 'alert-danger' : 'alert-secondary'">
+                        <div x-text="retentionText()"></div>
+                        <div class="small mt-1" x-show="!keepsNothing()" x-text="retentionEstimate()"></div>
+                        <div class="small mt-1" x-show="keepsNothing()">
+                            A job cannot be saved with this policy — pruning it would delete every
+                            snapshot in the repository group.
+                        </div>
+                        <div class="small text-danger mt-1"
+                             x-show="!keepsNothing() &amp;&amp; invalid('retention')"
+                             x-text="messageFor('retention')"></div>
+                    </div>
+
+                    <hr>
+
+                    <!-- Schedule ------------------------------------------------- -->
+                    <div class="mb-3">
+                        <label class="form-label" for="hangar-job-schedule">Schedule</label>
+                        <select id="hangar-job-schedule" class="form-select" x-model="form.scheduleMode">
+                            <template x-for="m in modes" :key="m.id">
+                                <option :value="m.id" x-text="m.label"></option>
+                            </template>
+                        </select>
+                    </div>
+
+                    <div class="mb-3" x-show="form.scheduleMode === 'custom'">
+                        <label class="form-label" for="hangar-job-calendar">OnCalendar expression</label>
+                        <input id="hangar-job-calendar" class="form-control hangar-mono"
+                               x-model="form.calendar" :aria-invalid="invalid('calendar')"
+                               autocomplete="off" spellcheck="false" placeholder="Mon..Fri 02:30">
+                        <div class="form-text">
+                            <span x-show="!invalid('calendar')">
+                                systemd calendar syntax, exactly as <code>systemd.time(7)</code> defines it.
+                            </span>
+                            <span class="text-danger" x-show="invalid('calendar')"
+                                  x-text="messageFor('calendar')"></span>
+                        </div>
+                    </div>
+
+                    <div class="alert alert-secondary py-2 px-3 mb-3">
+                        <div x-text="scheduleText()"></div>
+                        <div class="small hangar-mono mt-1" x-show="calendarPreview()"
+                             x-text="'OnCalendar=' + calendarPreview()"></div>
+                    </div>
+
+                    <div class="form-check mb-3">
+                        <input class="form-check-input" type="checkbox" id="hangar-job-enabled"
+                               x-model="form.enabled">
+                        <label class="form-check-label" for="hangar-job-enabled">
+                            Run on this schedule (enable the timer)
+                        </label>
+                    </div>
+
+                    <hr>
+
+                    <!-- Hooks ---------------------------------------------------- -->
+                    <div class="mb-3">
+                        <label class="form-label" for="hangar-job-pre">Before the backup</label>
+                        <input id="hangar-job-pre" class="form-control hangar-mono" x-model="form.preHook"
+                               autocomplete="off" spellcheck="false"
+                               placeholder="/usr/local/bin/dump-database.sh">
+                        <div class="form-text">
+                            <span x-show="!invalid('preHook')">
+                                Optional shell command. A non-zero exit stops the backup.
+                            </span>
+                            <span class="text-danger" x-show="invalid('preHook')"
+                                  x-text="messageFor('preHook')"></span>
+                        </div>
+                    </div>
+
+                    <div class="mb-0">
+                        <label class="form-label" for="hangar-job-post">After the backup</label>
+                        <input id="hangar-job-post" class="form-control hangar-mono" x-model="form.postHook"
+                               autocomplete="off" spellcheck="false">
+                        <div class="form-text">
+                            <span x-show="!invalid('postHook')">
+                                Optional shell command. Runs whether or not files were unreadable.
+                            </span>
+                            <span class="text-danger" x-show="invalid('postHook')"
+                                  x-text="messageFor('postHook')"></span>
+                        </div>
+                    </div>
+
+                </div>
+
+                <div class="modal-footer">
+                    <div class="me-auto small text-danger" x-show="submitted &amp;&amp; !canSave()">
+                        Fix the highlighted fields before saving.
+                    </div>
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal"
+                            @click="cancel()">Cancel</button>
+                    <button type="submit" class="btn btn-primary" :disabled="!canSave()">Save job</button>
+                </div>
+
+            </form>
+        </div>
+    </div>
+</div>

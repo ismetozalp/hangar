@@ -1,0 +1,139 @@
+<!-- Add / edit a repository.
+     Opened via the 'hangar:repo-edit' event so the Repositories screen never has to
+     reach into this modal's scope — same contract as confirm.html and password.html.
+
+     The field list is NOT hardcoded per backend: it comes from
+     HangarReposUi.fieldsFor(kind), which derives what is mandatory from
+     HangarRepos.REQUIRED. Adding a backend field to core/repos.js makes it appear
+     here without touching this file.
+
+     The repository PASSWORD is deliberately absent — creating a repository prompts
+     for it through the shared password dialog with confirmation, because a typo in
+     a new repository password is unrecoverable. -->
+<div class="modal fade" id="hangar-repo-edit" tabindex="-1"
+     aria-labelledby="hangar-repo-edit-title" aria-hidden="true"
+     x-data="hangarRepoEdit()" x-init="init()">
+    <div class="modal-dialog modal-dialog-centered modal-lg modal-dialog-scrollable">
+        <div class="modal-content">
+            <form @submit.prevent="submit()">
+
+                <div class="modal-header">
+                    <h5 class="modal-title" id="hangar-repo-edit-title" x-text="title()"></h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+
+                <div class="modal-body">
+
+                    <div class="row g-3 mb-3">
+                        <div class="col-sm-6">
+                            <label class="form-label" for="hangar-repo-id">Repository id</label>
+                            <!-- readonly rather than disabled: a disabled input is skipped
+                                 by screen-reader forms mode, so the one field the user
+                                 cannot change would also be the one they never hear about. -->
+                            <input id="hangar-repo-id" class="form-control hangar-mono"
+                                   x-model="form.id" :readonly="idLocked()"
+                                   :aria-readonly="idLocked() ? 'true' : null"
+                                   autocomplete="off" spellcheck="false"
+                                   placeholder="nas-nightly"
+                                   aria-describedby="hangar-repo-id-help">
+                            <div id="hangar-repo-id-help" class="form-text">
+                                Lowercase letters, digits and hyphens. Becomes the filename and the
+                                systemd unit name, so it cannot be changed later.
+                            </div>
+                        </div>
+
+                        <div class="col-sm-6">
+                            <label class="form-label" for="hangar-repo-label">Display name</label>
+                            <input id="hangar-repo-label" class="form-control"
+                                   x-model="form.label" autocomplete="off"
+                                   placeholder="Office NAS"
+                                   aria-describedby="hangar-repo-label-help">
+                            <div id="hangar-repo-label-help" class="form-text">
+                                Optional. Shown instead of the id in lists.
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="mb-3">
+                        <label class="form-label" for="hangar-repo-kind">Backend</label>
+                        <select id="hangar-repo-kind" class="form-select"
+                                :value="kind" @change="setKind($event.target.value)">
+                            <template x-for="k in kinds" :key="k.value">
+                                <option :value="k.value" :selected="k.value === kind" x-text="k.label"></option>
+                            </template>
+                        </select>
+                    </div>
+
+                    <!-- Kind-driven fields. -->
+                    <template x-for="f in fields()" :key="f.name">
+                        <div class="mb-3">
+                            <label class="form-label" :for="'hangar-repo-f-' + f.name">
+                                <span x-text="f.label"></span>
+                                <span x-show="!f.required" class="text-secondary small">(optional)</span>
+                            </label>
+
+                            <!-- rclone remotes are read from this host's rclone config;
+                                 hangar never creates them. A free-text box is offered when
+                                 rclone is absent or has no remotes, so the form is still
+                                 completable on a host that will be configured later. -->
+                            <template x-if="f.type === 'select' && remotes.length">
+                                <select class="form-select" :id="'hangar-repo-f-' + f.name"
+                                        x-model="form[f.name]" :required="f.required">
+                                    <option value="">Choose a remote…</option>
+                                    <template x-for="r in remotes" :key="r">
+                                        <option :value="r" x-text="r"></option>
+                                    </template>
+                                </select>
+                            </template>
+
+                            <template x-if="f.type !== 'select' || !remotes.length">
+                                <input class="form-control"
+                                       :id="'hangar-repo-f-' + f.name"
+                                       :type="f.secret ? 'password' : 'text'"
+                                       :placeholder="f.placeholder"
+                                       :required="f.required"
+                                       :autocomplete="f.secret ? 'new-password' : 'off'"
+                                       spellcheck="false"
+                                       x-model="form[f.name]"
+                                       :aria-describedby="f.help ? 'hangar-repo-h-' + f.name : null">
+                            </template>
+
+                            <div x-show="f.help" class="form-text" :id="'hangar-repo-h-' + f.name"
+                                 x-text="f.help"></div>
+                            <div x-show="f.type === 'select' && !remotes.length" class="form-text">
+                                No rclone remotes were found on this host. Type the remote name if you
+                                will configure it with <span class="hangar-mono">rclone config</span> later.
+                            </div>
+                        </div>
+                    </template>
+
+                    <!-- Backend credentials live in the repository definition because
+                         restic reads them from the environment (HangarRepos.envFor).
+                         The file is root-only; the repository password is the one secret
+                         that is kept apart, in core/secrets.js. -->
+                    <p class="small text-secondary mb-0">
+                        Backend credentials are stored in the repository definition,
+                        readable by root only.
+                    </p>
+
+                    <!-- role="alert" so a failed submit is announced: the button stays
+                         where it was and nothing else moves, so a sighted-only cue
+                         would be silent for anyone using a screen reader. -->
+                    <div x-show="problems.length" role="alert" class="alert alert-danger mt-3 mb-0">
+                        <strong>Fix the following:</strong>
+                        <ul class="mb-0 mt-1">
+                            <template x-for="p in problems" :key="p"><li x-text="p"></li></template>
+                        </ul>
+                    </div>
+                </div>
+
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="submit" class="btn btn-primary"
+                            x-text="mode === 'edit' ? 'Save' : 'Create repository'"></button>
+                </div>
+
+            </form>
+        </div>
+    </div>
+</div>

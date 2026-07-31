@@ -1,0 +1,371 @@
+#!/usr/bin/python3
+# hangar-run — privileged backup runner invoked by hangar-backup@<job>.service.
+#
+# Why this exists instead of chained ExecStartPre= directives: systemd's unit
+# directives fail opaquely (a failing ExecStartPre aborts the unit with no useful
+# record of which hook died), and they cannot capture restic's --json stream, which
+# is the whole reason we chose restic. So orchestration lives in one testable place.
+#
+# python3 is a safe dependency: cockpit-bridge is Python, so every host that can run
+# Cockpit already has it.
+#
+# Exit contract:
+#   0  success, or success with unreadable files (restic exit 3) — see NOTE below
+#   1  configuration error
+#   2  backup failed
+#   3  retention/prune failed after a successful backup
+#   4  a hook failed
+#
+# NOTE on restic exit 3: the snapshot IS written; some files could not be read.
+# Reporting that as a unit failure trains users to ignore real failures, so the unit
+# succeeds and the run is recorded with status "partial". The UI surfaces it, and the
+# state file below is what makes it visible after the journal rotates.
+
+import json
+import os
+import subprocess
+import sys
+import time
+
+CONF_DIR = os.environ.get("HANGAR_CONF_DIR", "/etc/hangar")
+STATE_DIR = os.environ.get("HANGAR_STATE_DIR", "/var/lib/hangar/state")
+
+# restic exit codes we care about (see docs/CONVENTIONS.md).
+EXIT_READ_ERRORS = 3
+EXIT_REPO_MISSING = 10
+EXIT_REPO_LOCKED = 11
+EXIT_WRONG_PASSWORD = 12
+EXIT_CANCELLED = 130
+
+KIND_BY_CODE = {
+    0: "OK",
+    1: "GENERIC",
+    2: "GO_RUNTIME",
+    EXIT_READ_ERRORS: "READ_ERRORS",
+    EXIT_REPO_MISSING: "REPO_MISSING",
+    EXIT_REPO_LOCKED: "REPO_LOCKED",
+    EXIT_WRONG_PASSWORD: "WRONG_PASSWORD",
+    EXIT_CANCELLED: "CANCELLED",
+}
+
+
+def log(level, msg, **fields):
+    """Structured line to stderr; systemd routes it to the journal.
+
+    SYSLOG_IDENTIFIER is set by the unit, so we only need the priority prefix that
+    systemd's <N> syntax understands.
+    """
+    prio = {"debug": 7, "info": 6, "warning": 4, "error": 3}.get(level, 6)
+    payload = {"msg": msg}
+    payload.update(fields)
+    sys.stderr.write("<%d>%s\n" % (prio, json.dumps(payload, sort_keys=True)))
+    sys.stderr.flush()
+
+
+def die(code, msg, **fields):
+    log("error", msg, **fields)
+    sys.exit(code)
+
+
+def read_json(path):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        die(1, "config file not found", path=path)
+    except json.JSONDecodeError as e:
+        die(1, "config file is not valid JSON", path=path, error=str(e))
+    except OSError as e:
+        die(1, "cannot read config file", path=path, error=str(e))
+
+
+def password_file(repo_id):
+    """Prefer the systemd credential when running under a unit.
+
+    LoadCredential= puts the key in $CREDENTIALS_DIRECTORY with a private bind mount,
+    which is strictly better than reading /etc directly. Fall back to the on-disk key
+    so the helper still works when run by hand for debugging.
+    """
+    creds = os.environ.get("CREDENTIALS_DIRECTORY")
+    if creds:
+        cand = os.path.join(creds, "hangar-repo-%s" % repo_id)
+        if os.path.exists(cand):
+            return cand
+    return os.path.join(CONF_DIR, "repos", "%s.key" % repo_id)
+
+
+def _join_two(scheme, name, prefix):
+    """Optional second segment shared by b2 / azure / gs / rclone: "<name>:<prefix>".
+
+    An empty prefix must NOT leave a trailing colon — "b2:bucket:" is a different
+    repository to "b2:bucket" as far as restic is concerned.
+    """
+    prefix = "" if prefix is None else str(prefix)
+    return "%s:%s%s" % (scheme, name, "" if prefix == "" else ":" + prefix)
+
+
+def repo_url(repo):
+    """Mirror of HangarRepos.buildUrl in js/core/repos.js.
+
+    Kept deliberately small and duplicated rather than shelling out to node: this
+    helper must work with no Cockpit session present. tests/integration/hangar-run
+    asserts the two implementations agree for every backend, which is what stops the
+    duplication drifting.
+
+    Note the field naming: 'path' is a filesystem path (local, sftp), while 'prefix'
+    is a key prefix inside a bucket or container (s3, b2, azure, gs, rclone). They are
+    genuinely different things and must not be conflated.
+    """
+    kind = repo.get("kind", "local")
+    if kind == "local":
+        return repo["path"]
+    if kind == "sftp":
+        user = repo.get("user") or ""
+        return "sftp:%s%s:%s" % (user + "@" if user else "", repo["host"], repo["path"])
+    if kind == "rest":
+        return "rest:%s" % repo["url"]
+    if kind == "s3":
+        prefix = repo.get("prefix") or ""
+        return "s3:%s/%s%s" % (repo["endpoint"], repo["bucket"],
+                               "" if prefix == "" else "/" + prefix)
+    if kind == "b2":
+        return _join_two("b2", repo["bucket"], repo.get("prefix"))
+    if kind == "azure":
+        return _join_two("azure", repo["container"], repo.get("prefix"))
+    if kind == "gs":
+        return _join_two("gs", repo["bucket"], repo.get("prefix"))
+    if kind == "rclone":
+        return _join_two("rclone", repo["remote"], repo.get("prefix"))
+    die(1, "unknown repository kind", kind=kind)
+
+
+def backend_env(repo):
+    env = {}
+    creds = repo.get("credentials") or {}
+    for key, value in creds.items():
+        # Credential names are fixed by restic's backends; pass them through as-is.
+        env[str(key)] = str(value)
+    return env
+
+
+def source_args(sources):
+    paths, flags = [], []
+    for src in sources:
+        if src.get("kind", "filesystem") != "filesystem":
+            # v1 ships filesystem only; VM and Podman sources land in v2 as new kinds.
+            die(1, "unsupported source kind", kind=src.get("kind"))
+        paths.extend(src.get("paths") or [])
+        for pat in src.get("excludes") or []:
+            flags.extend(["--exclude", pat])
+        if src.get("excludeFile"):
+            flags.extend(["--exclude-file", src["excludeFile"]])
+        if src.get("oneFileSystem"):
+            flags.append("--one-file-system")
+        for tag in src.get("tags") or []:
+            flags.extend(["--tag", tag])
+    if not paths:
+        die(1, "job has no paths to back up")
+    return paths, flags
+
+
+def retention_args(policy):
+    if not policy:
+        return []
+    args = []
+    for key, flag in (
+        ("last", "--keep-last"),
+        ("hourly", "--keep-hourly"),
+        ("daily", "--keep-daily"),
+        ("weekly", "--keep-weekly"),
+        ("monthly", "--keep-monthly"),
+        ("yearly", "--keep-yearly"),
+    ):
+        val = policy.get(key)
+        if val:
+            args.extend([flag, str(val)])
+    if policy.get("within"):
+        args.extend(["--keep-within", str(policy["within"])])
+    for tag in policy.get("tags") or []:
+        args.extend(["--keep-tag", tag])
+    if not args:
+        # A policy that keeps nothing would delete every snapshot. Refuse loudly.
+        die(1, "retention policy would keep no snapshots — refusing to prune")
+    args.extend(["--group-by", "host,paths"])
+    return args
+
+
+def build_plan(job, repo):
+    url = repo_url(repo)
+    pwfile = password_file(repo["id"])
+    paths, flags = source_args(job.get("sources") or [])
+    base = ["restic", "-r", url, "--password-file", pwfile]
+
+    backup = base + ["backup", "--json"] + flags + paths
+    for tag in job.get("tags") or []:
+        backup.extend(["--tag", tag])
+
+    plan = {"backup": backup, "forget": None, "env": backend_env(repo)}
+    ret = retention_args(job.get("retention"))
+    if ret:
+        plan["forget"] = base + ["forget", "--json", "--prune"] + ret
+    return plan
+
+
+def run_hook(name, command, env):
+    if not command:
+        return
+    log("info", "running hook", hook=name)
+    # Hooks are intentionally shell — that is their purpose (dumping a database
+    # before backup, cleaning up after). The job file is root-owned 0644 under
+    # /etc, so writing it already requires root.
+    res = subprocess.run(command, shell=True, env=env)
+    if res.returncode != 0:
+        die(4, "hook failed", hook=name, exit_code=res.returncode)
+
+
+def stream_restic(argv, env, label):
+    """Run restic, folding its JSON-lines stream into a final summary.
+
+    Unknown message types are passed over rather than treated as errors: restic adds
+    new ones between releases and a backup must not fail because we did not
+    recognise a progress message.
+    """
+    log("info", "starting %s" % label)
+    proc = subprocess.Popen(
+        argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, bufsize=1,
+    )
+    summary, errors, last_report = None, [], 0.0
+
+    for line in proc.stdout:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            continue  # non-JSON noise on stdout is not fatal
+        mtype = msg.get("message_type")
+        if mtype == "summary":
+            summary = msg
+        elif mtype == "error":
+            errors.append(msg)
+            log("warning", "restic reported an error",
+                item=msg.get("item"), during=msg.get("during"),
+                error=(msg.get("error") or {}).get("message") or msg.get("message"))
+        elif mtype == "status":
+            # Throttle: restic emits status many times a second and the journal is
+            # not the right place for that volume.
+            now = time.monotonic()
+            if now - last_report >= 10.0:
+                last_report = now
+                log("info", "progress",
+                    percent=round((msg.get("percent_done") or 0) * 100, 1),
+                    files_done=msg.get("files_done"),
+                    bytes_done=msg.get("bytes_done"))
+
+    stderr_text = proc.stderr.read() or ""
+    proc.wait()
+    code = proc.returncode
+
+    for eline in stderr_text.splitlines():
+        eline = eline.strip()
+        if not eline:
+            continue
+        try:
+            emsg = json.loads(eline)
+        except json.JSONDecodeError:
+            log("warning", "restic stderr", text=eline)
+            continue
+        if emsg.get("message_type") == "exit_error":
+            log("error", "restic exit_error",
+                code=emsg.get("code"), error=emsg.get("message"))
+
+    return code, summary, errors
+
+
+def write_state(job_id, record):
+    try:
+        os.makedirs(STATE_DIR, mode=0o755, exist_ok=True)
+        path = os.path.join(STATE_DIR, "%s.json" % job_id)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(record, fh, sort_keys=True, indent=2)
+            fh.write("\n")
+        os.replace(tmp, path)   # atomic: the UI must never read a half-written file
+    except OSError as e:
+        # Losing the state marker must not fail an otherwise good backup.
+        log("warning", "could not write state file", error=str(e))
+
+
+def main(argv):
+    if len(argv) < 2:
+        die(1, "usage: hangar-run <job-id> [--print-plan]")
+    job_id = argv[1]
+    print_plan = "--print-plan" in argv[2:]
+
+    job = read_json(os.path.join(CONF_DIR, "jobs", "%s.json" % job_id))
+    repo_id = job.get("repo")
+    if not repo_id:
+        die(1, "job does not name a repository", job=job_id)
+    repo = read_json(os.path.join(CONF_DIR, "repos", "%s.json" % repo_id))
+    repo.setdefault("id", repo_id)
+
+    plan = build_plan(job, repo)
+
+    if print_plan:
+        # Machine-readable dry run. The node integration tests use this to assert the
+        # helper and js/core/* agree on how a job becomes a restic command line.
+        json.dump(plan, sys.stdout, sort_keys=True, indent=2)
+        sys.stdout.write("\n")
+        return 0
+
+    env = dict(os.environ)
+    env.update(plan["env"])
+
+    started = time.time()
+    hooks = job.get("hooks") or {}
+    run_hook("pre", hooks.get("pre"), env)
+
+    code, summary, errors = stream_restic(plan["backup"], env, "backup")
+    kind = KIND_BY_CODE.get(code, "UNKNOWN")
+
+    if code not in (0, EXIT_READ_ERRORS):
+        write_state(job_id, {
+            "job": job_id, "status": "failed", "kind": kind,
+            "started": started, "finished": time.time(), "exit_code": code,
+        })
+        die(2, "backup failed", exit_code=code, kind=kind)
+
+    status = "partial" if code == EXIT_READ_ERRORS else "ok"
+    if status == "partial":
+        log("warning", "backup completed but some files were unreadable",
+            error_count=len(errors))
+
+    record = {
+        "job": job_id, "status": status, "kind": kind,
+        "started": started, "finished": time.time(), "exit_code": code,
+        "snapshot": (summary or {}).get("snapshot_id"),
+        "files_new": (summary or {}).get("files_new"),
+        "files_changed": (summary or {}).get("files_changed"),
+        "data_added": (summary or {}).get("data_added"),
+        "unreadable": len(errors),
+    }
+
+    if plan["forget"]:
+        fcode, _fsummary, _ferrors = stream_restic(plan["forget"], env, "forget")
+        if fcode != 0:
+            record["status"] = "prune-failed"
+            record["prune_exit_code"] = fcode
+            write_state(job_id, record)
+            run_hook("post", hooks.get("post"), env)
+            die(3, "retention/prune failed after a successful backup", exit_code=fcode)
+
+    write_state(job_id, record)
+    run_hook("post", hooks.get("post"), env)
+    log("info", "backup complete", status=status, snapshot=record.get("snapshot"))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

@@ -1,0 +1,10 @@
+2026-08-01 09:14:02.001234567 Relax-and-Recover 2.7 / 2023-12-05
+2026-08-01 09:14:02.114455661 Running rear mkrescue (PID 41881)
+2026-08-01 09:14:03.556677881 Creating disk layout
+2026-08-01 09:14:05.223344551 Creating root filesystem layout
+2026-08-01 09:14:11.987654321 Copying files and directories
+2026-08-01 09:14:19.101112131 Copying binaries and libraries
+2026-08-01 09:14:48.415161718 Creating recovery/rescue system initramfs/initrd initrd.cgz with gzip default compression
+2026-08-01 09:15:29.192021222 Making ISO image
+2026-08-01 09:15:44.232425262 Wrote ISO image: /var/lib/rear/output/rear-db01.iso (267M)
+2026-08-01 09:15:44.272829303 Copying resulting files to file location

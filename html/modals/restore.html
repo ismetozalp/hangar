@@ -1,0 +1,110 @@
+<!-- Restore dialog for the Logbook.
+     Opened via the 'hangar:restore' event, like confirm.html and password.html, so
+     the screen never reaches into this component's state.
+
+     Restoring to a different directory is preselected on purpose: it is the only
+     mode that cannot destroy anything. The original-location mode is reachable,
+     but it goes through the shared danger confirmation before anything is written. -->
+<div class="modal fade" id="hangar-restore" tabindex="-1"
+     aria-labelledby="hangar-restore-title" aria-hidden="true"
+     x-data="hangarRestore()" x-init="init()">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+            <form @submit.prevent="submit()">
+
+                <div class="modal-header">
+                    <h5 class="modal-title" id="hangar-restore-title">Restore</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"
+                            aria-label="Close" @click="cancel()"></button>
+                </div>
+
+                <div class="modal-body">
+
+                    <p class="small text-secondary mb-3">
+                        <span x-text="summary"></span>
+                        <span x-show="momentLabel">
+                            from <span class="hangar-mono" x-text="momentLabel"></span> UTC
+                        </span>
+                    </p>
+
+                    <fieldset class="mb-3">
+                        <legend class="form-label">Where should these go?</legend>
+
+                        <div class="form-check">
+                            <input class="form-check-input" type="radio" name="hangar-restore-mode"
+                                   id="hangar-restore-alternate" value="alternate" x-model="mode">
+                            <label class="form-check-label" for="hangar-restore-alternate">
+                                Into a different directory
+                                <span class="d-block small text-secondary">
+                                    Nothing already on the system is touched.
+                                </span>
+                            </label>
+                        </div>
+
+                        <div class="form-check mt-2">
+                            <input class="form-check-input" type="radio" name="hangar-restore-mode"
+                                   id="hangar-restore-original" value="original" x-model="mode">
+                            <label class="form-check-label" for="hangar-restore-original">
+                                Back to their original locations
+                                <span class="d-block small text-secondary">
+                                    Replaces whatever is at those paths now.
+                                </span>
+                            </label>
+                        </div>
+                    </fieldset>
+
+                    <div class="mb-3" x-show="mode === 'alternate'">
+                        <label class="form-label" for="hangar-restore-target">Restore into</label>
+                        <input id="hangar-restore-target" class="form-control hangar-mono"
+                               type="text" x-model="target" spellcheck="false"
+                               autocomplete="off" placeholder="/var/tmp/hangar-restore">
+                        <div class="form-text">
+                            An absolute path. The snapshot's directory structure is recreated below it.
+                        </div>
+                    </div>
+
+                    <!-- Files being restored, named rather than counted: the user is
+                         about to overwrite these if they pick the original location.
+                         The paths come from the plan, so this list is exactly what
+                         restic is given — a selection entry that names nothing is
+                         dropped by both rather than shown here and then skipped. -->
+                    <details class="mb-3" x-show="selectionPaths().length">
+                        <summary class="small">Selected items</summary>
+                        <ul class="hangar-mono small mb-0 mt-2">
+                            <template x-for="p in selectionPaths()" :key="p">
+                                <li x-text="p"></li>
+                            </template>
+                        </ul>
+                    </details>
+
+                    <template x-for="w in warnings()" :key="w">
+                        <div class="alert alert-warning py-2 px-3 small mb-2" role="status"
+                             x-text="w"></div>
+                    </template>
+
+                    <template x-for="p in problems()" :key="p">
+                        <div class="alert alert-danger py-2 px-3 small mb-2" role="alert"
+                             x-text="p"></div>
+                    </template>
+
+                    <!-- Reached when the shared danger confirmation is not on the
+                         page. Submitting fails closed, so the user has to be told
+                         why the button did nothing. -->
+                    <div x-show="dialogError" class="alert alert-danger py-2 px-3 small mb-0"
+                         role="alert" x-text="dialogError"></div>
+
+                </div>
+
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal"
+                            @click="cancel()">Cancel</button>
+                    <button type="submit" class="btn"
+                            :class="mode === 'original' ? 'btn-danger' : 'btn-primary'"
+                            :disabled="!valid()"
+                            x-text="mode === 'original' ? 'Restore and replace…' : 'Restore'"></button>
+                </div>
+
+            </form>
+        </div>
+    </div>
+</div>

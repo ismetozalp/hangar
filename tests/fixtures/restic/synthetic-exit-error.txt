@@ -1,0 +1,2 @@
+unable to open repository at sftp:backup@nas.lan:/vol/restic
+{"message_type":"exit_error","code":11,"message":"unable to create lock in backend: repository is already locked exclusively by PID 4711 on nas.lan by root (UID 0, GID 0)"}

@@ -1,0 +1,137 @@
+// Unit tests for js/app.js — tab wiring and the two generic dialogs.
+//
+// app.js is an Alpine component factory, not a pure library, so these tests drive
+// the returned objects directly. That is enough to cover the logic that actually
+// matters here: password confirmation, secret lifetime, and dialog resolution.
+'use strict';
+const test = require('node:test');
+const assert = require('node:assert/strict');
+
+// app.js reaches for `root.document` and `root.bootstrap` only inside handlers, so
+// it loads fine under node. Confirm that, since it is the reason these tests exist.
+const App = require('../../js/app.js');
+
+test('module loads with no DOM present', () => {
+    assert.equal(typeof App.hangarApp, 'function');
+    assert.equal(typeof App.hangarConfirm, 'function');
+    assert.equal(typeof App.hangarPassword, 'function');
+});
+
+test('tabs cover every screen the plugin ships', () => {
+    const ids = App.TABS.map((t) => t.id);
+    assert.deepEqual(ids, ['overview', 'repos', 'jobs', 'logbook', 'recovery', 'settings']);
+    for (const t of App.TABS) {
+        assert.ok(t.label && typeof t.label === 'string', `${t.id} has no label`);
+    }
+});
+
+test('no tab is labelled "Time Machine"', () => {
+    // The feature is named Logbook. Guarded here as well as in the smoke test
+    // because a label is the most likely place for it to creep back in.
+    for (const t of App.TABS) assert.ok(!/time\s*machine/i.test(t.label));
+});
+
+test('app starts on overview and not ready', () => {
+    const a = App.hangarApp();
+    assert.equal(a.tab, 'overview');
+    assert.equal(a.ready, false);
+    assert.deepEqual(a.missing, []);
+});
+
+test('missingSummary renders tool names with and without reasons', () => {
+    const a = App.hangarApp();
+    a.missing = [{ tool: 'restic', reason: 'not packaged' }, { tool: 'fuse3' }];
+    assert.equal(a.missingSummary(), 'restic (not packaged), fuse3');
+
+    a.missing = [];
+    assert.equal(a.missingSummary(), '');
+});
+
+// --- password dialog -----------------------------------------------------
+
+function pw(overrides) {
+    const p = App.hangarPassword();
+    Object.assign(p, overrides || {});
+    return p;
+}
+
+test('password dialog rejects an empty password', () => {
+    assert.equal(pw({ password: '' }).valid(), false);
+});
+
+test('password dialog accepts a password when not confirming', () => {
+    assert.equal(pw({ password: 'hunter2', confirming: false }).valid(), true);
+});
+
+test('password dialog requires a match when confirming', () => {
+    assert.equal(pw({ password: 'a', confirm: 'b', confirming: true }).valid(), false);
+    assert.equal(pw({ password: 'a', confirm: 'a', confirming: true }).valid(), true);
+});
+
+test('a new-repository password mismatch produces a specific message', () => {
+    // A typo here is unrecoverable — there is no existing repository to check the
+    // password against — so the error must say which problem it is.
+    const p = pw({ password: 'a', confirm: 'b', confirming: true });
+    p.submit();
+    assert.match(p.error, /do not match/);
+});
+
+test('an empty password produces its own message', () => {
+    const p = pw({ password: '' });
+    p.submit();
+    assert.match(p.error, /Enter a password/);
+});
+
+test('submit resolves with the password and then clears it from state', () => {
+    // The secret must not outlive the dialog in Alpine state; core/secrets.js is the
+    // only thing allowed to hold it.
+    let resolved = null;
+    const p = pw({ password: 's3cret', confirming: false });
+    p._resolve = (v) => { resolved = v; };
+    p.submit();
+
+    assert.equal(resolved, 's3cret');
+    assert.equal(p.password, '');
+    assert.equal(p.confirm, '');
+    assert.equal(p.error, '');
+    assert.equal(p._resolve, null, 'resolver should not be reusable');
+});
+
+test('a failed submit does not clear the typed password', () => {
+    // Wiping the field on a mismatch would force the user to retype both.
+    const p = pw({ password: 'a', confirm: 'b', confirming: true });
+    p.submit();
+    assert.equal(p.password, 'a');
+});
+
+test('password dialog does not resolve when invalid', () => {
+    let called = false;
+    const p = pw({ password: '' });
+    p._resolve = () => { called = true; };
+    p.submit();
+    assert.equal(called, false);
+});
+
+// --- confirm dialog ------------------------------------------------------
+
+test('confirm dialog defaults are safe', () => {
+    const c = App.hangarConfirm();
+    assert.equal(c.danger, false);
+    assert.equal(c.confirmLabel, 'Confirm');
+    assert.equal(c.cancelLabel, 'Cancel');
+});
+
+test('confirm dialog resolves true and drops its resolver', () => {
+    let resolved = null;
+    const c = App.hangarConfirm();
+    c._resolve = (v) => { resolved = v; };
+    // No DOM: accept() must still resolve rather than throwing on the missing modal.
+    globalThis.document = { getElementById: () => null };
+    try {
+        c.accept();
+    } finally {
+        delete globalThis.document;
+    }
+    assert.equal(resolved, true);
+    assert.equal(c._resolve, null);
+});

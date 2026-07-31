@@ -1,0 +1,216 @@
+<!-- Prerequisite installer.
+     Opened by the 'hangar:provision' event from app.js. Shows what is missing and
+     why it matters, then installs through PackageKit.
+
+     The consent panel below is deliberately not the shared confirm dialog: a
+     download that bypasses the package manager has to show a URL, a checksum
+     source and the better alternative, and it has to be confirmed separately from
+     the Install button that started the run. -->
+<div class="modal fade" id="hangar-provision" tabindex="-1"
+     aria-labelledby="hangar-provision-title" aria-hidden="true"
+     x-data="hangarProvisionUi()" x-init="init()">
+    <div class="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable">
+        <div class="modal-content">
+
+            <div class="modal-header">
+                <h5 class="modal-title" id="hangar-provision-title">Install prerequisites</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+
+            <div class="modal-body">
+
+                <p class="text-secondary small">
+                    Hangar installs these through the system package manager, so nothing has
+                    to be typed at a shell.
+                </p>
+
+                <div x-show="loading" class="hangar-empty">
+                    Checking what is already installed…
+                </div>
+
+                <!-- Hangar could not find out what is missing. An empty list would
+                     otherwise read as "you are fine", which is a guess, not an answer. -->
+                <div x-show="!loading && error" class="alert alert-danger py-2 px-3 small" role="alert">
+                    <strong x-text="error && error.title"></strong>
+                    <div x-text="error && error.text"></div>
+                    <div x-show="error && error.detail" class="hangar-mono text-secondary mt-1"
+                         x-text="error && error.detail"></div>
+                    <button type="button" class="btn btn-sm btn-outline-danger mt-2"
+                            x-show="error && error.actionLabel && !busy"
+                            @click="retryOpen()"
+                            x-text="error && error.actionLabel"></button>
+                </div>
+
+                <div x-show="!loading && !error && !rows.length" class="hangar-empty">
+                    Everything hangar needs is already installed.
+                </div>
+
+                <!-- What is missing, and why it is needed --------------------- -->
+                <ul class="list-group mb-3" x-show="rows.length">
+                    <template x-for="row in rows" :key="row.tool">
+                        <li class="list-group-item">
+
+                            <div class="d-flex align-items-start gap-3">
+                                <div class="flex-grow-1">
+                                    <div class="d-flex align-items-center gap-2">
+                                        <!-- Decorative: the same state is spelled out
+                                             in words by label(row.state) below. -->
+                                        <span class="hangar-dot" aria-hidden="true"
+                                              :class="{ ok: row.state === 'done',
+                                                        running: row.state === 'installing',
+                                                        failed: row.state === 'failed',
+                                                        partial: row.state === 'blocked' || row.state === 'manual'
+                                                                 || row.state === 'partial' }"></span>
+                                        <strong class="hangar-mono" x-text="row.tool"></strong>
+                                        <span class="badge"
+                                              :class="row.required ? 'text-bg-danger' : 'text-bg-secondary'"
+                                              x-text="row.need"></span>
+                                        <span x-show="row.download" class="badge text-bg-warning">Not packaged here</span>
+                                    </div>
+                                    <div class="small mt-1" x-text="row.reason"></div>
+                                    <div class="small text-secondary mt-1" x-text="row.action"></div>
+                                </div>
+
+                                <div class="text-end" style="min-width: 9rem;">
+                                    <span class="small text-secondary" x-text="label(row.state)"></span>
+                                </div>
+                            </div>
+
+                            <div class="progress hangar-progress mt-2"
+                                 x-show="row.state === 'installing'"
+                                 role="progressbar" aria-label="Installation progress"
+                                 :aria-valuenow="row.progress" aria-valuemin="0" aria-valuemax="100">
+                                <div class="progress-bar" :style="'width: ' + row.progress + '%'"></div>
+                            </div>
+
+                            <div x-show="row.note" class="small text-secondary mt-2" x-text="row.note"></div>
+
+                            <!-- A failure is an action, not a toast: the remediation
+                                 that core/errors.js chose becomes the button.
+                                 The colour comes from severity, so a non-fatal kind
+                                 — a partial result — cannot be painted as a failure. -->
+                            <div x-show="row.error" role="alert"
+                                 class="alert py-2 px-3 small mt-2 mb-0"
+                                 :class="row.error && row.error.severity === 'warning'
+                                         ? 'alert-warning' : 'alert-danger'">
+                                <strong x-text="row.error && row.error.title"></strong>
+                                <div x-text="row.error && row.error.text"></div>
+                                <div x-show="row.error && row.error.hint" class="mt-1"
+                                     x-text="row.error && row.error.hint"></div>
+
+                                <!-- Partial success: the files that could not be read
+                                     are listed here, never summarised as a failure. -->
+                                <ul x-show="row.error && row.error.unreadable.length"
+                                    class="hangar-mono mt-1 mb-0 ps-3">
+                                    <template x-for="path in visibleUnreadable(row)" :key="path">
+                                        <li x-text="path"></li>
+                                    </template>
+                                </ul>
+                                <div x-show="moreUnreadable(row)" class="text-secondary mt-1"
+                                     x-text="'and ' + moreUnreadable(row) + ' more'"></div>
+
+                                <div x-show="row.error && row.error.detail"
+                                     class="hangar-mono text-secondary mt-1"
+                                     x-text="row.error && row.error.detail"></div>
+                                <button type="button" class="btn btn-sm mt-2"
+                                        :class="row.error && row.error.severity === 'warning'
+                                                ? 'btn-outline-secondary' : 'btn-outline-danger'"
+                                        x-show="row.error && row.error.actionLabel && !busy
+                                                && (row.error.remediation !== 'list-unreadable'
+                                                    || moreUnreadable(row))"
+                                        @click="runAction(row)"
+                                        x-text="row.error && row.error.actionLabel"></button>
+                            </div>
+
+                            <!-- No downloader available: the verified URLs, so the
+                                 user can finish the job by hand. -->
+                            <div x-show="row.state === 'manual' && row.release"
+                                 class="small hangar-mono text-secondary mt-2">
+                                <div x-text="row.release && row.release.url"></div>
+                                <div x-text="row.release && row.release.sha256Url"></div>
+                            </div>
+
+                        </li>
+                    </template>
+                </ul>
+
+                <div x-show="rows.length && anyDownloads() && !consent" role="status"
+                     class="alert alert-warning py-2 px-3 small">
+                    At least one of these is not in any repository this distribution enables.
+                    Hangar will ask before downloading anything.
+                </div>
+
+                <!-- Download consent ----------------------------------------
+                     x-if, not x-show: x-model needs a real property to bind to, and
+                     under x-show the checkbox would still evaluate consent.accepted
+                     while consent is null and take the whole component down. -->
+                <template x-if="consent">
+                    <div class="card border-warning mb-2" role="group"
+                         aria-labelledby="hangar-provision-consent-title">
+                        <div class="card-header py-2">
+                            <strong id="hangar-provision-consent-title">Confirm the download of
+                                <span class="hangar-mono" x-text="consent.tool"></span></strong>
+                        </div>
+                        <div class="card-body">
+                            <p class="small mb-3" style="white-space: pre-line;"
+                               x-text="consent.text"></p>
+
+                            <div class="form-check mb-3">
+                                <input class="form-check-input" type="checkbox"
+                                       id="hangar-provision-consent"
+                                       x-model="consent.accepted">
+                                <label class="form-check-label small" for="hangar-provision-consent">
+                                    I understand this binary is not managed by my package manager.
+                                </label>
+                            </div>
+
+                            <div class="d-flex flex-wrap gap-2">
+                                <button type="button" class="btn btn-sm btn-outline-primary"
+                                        x-show="consent.epel"
+                                        @click="enableEpel()">
+                                    Enable EPEL and install the package instead
+                                </button>
+                                <button type="button" class="btn btn-sm btn-warning"
+                                        :disabled="!canDownload()"
+                                        @click="acceptConsent()">
+                                    Download and install anyway
+                                </button>
+                                <button type="button" class="btn btn-sm btn-secondary"
+                                        @click="declineConsent()">
+                                    Skip this one
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </template>
+
+                <div x-show="finished() && !failedRows().length" class="alert alert-success py-2 px-3 small mb-0"
+                     role="status">
+                    Everything is in place.
+                </div>
+
+                <div x-show="finished() && failedRows().length" class="alert alert-warning py-2 px-3 small mb-0"
+                     role="status">
+                    Some tools were not installed. Hangar still works without the optional ones.
+                </div>
+
+            </div>
+
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal"
+                        @click="close()">Close</button>
+                <button type="button" class="btn btn-outline-secondary"
+                        x-show="retryableRows().length && !busy && !consent"
+                        @click="retryAll()">Retry failed</button>
+                <button type="button" class="btn btn-primary"
+                        x-show="rows.length"
+                        :disabled="busy || loading || !!consent || pending() === 0"
+                        @click="installAll()">
+                    <span x-show="!busy">Install</span>
+                    <span x-show="busy">Installing…</span>
+                </button>
+            </div>
+
+        </div>
+    </div>
+</div>

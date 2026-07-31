@@ -1,0 +1,16 @@
+{
+  "source_snapshot": "1a2b3c4d",
+  "target_snapshot": "9f8e7d6c",
+  "changes": [
+    { "path": "/srv/data/new.bin", "modifier": "+" },
+    { "path": "/srv/data/gone.bin", "modifier": "-" },
+    { "path": "/etc/hosts", "modifier": "M" },
+    { "path": "/srv/data/link", "modifier": "T" },
+    { "path": "/srv/data/odd", "modifier": "?" }
+  ],
+  "statistics": {
+    "changed_files": 2,
+    "added": { "files": 1, "dirs": 0, "others": 0, "data_blobs": 3, "tree_blobs": 1, "bytes": 4096 },
+    "removed": { "files": 1, "dirs": 0, "others": 0, "data_blobs": 2, "tree_blobs": 1, "bytes": 2048 }
+  }
+}

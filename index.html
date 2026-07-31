@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Hangar</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="stylesheet" href="css/bootstrap.min.css">
+    <link rel="stylesheet" href="css/themes.css">
+    <link rel="stylesheet" href="css/hangar.css">
+    <script src="../base1/cockpit.js"></script>
+</head>
+<body>
+
+<div class="hangar-shell" x-data="hangarApp()" x-init="init()" x-cloak>
+
+    <!-- Header ---------------------------------------------------------- -->
+    <div class="hangar-header d-flex align-items-center gap-3">
+        <strong class="me-2">Hangar</strong>
+
+        <ul class="nav nav-pills nav-sm flex-grow-1">
+            <template x-for="t in tabs" :key="t.id">
+                <li class="nav-item">
+                    <button class="nav-link py-1 px-3"
+                            :class="{ active: tab === t.id }"
+                            @click="tab = t.id"
+                            x-text="t.label"></button>
+                </li>
+            </template>
+        </ul>
+
+        <span x-show="!ready" class="text-secondary small">Checking prerequisites…</span>
+        <span x-show="ready && missing.length" class="badge text-bg-warning"
+              x-text="missing.length + ' tool(s) missing'"></span>
+
+        <!-- Version badge doubles as the update affordance: a plain label when
+             current, a button only when there is genuinely something to install. -->
+        <button class="btn btn-sm btn-success py-0"
+                x-show="update.available"
+                @click="openUpdateModal()"
+                :aria-label="'Update Hangar to version ' + update.version"
+                x-text="'Update to ' + update.version"></button>
+        <span class="text-secondary small hangar-mono"
+              x-show="!update.available && installedVersion"
+              x-text="'v' + installedVersion"></span>
+    </div>
+
+    <!-- Body ------------------------------------------------------------ -->
+    <div class="hangar-body">
+
+        <!-- Prerequisites gate: hangar installs what it needs rather than telling
+             the user to run a package manager. Shown until restic is present. -->
+        <div x-show="ready && missing.length" class="alert alert-warning">
+            <div class="d-flex align-items-center gap-3">
+                <div class="flex-grow-1">
+                    <strong>Some tools are not installed yet.</strong>
+                    <div class="small" x-text="missingSummary()"></div>
+                </div>
+                <button class="btn btn-sm btn-primary" @click="openProvision()">Install</button>
+            </div>
+        </div>
+
+        <div x-show="tab === 'overview'"   id="hangar-overview"></div>
+        <div x-show="tab === 'repos'"      id="hangar-repos"></div>
+        <div x-show="tab === 'jobs'"       id="hangar-jobs"></div>
+        <div x-show="tab === 'logbook'"    id="hangar-logbook"></div>
+        <div x-show="tab === 'recovery'"   id="hangar-recovery"></div>
+        <div x-show="tab === 'settings'"   id="hangar-settings"></div>
+
+    </div>
+
+    <!-- Modal partials are injected here by boot.js before Alpine starts. -->
+    <div id="hangar-partials"></div>
+
+</div>
+
+<!-- Vendor ------------------------------------------------------------- -->
+<script src="js/bootstrap.bundle.min.js"></script>
+
+<!-- Core: order matters — errors.js first, everything depends on it. ----- -->
+<script src="js/core/errors.js"></script>
+<script src="js/core/secrets.js"></script>
+<script src="js/core/repos.js"></script>
+<script src="js/core/sources.js"></script>
+<script src="js/core/retention.js"></script>
+<script src="js/core/schedule.js"></script>
+<script src="js/core/provision.js"></script>
+<script src="js/core/dr.js"></script>
+<script src="js/core/logbook.js"></script>
+<script src="js/core/semver.js"></script>
+<script src="js/core/config.js"></script>
+
+<!-- Engine -------------------------------------------------------------- -->
+<script src="js/engine/restic.js"></script>
+
+<!-- Features ------------------------------------------------------------ -->
+<script src="js/features/overview.js"></script>
+<script src="js/features/repos-ui.js"></script>
+<script src="js/features/jobs-ui.js"></script>
+<script src="js/features/logbook-ui.js"></script>
+<script src="js/features/recovery-ui.js"></script>
+<script src="js/features/provision-ui.js"></script>
+<script src="js/features/settings-ui.js"></script>
+<script src="js/features/update.js"></script>
+
+<script src="js/app.js"></script>
+
+<!-- boot.js injects the modal partials and THEN loads Alpine, so Alpine walks a
+     complete DOM. Order is the whole trick — same as manifest/explorer. -->
+<script src="js/boot.js"></script>
+
+</body>
+</html>

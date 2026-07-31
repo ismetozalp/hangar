@@ -1,0 +1,38 @@
+<!-- Generic confirmation modal.
+     Opened via the 'hangar:confirm' event so any feature can reuse it rather than
+     shipping its own. Destructive actions get btn-danger and require the user to
+     read what will happen, not just where the button is. -->
+<div class="modal fade" id="hangar-confirm" tabindex="-1"
+     aria-labelledby="hangar-confirm-title" aria-hidden="true"
+     x-data="hangarConfirm()" x-init="init()">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+
+            <div class="modal-header">
+                <h5 class="modal-title" id="hangar-confirm-title" x-text="title"></h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+
+            <div class="modal-body">
+                <p x-text="message" class="mb-2"></p>
+
+                <p x-show="detail" class="text-secondary small mb-2" x-text="detail"></p>
+
+                <!-- Irreversible actions name the thing being destroyed, so the
+                     dialog cannot be dismissed on autopilot. -->
+                <div x-show="danger" class="alert alert-danger py-2 px-3 small mb-0">
+                    This cannot be undone.
+                </div>
+            </div>
+
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal"
+                        x-text="cancelLabel"></button>
+                <button type="button" class="btn"
+                        :class="danger ? 'btn-danger' : 'btn-primary'"
+                        @click="accept()" x-text="confirmLabel"></button>
+            </div>
+
+        </div>
+    </div>
+</div>

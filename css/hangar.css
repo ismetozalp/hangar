@@ -1,0 +1,173 @@
+/* hangar.css — plugin styling layered over Bootstrap + the shared themes.css.
+ *
+ * The Logbook scrubber is the only genuinely custom widget here; everything else
+ * leans on Bootstrap so the plugin inherits Cockpit's light/dark switching via
+ * themes.css rather than maintaining a second palette.
+ */
+
+:root {
+    --hangar-gutter: 1rem;
+    --hangar-scrubber-w: 13rem;
+    --hangar-ok: #2e7d32;
+    --hangar-warn: #ed6c02;
+    --hangar-err: #c62828;
+    --hangar-idle: #6c757d;
+}
+
+body {
+    margin: 0;
+    font-size: 0.9rem;
+}
+
+.hangar-shell {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    overflow: hidden;
+}
+
+.hangar-header {
+    flex: 0 0 auto;
+    padding: 0.6rem var(--hangar-gutter);
+    border-bottom: 1px solid var(--bs-border-color, rgba(0, 0, 0, 0.15));
+}
+
+.hangar-body {
+    flex: 1 1 auto;
+    overflow: auto;
+    padding: var(--hangar-gutter);
+}
+
+/* --- status dots ------------------------------------------------------- */
+
+.hangar-dot {
+    display: inline-block;
+    width: 0.6rem;
+    height: 0.6rem;
+    border-radius: 50%;
+    margin-right: 0.4rem;
+    vertical-align: middle;
+    background: var(--hangar-idle);
+}
+
+.hangar-dot.ok       { background: var(--hangar-ok); }
+.hangar-dot.partial  { background: var(--hangar-warn); }
+.hangar-dot.failed   { background: var(--hangar-err); }
+.hangar-dot.running  { background: var(--hangar-ok); animation: hangar-pulse 1.4s ease-in-out infinite; }
+
+@keyframes hangar-pulse {
+    0%, 100% { opacity: 1; }
+    50%      { opacity: 0.25; }
+}
+
+/* Respect users who have asked the OS for less motion — the pulse is decorative. */
+@media (prefers-reduced-motion: reduce) {
+    .hangar-dot.running { animation: none; }
+}
+
+/* --- Logbook ----------------------------------------------------------- */
+
+.hangar-logbook {
+    display: flex;
+    gap: var(--hangar-gutter);
+    align-items: stretch;
+    min-height: 24rem;
+}
+
+.hangar-tree {
+    flex: 1 1 auto;
+    overflow: auto;
+    border: 1px solid var(--bs-border-color, rgba(0, 0, 0, 0.15));
+    border-radius: 0.35rem;
+}
+
+/* The scrubber is the signature control: a vertical stack of moments, newest at
+ * the top, that the user scrolls back through. Sticky so it stays put while the
+ * file tree beside it scrolls independently. */
+.hangar-scrubber {
+    flex: 0 0 var(--hangar-scrubber-w);
+    overflow: auto;
+    border-left: 1px solid var(--bs-border-color, rgba(0, 0, 0, 0.15));
+    padding-left: 0.75rem;
+}
+
+.hangar-band-label {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    opacity: 0.65;
+    padding: 0.35rem 0 0.2rem;
+    background: var(--bs-body-bg, #fff);
+}
+
+.hangar-moment {
+    display: block;
+    width: 100%;
+    text-align: left;
+    border: 0;
+    background: transparent;
+    padding: 0.3rem 0.5rem;
+    border-radius: 0.3rem;
+    cursor: pointer;
+    line-height: 1.25;
+}
+
+.hangar-moment:hover { background: var(--bs-secondary-bg, rgba(0, 0, 0, 0.06)); }
+
+.hangar-moment.active {
+    background: var(--bs-primary, #0d6efd);
+    color: #fff;
+}
+
+.hangar-moment .rel {
+    display: block;
+    font-size: 0.75rem;
+    opacity: 0.7;
+}
+
+.hangar-moment.active .rel { opacity: 0.85; }
+
+/* Change badges between adjacent snapshots. */
+.hangar-badge {
+    font-size: 0.68rem;
+    padding: 0 0.3rem;
+    border-radius: 0.25rem;
+    margin-left: 0.35rem;
+}
+
+.hangar-badge.added    { background: rgba(46, 125, 50, 0.18);  color: var(--hangar-ok); }
+.hangar-badge.modified { background: rgba(237, 108, 2, 0.18);  color: var(--hangar-warn); }
+.hangar-badge.removed  { background: rgba(198, 40, 40, 0.18);  color: var(--hangar-err); }
+
+/* --- misc -------------------------------------------------------------- */
+
+.hangar-empty {
+    padding: 3rem 1rem;
+    text-align: center;
+    opacity: 0.7;
+}
+
+.hangar-mono {
+    font-family: var(--bs-font-monospace, monospace);
+    font-size: 0.82rem;
+}
+
+/* Raw ReaR log tail — we show it verbatim when parsing fails, so it needs to be
+ * readable and scrollable rather than truncated. */
+.hangar-rawlog {
+    max-height: 18rem;
+    overflow: auto;
+    white-space: pre;
+    font-family: var(--bs-font-monospace, monospace);
+    font-size: 0.78rem;
+    padding: 0.6rem;
+    border-radius: 0.3rem;
+    background: var(--bs-secondary-bg, rgba(0, 0, 0, 0.05));
+}
+
+.hangar-progress {
+    height: 0.45rem;
+}

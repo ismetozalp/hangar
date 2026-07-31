@@ -1,0 +1,15 @@
+Relax-and-Recover 2.7 / 2023-12-05
+Running rear mkrescue (PID 42010 date 2026-08-01 09:31:44)
+Using log file: /var/log/rear/rear-db01.log
+Creating disk layout
+Creating root filesystem layout
+Copying files and directories
+Copying binaries and libraries
+ERROR: Could not find a required program: restic
+Some latest log messages since the last called script 400_copy_binaries_libraries.sh:
+  2026-08-01 09:31:52.118293145 Including rescue/default/400_copy_binaries_libraries.sh
+  2026-08-01 09:31:52.884012331 Copying binaries and libraries
+Aborting due to an error, check /var/log/rear/rear-db01.log for details
+Exiting rear mkrescue (PID 42010) and its descendant processes ...
+Running exit tasks
+You should also rm -Rf /var/tmp/rear.PqR9ke2Lm1

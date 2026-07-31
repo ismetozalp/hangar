@@ -1,0 +1,7 @@
+++ source /usr/share/rear/lib/_input-output-functions.sh
+++ declare -a EXTERNAL_BACKUP
++++ mktemp -d /var/tmp/rear.XXXXXXXXXXXXXXX
+zstd: /*stdin*\: unexpected end of file
+mkisofs: Warning: -input-charset not specified, using utf-8 (detected in locale settings)
+grub2-mkimage: warning: this msdos-style partition label has no post-MBR gap.
+	setting up 1 dm device

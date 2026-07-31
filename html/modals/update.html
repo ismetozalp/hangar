@@ -1,0 +1,94 @@
+<!-- Self-update modal.
+     Not the generic confirm dialog: this needs three distinct phases (confirm ->
+     running -> done/error) and a live log pane, which confirmDialog's
+     title+message shape has no room for.
+
+     Static backdrop and keyboard=false while running: `make install` runs as root,
+     and walking away from it half-finished is exactly what must not happen. -->
+<div class="modal fade" id="hangar-update" tabindex="-1"
+     data-bs-backdrop="static" data-bs-keyboard="false"
+     aria-labelledby="hangar-update-title" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered modal-lg">
+        <div class="modal-content">
+
+            <div class="modal-header">
+                <h5 class="modal-title" id="hangar-update-title">
+                    <span x-show="updatePhase === 'confirm'">Update Hangar</span>
+                    <span x-show="updatePhase === 'running'">Updating…</span>
+                    <span x-show="updatePhase === 'done'">Update installed</span>
+                    <span x-show="updatePhase === 'error'">Update failed</span>
+                </h5>
+                <button type="button" class="btn-close" aria-label="Close"
+                        x-show="!_inFlight" @click="closeUpdateModal()"></button>
+            </div>
+
+            <div class="modal-body">
+
+                <!-- Confirm phase -->
+                <template x-if="updatePhase === 'confirm'">
+                    <div>
+                        <p class="mb-2">
+                            Version <strong x-text="update.version"></strong> is available.
+                            You have <span class="hangar-mono" x-text="installedVersion || 'unknown'"></span>.
+                        </p>
+
+                        <div x-show="update.prerelease" class="alert alert-warning py-2 px-3 small">
+                            This is a pre-release.
+                        </div>
+
+                        <details x-show="update.notes" class="mb-3">
+                            <summary class="small">Release notes</summary>
+                            <div class="hangar-rawlog mt-2" x-text="update.notes"></div>
+                        </details>
+
+                        <p class="small text-secondary mb-2">
+                            Hangar will download the release, run
+                            <span class="hangar-mono">make install</span> as root, and restart
+                            Cockpit. Your configuration in
+                            <span class="hangar-mono">/etc/hangar</span> and your backup
+                            repositories are not touched.
+                        </p>
+
+                        <!-- Stated plainly because it is the reassurance that makes the
+                             root install acceptable to agree to. -->
+                        <div class="alert alert-secondary py-2 px-3 small mb-0">
+                            If the update fails, the version you are running now stays in place.
+                        </div>
+                    </div>
+                </template>
+
+                <!-- Running / finished: the live log -->
+                <template x-if="updatePhase !== 'confirm'">
+                    <div>
+                        <div x-show="updatePhase === 'done'" class="alert alert-success py-2 px-3 small">
+                            Reload this page in a few seconds to pick up the new version.
+                        </div>
+                        <div x-show="updatePhase === 'error'" class="alert alert-danger py-2 px-3 small">
+                            The update did not complete. The previously installed version is
+                            still active.
+                        </div>
+                        <div class="hangar-rawlog" role="log" aria-live="polite">
+                            <template x-for="(line, i) in updateLog" :key="i">
+                                <div x-text="line"></div>
+                            </template>
+                        </div>
+                    </div>
+                </template>
+
+            </div>
+
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary"
+                        x-show="updatePhase === 'confirm'" @click="closeUpdateModal()">Cancel</button>
+                <button type="button" class="btn btn-primary"
+                        x-show="updatePhase === 'confirm'" @click="startSelfUpdate()">Install update</button>
+                <button type="button" class="btn btn-secondary" disabled
+                        x-show="updatePhase === 'running'">Working…</button>
+                <button type="button" class="btn btn-primary"
+                        x-show="updatePhase === 'done' || updatePhase === 'error'"
+                        @click="closeUpdateModal()">Close</button>
+            </div>
+
+        </div>
+    </div>
+</div>

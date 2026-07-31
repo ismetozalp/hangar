@@ -1,0 +1,25 @@
+Relax-and-Recover 2.7 / 2023-12-05
+Running rear mkrescue (PID 41881 date 2026-08-01 09:14:02)
+Using log file: /var/log/rear/rear-db01.log
+Running workflow mkrescue on the normal/original system
+Creating disk layout
+Overwriting existing disk layout file /var/lib/rear/layout/disklayout.conf
+Creating root filesystem layout
+Handling network interface 'ens3'
+ens3 is a physical device
+Handled network interface 'ens3'
+Copying logfile /var/log/rear/rear-db01.log into initramfs as '/tmp/rear-db01-partial-2026-08-01T09:14:02+03:00.log'
+Copying files and directories
+Copying binaries and libraries
+Copying all kernel modules in /lib/modules/6.12.0-211.40.1.el10_2.x86_64 (MODULES contains 'all_modules')
+Copying all files in /lib*/firmware/
+Symlinking dirs
+Testing that /var/tmp/rear.YMzQ4bF0uT2fSlp/rootfs/bin/sh is a working shell
+Creating recovery/rescue system initramfs/initrd initrd.cgz with gzip default compression
+Created initrd.cgz with gzip default compression (250564341 bytes) in 41 seconds
+Making ISO image
+Wrote ISO image: /var/lib/rear/output/rear-db01.iso (267M)
+Copying resulting files to file location
+Saving /var/log/rear/rear-db01.log as rear-db01.log to file location
+Exiting rear mkrescue (PID 41881) and its descendant processes ...
+Running exit tasks
