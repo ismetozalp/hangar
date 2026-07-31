@@ -1,0 +1,10 @@
+node_modules/
+package-lock.json
+hangar-*.zip
+tests/*.png
+tests/tmp/
+.superpowers/
+/tmp/
+
+# Planning/spec docs — not part of the shipped plugin
+docs/

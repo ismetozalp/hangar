@@ -1,0 +1,16 @@
+{
+    "version": 0,
+    "name": "hangar",
+    "requires": { "cockpit": "300" },
+    "tools": {
+        "index": {
+            "label": "Hangar",
+            "path": "index.html",
+            "order": 52,
+            "keywords": [
+                { "matches": ["backup","restore","snapshot","restic","recovery","disaster","archive","rear","logbook"], "weight": 3 }
+            ]
+        }
+    },
+    "content-security-policy": "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; connect-src 'self'; font-src 'self' data:; object-src 'self'"
+}

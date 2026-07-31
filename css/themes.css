@@ -1,0 +1,372 @@
+/* themes.css — custom Bootstrap 5.3 `data-bs-theme` palettes for Manifest.
+   `system` / `light` / `dark` use Bootstrap's built-in modes and need no
+   block here. Each custom theme below overrides the key Bootstrap CSS
+   variables plus the Manifest --mf-* accents (banner, status dot,
+   selection). All are `base:'dark'` (they extend Bootstrap's dark mode) —
+   see js/core/themes.js THEMES registry. Contrast checked for WCAG AA body
+   text against its background. */
+
+/* ── Aqua — teal/cyan on deep slate ── */
+[data-bs-theme="aqua"] {
+    --bs-body-bg: #071a1f;
+    --bs-body-color: #d8f3f0;
+    --bs-body-color-rgb: 216, 243, 240;
+    --bs-secondary-color: rgba(216, 243, 240, 0.75);
+    --bs-tertiary-color: rgba(216, 243, 240, 0.5);
+    --bs-emphasis-color: #ffffff;
+    --bs-heading-color: #ffffff;
+    --bs-secondary-bg: #0e2a31;
+    --bs-tertiary-bg: #123640;
+    --bs-border-color: #1d4a55;
+    --bs-primary: #2dd4bf;
+    --bs-primary-rgb: 45, 212, 191;
+    --bs-success: #34d399;
+    --bs-warning: #fbbf24;
+    --bs-danger: #f87171;
+    --bs-link-color: #5eead4;
+    --bs-link-hover-color: #99f6e4;
+
+    --mf-banner-up-bg: #0f3d38;
+    --mf-banner-down-bg: #4a2e12;
+    --mf-dot-up: #2dd4bf;
+    --mf-dot-down: #94a3b8;
+    --mf-progress-fg: #2dd4bf;
+    --mf-row-selected-bg: #12414a;
+}
+
+/* ── Nord — arctic blue-grey ── */
+[data-bs-theme="nord"] {
+    --bs-body-bg: #2e3440;
+    --bs-body-color: #e5e9f0;
+    --bs-body-color-rgb: 229, 233, 240;
+    --bs-secondary-color: rgba(229, 233, 240, 0.75);
+    --bs-tertiary-color: rgba(229, 233, 240, 0.5);
+    --bs-emphasis-color: #eceff4;
+    --bs-heading-color: #eceff4;
+    --bs-secondary-bg: #3b4252;
+    --bs-tertiary-bg: #434c5e;
+    --bs-border-color: #4c566a;
+    --bs-primary: #88c0d0;
+    --bs-primary-rgb: 136, 192, 208;
+    --bs-success: #a3be8c;
+    --bs-warning: #ebcb8b;
+    --bs-danger: #bf616a;
+    --bs-link-color: #88c0d0;
+    --bs-link-hover-color: #8fbcbb;
+
+    --mf-banner-up-bg: #3b4a3f;
+    --mf-banner-down-bg: #4f4130;
+    --mf-dot-up: #a3be8c;
+    --mf-dot-down: #4c566a;
+    --mf-progress-fg: #88c0d0;
+    --mf-row-selected-bg: #3b4252;
+}
+
+/* ── Solarized (dark) — warm amber accents ── */
+[data-bs-theme="solarized"] {
+    --bs-body-bg: #002b36;
+    --bs-body-color: #d3c9ab;
+    --bs-body-color-rgb: 211, 201, 171;
+    --bs-secondary-color: rgba(211, 201, 171, 0.75);
+    --bs-tertiary-color: rgba(211, 201, 171, 0.5);
+    --bs-emphasis-color: #fdf6e3;
+    --bs-heading-color: #fdf6e3;
+    --bs-secondary-bg: #073642;
+    --bs-tertiary-bg: #0a4351;
+    --bs-border-color: #12586a;
+    --bs-primary: #b58900;
+    --bs-primary-rgb: 181, 137, 0;
+    --bs-success: #859900;
+    --bs-warning: #cb4b16;
+    --bs-danger: #dc322f;
+    --bs-link-color: #cb9500;
+    --bs-link-hover-color: #e0a800;
+
+    --mf-banner-up-bg: #35400e;
+    --mf-banner-down-bg: #4a2a14;
+    --mf-dot-up: #859900;
+    --mf-dot-down: #586e75;
+    --mf-progress-fg: #b58900;
+    --mf-row-selected-bg: #0a4351;
+}
+
+/* ── Dracula — purple/pink on near-black ── */
+[data-bs-theme="dracula"] {
+    --bs-body-bg: #282a36;
+    --bs-body-color: #f8f8f2;
+    --bs-body-color-rgb: 248, 248, 242;
+    --bs-secondary-color: rgba(248, 248, 242, 0.75);
+    --bs-tertiary-color: rgba(248, 248, 242, 0.5);
+    --bs-emphasis-color: #ffffff;
+    --bs-heading-color: #ffffff;
+    --bs-secondary-bg: #343746;
+    --bs-tertiary-bg: #3b3e4f;
+    --bs-border-color: #44475a;
+    --bs-primary: #bd93f9;
+    --bs-primary-rgb: 189, 147, 249;
+    --bs-success: #50fa7b;
+    --bs-warning: #f1fa8c;
+    --bs-danger: #ff5555;
+    --bs-link-color: #ff79c6;
+    --bs-link-hover-color: #ffb3de;
+
+    --mf-banner-up-bg: #1f4a2e;
+    --mf-banner-down-bg: #4a3a1a;
+    --mf-dot-up: #50fa7b;
+    --mf-dot-down: #6272a4;
+    --mf-progress-fg: #bd93f9;
+    --mf-row-selected-bg: #3b3e4f;
+}
+
+/* ── Gruvbox — warm retro on brown ── */
+[data-bs-theme="gruvbox"] {
+    --bs-body-bg: #282828;
+    --bs-body-color: #ebdbb2;
+    --bs-body-color-rgb: 235, 219, 178;
+    --bs-secondary-color: rgba(235, 219, 178, 0.75);
+    --bs-tertiary-color: rgba(235, 219, 178, 0.5);
+    --bs-emphasis-color: #fbf1c7;
+    --bs-heading-color: #fbf1c7;
+    --bs-secondary-bg: #3c3836;
+    --bs-tertiary-bg: #504945;
+    --bs-border-color: #665c54;
+    --bs-primary: #d65d0e;
+    --bs-primary-rgb: 214, 93, 14;
+    --bs-success: #98971a;
+    --bs-warning: #d79921;
+    --bs-danger: #cc241d;
+    --bs-link-color: #83a598;
+    --bs-link-hover-color: #8ec07c;
+    --mf-banner-up-bg: #3c441e;
+    --mf-banner-down-bg: #4a3423;
+    --mf-dot-up: #98971a;
+    --mf-dot-down: #928374;
+    --mf-progress-fg: #fe8019;
+    --mf-row-selected-bg: #45403a;
+}
+
+/* ── Catppuccin (Mocha) — pastel on deep indigo ── */
+[data-bs-theme="catppuccin"] {
+    --bs-body-bg: #1e1e2e;
+    --bs-body-color: #cdd6f4;
+    --bs-body-color-rgb: 205, 214, 244;
+    --bs-secondary-color: rgba(205, 214, 244, 0.75);
+    --bs-tertiary-color: rgba(205, 214, 244, 0.5);
+    --bs-emphasis-color: #ffffff;
+    --bs-heading-color: #ffffff;
+    --bs-secondary-bg: #313244;
+    --bs-tertiary-bg: #45475a;
+    --bs-border-color: #585b70;
+    --bs-primary: #cba6f7;
+    --bs-primary-rgb: 203, 166, 247;
+    --bs-success: #a6e3a1;
+    --bs-warning: #f9e2af;
+    --bs-danger: #f38ba8;
+    --bs-link-color: #89b4fa;
+    --bs-link-hover-color: #b4befe;
+    --mf-banner-up-bg: #2a3a2e;
+    --mf-banner-down-bg: #3a2e2a;
+    --mf-dot-up: #a6e3a1;
+    --mf-dot-down: #6c7086;
+    --mf-progress-fg: #cba6f7;
+    --mf-row-selected-bg: #45475a;
+}
+/* ── Tokyo Night — blue/purple night ── */
+[data-bs-theme="tokyonight"] {
+    --bs-body-bg: #1a1b26;
+    --bs-body-color: #c0caf5;
+    --bs-body-color-rgb: 192, 202, 245;
+    --bs-secondary-color: rgba(192, 202, 245, 0.75);
+    --bs-tertiary-color: rgba(192, 202, 245, 0.5);
+    --bs-emphasis-color: #ffffff;
+    --bs-heading-color: #ffffff;
+    --bs-secondary-bg: #24283b;
+    --bs-tertiary-bg: #2f334d;
+    --bs-border-color: #414868;
+    --bs-primary: #7aa2f7;
+    --bs-primary-rgb: 122, 162, 247;
+    --bs-success: #9ece6a;
+    --bs-warning: #e0af68;
+    --bs-danger: #f7768e;
+    --bs-link-color: #7dcfff;
+    --bs-link-hover-color: #b4f9f8;
+    --mf-banner-up-bg: #29352b;
+    --mf-banner-down-bg: #3a2f26;
+    --mf-dot-up: #9ece6a;
+    --mf-dot-down: #565f89;
+    --mf-progress-fg: #7aa2f7;
+    --mf-row-selected-bg: #2f334d;
+}
+
+/* ── Rosé Pine — muted rose & iris ── */
+[data-bs-theme="rosepine"] {
+    --bs-body-bg: #191724;
+    --bs-body-color: #e0def4;
+    --bs-body-color-rgb: 224, 222, 244;
+    --bs-secondary-color: rgba(224, 222, 244, 0.75);
+    --bs-tertiary-color: rgba(224, 222, 244, 0.5);
+    --bs-emphasis-color: #ffffff;
+    --bs-heading-color: #ffffff;
+    --bs-secondary-bg: #1f1d2e;
+    --bs-tertiary-bg: #26233a;
+    --bs-border-color: #403d52;
+    --bs-primary: #eb6f92;
+    --bs-primary-rgb: 235, 111, 146;
+    --bs-success: #9ccfd8;
+    --bs-warning: #f6c177;
+    --bs-danger: #eb6f92;
+    --bs-link-color: #c4a7e7;
+    --bs-link-hover-color: #d7c4f0;
+    --mf-banner-up-bg: #2a333a;
+    --mf-banner-down-bg: #3a2e2a;
+    --mf-dot-up: #9ccfd8;
+    --mf-dot-down: #6e6a86;
+    --mf-progress-fg: #ebbcba;
+    --mf-row-selected-bg: #26233a;
+}
+
+/* ── Sunset — warm orange/rose on plum ── */
+[data-bs-theme="sunset"] {
+    --bs-body-bg: #2b1e2e;
+    --bs-body-color: #f5e0d8;
+    --bs-body-color-rgb: 245, 224, 216;
+    --bs-secondary-color: rgba(245, 224, 216, 0.75);
+    --bs-tertiary-color: rgba(245, 224, 216, 0.5);
+    --bs-emphasis-color: #fff5f0;
+    --bs-heading-color: #fff5f0;
+    --bs-secondary-bg: #3a2836;
+    --bs-tertiary-bg: #4a3344;
+    --bs-border-color: #5e4256;
+    --bs-primary: #f97316;
+    --bs-primary-rgb: 249, 115, 22;
+    --bs-success: #fbbf24;
+    --bs-warning: #f59e0b;
+    --bs-danger: #ef4444;
+    --bs-link-color: #fb7185;
+    --bs-link-hover-color: #fda4af;
+    --mf-banner-up-bg: #3a3a1e;
+    --mf-banner-down-bg: #4a2e1e;
+    --mf-dot-up: #fbbf24;
+    --mf-dot-down: #9a7a8a;
+    --mf-progress-fg: #f97316;
+    --mf-row-selected-bg: #4a3344;
+}
+
+/* ── Sepia — warm paper (light) ── */
+[data-bs-theme="sepia"] {
+    --bs-body-bg: #f4ecd8;
+    --bs-body-color: #5b4636;
+    --bs-body-color-rgb: 91, 70, 54;
+    --bs-secondary-color: rgba(91, 70, 54, 0.75);
+    --bs-tertiary-color: rgba(91, 70, 54, 0.5);
+    --bs-emphasis-color: #3a2c1e;
+    --bs-heading-color: #3a2c1e;
+    --bs-secondary-bg: #ece0c8;
+    --bs-tertiary-bg: #e3d5b8;
+    --bs-border-color: #d3c4a3;
+    --bs-primary: #a0522d;
+    --bs-primary-rgb: 160, 82, 45;
+    --bs-success: #6b8e23;
+    --bs-warning: #b8860b;
+    --bs-danger: #a52a2a;
+    --bs-link-color: #8b4513;
+    --bs-link-hover-color: #a0522d;
+    --mf-banner-up-bg: #dce8c0;
+    --mf-banner-down-bg: #f0dcc0;
+    --mf-dot-up: #6b8e23;
+    --mf-dot-down: #a89878;
+    --mf-progress-fg: #a0522d;
+    --mf-row-selected-bg: #e3d5b8;
+}
+
+/* ── Theme-accent buttons ──
+   Make primary buttons follow the theme's --bs-primary instead of Bootstrap's
+   fixed blue, with a darker hover/active via color-mix. For the built-in
+   Light/Dark themes --bs-primary IS Bootstrap blue, so they are unchanged; only
+   the custom themes (which override --bs-primary) get accent-coloured buttons. */
+.btn-primary {
+    --bs-btn-bg: var(--bs-primary);
+    --bs-btn-border-color: var(--bs-primary);
+    --bs-btn-hover-bg: color-mix(in srgb, var(--bs-primary) 85%, #000);
+    --bs-btn-hover-border-color: color-mix(in srgb, var(--bs-primary) 78%, #000);
+    --bs-btn-active-bg: color-mix(in srgb, var(--bs-primary) 74%, #000);
+    --bs-btn-active-border-color: color-mix(in srgb, var(--bs-primary) 70%, #000);
+    --bs-btn-disabled-bg: var(--bs-primary);
+    --bs-btn-disabled-border-color: var(--bs-primary);
+    --bs-btn-focus-shadow-rgb: var(--bs-primary-rgb);
+}
+.btn-outline-primary {
+    --bs-btn-color: var(--bs-primary);
+    --bs-btn-border-color: var(--bs-primary);
+    --bs-btn-hover-bg: var(--bs-primary);
+    --bs-btn-hover-border-color: var(--bs-primary);
+    --bs-btn-active-bg: var(--bs-primary);
+    --bs-btn-active-border-color: var(--bs-primary);
+    --bs-btn-focus-shadow-rgb: var(--bs-primary-rgb);
+}
+/* Light accents (teal/mauve/etc.) need DARK button text for contrast; the rest
+   keep white. Applies to the filled button and the outline button's hover fill. */
+[data-bs-theme="aqua"] .btn-primary,
+[data-bs-theme="nord"] .btn-primary,
+[data-bs-theme="dracula"] .btn-primary,
+[data-bs-theme="catppuccin"] .btn-primary,
+[data-bs-theme="aqua"] .btn-outline-primary,
+[data-bs-theme="nord"] .btn-outline-primary,
+[data-bs-theme="dracula"] .btn-outline-primary,
+[data-bs-theme="catppuccin"] .btn-outline-primary {
+    --bs-btn-color: #14181a;
+    --bs-btn-hover-color: #14181a;
+    --bs-btn-active-color: #14181a;
+    --bs-btn-disabled-color: #14181a;
+}
+/* Outline buttons must still show the accent as their (un-hovered) text colour,
+   not the dark hover colour, in those light-accent themes. */
+[data-bs-theme="aqua"] .btn-outline-primary,
+[data-bs-theme="nord"] .btn-outline-primary,
+[data-bs-theme="dracula"] .btn-outline-primary,
+[data-bs-theme="catppuccin"] .btn-outline-primary {
+    --bs-btn-color: var(--bs-primary);
+}
+
+/* Modal close (×): Bootstrap only whitens .btn-close for data-bs-theme="dark",
+   so on the custom DARK themes the × renders as a near-black glyph on a dark
+   header (the light/sepia themes keep the default dark glyph, which is correct).
+   Apply the same white-invert filter Bootstrap uses for its dark theme. */
+[data-bs-theme="aqua"] .btn-close,
+[data-bs-theme="nord"] .btn-close,
+[data-bs-theme="solarized"] .btn-close,
+[data-bs-theme="dracula"] .btn-close,
+[data-bs-theme="gruvbox"] .btn-close,
+[data-bs-theme="catppuccin"] .btn-close,
+[data-bs-theme="tokyonight"] .btn-close,
+[data-bs-theme="rosepine"] .btn-close,
+[data-bs-theme="sunset"] .btn-close {
+    filter: invert(1) grayscale(100%) brightness(200%);
+}
+
+/* Wire the manifest.css component classes to the --mf-* accent variables
+   (System/Light/Dark leave these unset and fall back to manifest.css's
+   Bootstrap-var defaults). */
+.mf-banner-up { background: var(--mf-banner-up-bg, var(--bs-success-bg-subtle, #d1e7dd)); }
+.mf-banner-down { background: var(--mf-banner-down-bg, var(--bs-warning-bg-subtle, #fff3cd)); }
+.mf-dot.up { background: var(--mf-dot-up, var(--bs-success, #198754)); }
+.mf-dot.down { background: var(--mf-dot-down, var(--bs-secondary, #6c757d)); }
+.mf-row-selected { background: var(--mf-row-selected-bg, var(--bs-primary-bg-subtle, #cfe2ff)); }
+.progress-bar, .mf-progress-fg { background-color: var(--mf-progress-fg, var(--bs-primary)); }
+
+/* Theme picker swatches (Settings → Appearance): a two-tone preview of each
+   theme — base background on one half, accent/primary on the other. The span's
+   size/border/radius come from its inline style; only the fill lives here. */
+.mf-theme-swatch-system    { background: linear-gradient(135deg, #f8f9fa 50%, #212529 50%); }
+.mf-theme-swatch-light     { background: linear-gradient(135deg, #f8f9fa 50%, #0d6efd 50%); }
+.mf-theme-swatch-dark      { background: linear-gradient(135deg, #212529 50%, #6ea8fe 50%); }
+.mf-theme-swatch-aqua      { background: linear-gradient(135deg, #071a1f 50%, #2dd4bf 50%); }
+.mf-theme-swatch-nord      { background: linear-gradient(135deg, #2e3440 50%, #88c0d0 50%); }
+.mf-theme-swatch-solarized { background: linear-gradient(135deg, #002b36 50%, #b58900 50%); }
+.mf-theme-swatch-dracula   { background: linear-gradient(135deg, #282a36 50%, #bd93f9 50%); }
+.mf-theme-swatch-gruvbox    { background: linear-gradient(135deg, #282828 50%, #d65d0e 50%); }
+.mf-theme-swatch-catppuccin { background: linear-gradient(135deg, #1e1e2e 50%, #cba6f7 50%); }
+.mf-theme-swatch-tokyonight { background: linear-gradient(135deg, #1a1b26 50%, #7aa2f7 50%); }
+.mf-theme-swatch-rosepine   { background: linear-gradient(135deg, #191724 50%, #eb6f92 50%); }
+.mf-theme-swatch-sunset     { background: linear-gradient(135deg, #2b1e2e 50%, #f97316 50%); }
+.mf-theme-swatch-sepia      { background: linear-gradient(135deg, #f4ecd8 50%, #a0522d 50%); }
