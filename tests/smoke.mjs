@@ -181,6 +181,56 @@ for (const f of [...modules, 'index.html', ...walkHtml('html')]) {
 }
 ok('no x-show is defeated by a Bootstrap display utility');
 
+// --- the README's provider claims must match the code -------------------
+//
+// A provider list in prose is exactly the thing that drifts: someone adds a
+// backend and the documentation quietly keeps promising the old set. Worse, the
+// README tells users which providers Hangar can set up FOR them and which need a
+// manual step — getting that wrong sends someone to a dead end.
+
+if (exists('README.md') && exists('js/core/rclone.js')) {
+    const readme = read('README.md');
+    const { createRequire } = await import('node:module');
+    const require_ = createRequire(import.meta.url);
+    const Rclone = require_(path.join(ROOT, 'js/core/rclone.js'));
+
+    // The README uses the name people say ("OneDrive", "Swift") rather than the
+    // table's fuller label ("Microsoft OneDrive", "OpenStack Swift"), so accept a
+    // match on ANY significant word of the label, or on the id.
+    const SKIP_WORDS = new Set(['microsoft', 'openstack', 'compatible', 'storage',
+        'windows', 'share', 'ssh', 'google', 'and']);
+    const mentions = (label, id) => {
+        const words = label.split(/[\s(),/…]+/).filter(Boolean)
+            .map((w) => w.replace(/[^A-Za-z0-9-]/g, ''))
+            .filter((w) => w.length >= 2 && !SKIP_WORDS.has(w.toLowerCase()));
+        return [id, ...words].some((w) =>
+            new RegExp(`\\b${w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(readme));
+    };
+
+    for (const p of Rclone.providers()) {
+        if (!mentions(p.label, p.id))
+            fail(`README does not mention the "${p.id}" destination (${p.label})`);
+    }
+
+    // A provider Hangar cannot configure must be documented as such, or the user
+    // follows instructions that cannot work.
+    for (const p of Rclone.providers().filter((x) => x.auth === Rclone.AUTH.EXTERNAL)) {
+        const name = p.label.split(/[\s(/]/)[0];
+        const inManualRow = new RegExp(`\\|\\s*\\*\\*Manual\\*\\*\\s*\\|[^|]*${name}`, 'i');
+        if (!inManualRow.test(readme))
+            fail(`${p.label} cannot be configured by hangar but the README does not say so`);
+    }
+
+    // And the reverse: nothing Hangar CAN automate should be listed as manual.
+    const manualRow = (readme.match(/\|\s*\*\*Manual\*\*\s*\|([^|]*)\|/i) || [])[1] || '';
+    for (const p of Rclone.providers().filter((x) => x.auth !== Rclone.AUTH.EXTERNAL)) {
+        const name = p.label.split(/[\s(/]/)[0];
+        if (new RegExp(`\\b${name}\\b`, 'i').test(manualRow))
+            fail(`README lists ${p.label} as manual, but hangar can configure it`);
+    }
+    ok(`README documents all ${Rclone.providers().length} cloud destinations correctly`);
+}
+
 // --- the feature is called Logbook, never Time Machine ------------------
 
 for (const f of [...modules, 'index.html', 'css/hangar.css']) {

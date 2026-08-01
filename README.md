@@ -48,6 +48,66 @@ package manager.
 
 ---
 
+## Cloud destinations
+
+Hangar speaks four object stores natively — **Amazon S3** (and S3-compatible
+providers), **Backblaze B2**, **Azure Blob Storage** and **Google Cloud
+Storage** — plus local disks, USB drives, SFTP and a
+[restic REST server](https://github.com/restic/rest-server).
+
+Everything else goes through [rclone](https://rclone.org/overview/), which adds
+roughly forty more: **Google Drive, Dropbox, OneDrive, Box, pCloud, Mega, Proton
+Drive, iCloud Drive**, Yandex Disk, Koofr, Jottacloud, Seafile, and protocols
+including **WebDAV, SMB/CIFS, FTP and HDFS**.
+
+Two things worth knowing before you choose:
+
+**Prefer the native backend where one exists.** If you are on S3, B2, Azure or
+GCS, use Hangar's own repository kind rather than routing through rclone — one
+less process in the path, one less thing to fail.
+
+**Do not add rclone's `crypt` layer.** restic already encrypts everything
+client-side before it leaves the machine. Layering `crypt` underneath buys
+nothing and costs CPU; your provider holds encrypted restic packs either way.
+
+### Adding a cloud destination
+
+Hangar can create the rclone remote for you — **Repositories → Add a cloud
+destination** — so `rclone config` is not a prerequisite. How much it can do
+depends on how the provider authenticates.
+
+| Kind | Providers | What you do |
+|---|---|---|
+| **Credentials** | WebDAV, SFTP, FTP, SMB, S3, B2, Swift, Koofr, Mega | Fill in the form. Nothing to run elsewhere. |
+| **Sign-in** | Google Drive, Dropbox, OneDrive, Box, pCloud, Yandex | Run one command on **your own computer**, paste the result back. |
+| **Manual** | Jottacloud | Hangar cannot automate it — it shows you what to run. |
+
+### Why sign-in needs a command on your own computer
+
+`rclone authorize` starts a local web server and asks the provider to redirect
+your browser to `127.0.0.1` when you approve. Run it on the server and that
+redirect points at the *server's* loopback address, which your laptop's browser
+cannot reach.
+
+So Hangar shows you the exact command, you run it where your browser is, and you
+paste the token back. This is rclone's own documented headless procedure, not a
+workaround Hangar invented.
+
+### Per-provider limits
+
+These are properties of the providers, not of Hangar, and Hangar states each one
+at the point where you choose:
+
+| Provider | Limit |
+|---|---|
+| **Google Drive** | rclone's built-in client ID is shared by every rclone user and is **heavily rate-limited**. For anything beyond a trial, register your own in the Google Cloud console — backups will be far faster. This is the only one Hangar flags as a warning rather than a note. |
+| **OneDrive** | A **OneDrive for Business** tenant may refuse rclone's built-in client ID outright. Register an app in Entra ID. |
+| **Box** | The refresh token **expires after 60 days of inactivity**. A repository that is never written to will eventually need re-authorising. |
+| **pCloud** | Accounts live in one of two regions. If the remote lists nothing after you authorise, the account is in the other one. |
+| **Dropbox, Yandex** | Shared-key rate limits and per-application quotas. Your own app registration avoids them; the built-in one is usually fine for modest backups. |
+| **Jottacloud** | Works as a destination, but **Hangar cannot create the remote.** rclone has no `authorize` flow for it — verified, not assumed: `rclone authorize jottacloud` answers *"not supported by this backend"*. Generate a personal login token in Jottacloud's web interface, run **interactive** `rclone config` once, and Hangar will pick the remote up. Note that the non-interactive `rclone config create <name> jottacloud` **appears to succeed but leaves a remote with no token** — it will show up in Hangar's list and fail at backup time. Use interactive `rclone config`. |
+
+
 ## Requirements
 
 - Cockpit 300 or newer
@@ -208,20 +268,44 @@ cleanly when restic is not installed.
 
 ## Known limitations
 
-- **ReaR's restic support is not official.** Upstream ReaR has no restic
-  workflow; Hangar generates a `BACKUP=EXTERNAL` configuration, which ReaR's own
-  documentation calls a last resort. This is precisely why the recovery drill
-  exists. Verify your rescue image.
-- **Backing up a running database's files can produce a backup that will not
-  restore.** Hangar warns when a container that looks like a database is backed
-  up with consistency `none`, but it cannot make a live copy safe. Use `stop`,
-  or `command` with a proper dump (`mongodump`, `pg_dump`), for databases.
-- **VM quiesce mode `agent` degrades silently.** It needs `qemu-guest-agent`
-  running inside the guest; without it the freeze fails and the copy is only
-  crash-consistent.
-- **Single host.** Cockpit's multi-machine fan-out is not used.
+Stated plainly, because a backup tool that oversells itself is worse than one
+that does less.
 
----
+**Disaster recovery rests on an unsupported path.** Upstream ReaR has no restic
+workflow. Hangar generates a `BACKUP=EXTERNAL` configuration, which ReaR's own
+documentation calls a last resort, and upstream will not support it. This is
+exactly why the recovery drill exists — **build the rescue image and verify it
+before you need it.** An untested rescue image is a guess.
+
+**Backing up a running database's files can produce a backup that will not
+restore.** Hangar warns when a container that looks like a database is backed up
+with consistency `none`, but no warning makes a live copy safe. For databases
+use `stop`, or `command` with a real dump (`mongodump`, `pg_dump`).
+
+**VM quiesce mode `agent` degrades silently.** It needs `qemu-guest-agent`
+running *inside* the guest. Without it the freeze fails and the copy is only
+crash-consistent — and nothing in the guest tells you that.
+
+**`none` quiesce is crash-consistent at best.** It is the fast option, not the
+safe one. Whether that is acceptable depends entirely on what the VM runs.
+
+**One machine.** Hangar manages the host it runs on. Cockpit's host switcher has
+been deprecated and disabled by default since Cockpit 322, for sound security
+reasons, so Hangar deliberately does not build on it. If you want several
+machines in one view, point them all at **one shared restic repository** —
+concurrent writers are safe and every snapshot records its hostname, so the
+aggregation happens in the data rather than in the browser.
+
+**Jottacloud cannot be configured from Hangar**, and several cloud providers
+carry rate limits that are not Hangar's to fix. See
+[Per-provider limits](#per-provider-limits).
+
+**restic and rclone are not Red Hat–supported on RHEL.** They live in EPEL. Only
+ReaR ships in RHEL AppStream proper. For a homelab this is irrelevant; for a
+supported production estate it is a procurement question worth asking first.
+
+**No cross-run analytics.** Hangar has no database, so it can only show what
+systemd and restic can tell it. Once journald rotates, that history is gone.
 
 ## Licence
 
