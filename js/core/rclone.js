@@ -74,7 +74,13 @@
         return prop(table, key);
     }
 
-    const AUTH = { OAUTH: 'oauth', CREDENTIALS: 'credentials', NONE: 'none' };
+    // EXTERNAL is not a lesser OAuth — it means rclone itself has no `authorize`
+// hook for the backend, so no command hangar can print will help. Verified by
+// running it: `rclone authorize jottacloud` answers
+// "Error: not supported by this backend", even though the backend HAS a token
+// option. Having a token option is not the same as supporting authorize, which
+// is precisely the proxy that let this ship.
+const AUTH = { OAUTH: 'oauth', CREDENTIALS: 'credentials', EXTERNAL: 'external', NONE: 'none' };
 
     // rclone itself accepts up to 100+ character names, but this name is also
     // pasted into a repository URL, a systemd unit description and a config
@@ -208,7 +214,14 @@
             id: 'jottacloud',
             label: 'Jottacloud',
             type: 'jottacloud',
-            auth: AUTH.OAUTH,
+            // NOT OAuth as far as rclone's tooling is concerned: see AUTH.EXTERNAL.
+            auth: AUTH.EXTERNAL,
+            setupSteps: [
+                'Sign in to Jottacloud on the web and open Settings, then Security.',
+                'Generate a personal login token and copy it.',
+                'On this server run `rclone config`, choose Jottacloud, and paste the token.',
+                'Come back here and pick the new remote from the list.'
+            ],
             fields: [
                 { key: 'client_id', label: 'Client ID', type: 'text', required: false, placeholder: '',
                   help: OAUTH_HELP },
@@ -637,7 +650,23 @@
     // own computer, which is where the browser is.
     function authorizeCommand(providerId) {
         const p = requireProvider(providerId);
+        // null, not a guess: a backend without an authorize hook has no command
+        // to offer, and printing one that errors is worse than printing nothing.
+        if (p.auth !== AUTH.OAUTH) return null;
         return 'rclone authorize "' + p.type + '"';
+    }
+
+    // Backends rclone cannot authorize for us. The UI shows these instructions
+    // instead of a command, and does not pretend it can finish the job.
+    function externalSetup(providerId) {
+        const p = requireProvider(providerId);
+        if (p.auth !== AUTH.EXTERNAL) return null;
+        return {
+            provider: p.id,
+            reason: 'rclone has no automated sign-in for ' + p.label + '.',
+            steps: p.setupSteps || [],
+            command: 'rclone config'
+        };
     }
 
     function describeProvider(id) {
@@ -1015,7 +1044,7 @@
     }
 
     const HangarRclone = {
-        AUTH, PROVIDERS, MAX_NAME_LEN,
+        AUTH, PROVIDERS, externalSetup, MAX_NAME_LEN,
         providers, providerFor, isOAuth, isSecretField, fieldFor, describeProvider,
         validateRemoteName, validateFields,
         configCreateArgv, configDeleteArgv, configFileArgv, obscureArgv,

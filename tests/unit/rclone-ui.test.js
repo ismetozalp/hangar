@@ -109,9 +109,12 @@ const CRED_IDS = Rclone.providers().filter((p) => p.auth === Rclone.AUTH.CREDENT
 
 // ------------------------------------------------------------------ grouping
 
-test('providerGroups splits the table into exactly the two setup experiences', () => {
+test('providerGroups splits the table by setup experience', () => {
+    // Three, not two: some backends have no rclone authorize hook at all, and
+    // putting them in either of the other groups would promise a flow that
+    // cannot run.
     const groups = Ui.providerGroups();
-    assert.deepEqual(groups.map((g) => g.id), ['oauth', 'credentials']);
+    assert.deepEqual(groups.map((g) => g.id), ['oauth', 'credentials', 'external']);
 });
 
 test('the OAuth group comes first, because it is the one with a prerequisite', () => {
@@ -131,7 +134,7 @@ test('every provider in the table appears in exactly one group', () => {
 test('grouping is derived from the table, never from a list of names here', () => {
     Ui.providerGroups().forEach((g) => {
         g.providers.forEach((p) => {
-            const want = Rclone.isOAuth(p.id) ? 'oauth' : 'credentials';
+            const want = Rclone.providerFor(p.id).auth;
             assert.equal(g.id, want, p.id + ' is in the wrong group');
         });
     });

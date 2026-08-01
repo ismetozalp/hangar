@@ -284,18 +284,44 @@ test('authorizeCommand names a backend rclone can actually authorize', { skip },
         assert.ok(m, `authorizeCommand produced something unparseable: ${cmd}`);
         assert.ok(backendFor(m[1]), `${p.id}: rclone has no backend "${m[1]}"`);
 
-        // rclone only has an authorize flow for backends with a token option; a
-        // provider marked OAuth without one would print a command that cannot help.
-        assert.ok(optionFor(p.type, 'token'),
-            `${p.id} is marked OAuth but rclone backend "${p.type}" has no token option`);
+        // A token option is NOT evidence of an authorize flow. jottacloud has one
+        // and still answers "not supported by this backend" — which is exactly how
+        // a command that always errors reached the wizard. The only proof is
+        // running it, so that is what this does.
+        const r = spawnSync('rclone', ['authorize', p.type],
+            { encoding: 'utf8', timeout: 3000, input: '' });
+        const out = `${r.stdout || ''}${r.stderr || ''}`;
+        assert.ok(!/not supported by this backend/i.test(out),
+            `${p.id} is marked OAuth but \`rclone authorize ${p.type}\` refuses it`);
+    });
+});
+
+test('a provider marked EXTERNAL really is one rclone cannot authorize', { skip }, () => {
+    // The other direction, so a backend does not sit in the manual group forever
+    // after rclone grows an authorize hook for it.
+    const external = Rclone.PROVIDERS.filter((p) => p.auth === Rclone.AUTH.EXTERNAL);
+    external.forEach((p) => {
+        assert.equal(Rclone.authorizeCommand(p.id), null,
+            `${p.id} is EXTERNAL but still offers an authorize command`);
+        const r = spawnSync('rclone', ['authorize', p.type],
+            { encoding: 'utf8', timeout: 3000, input: '' });
+        const out = `${r.stdout || ''}${r.stderr || ''}`;
+        assert.match(out, /not supported by this backend/i,
+            `${p.id} is marked EXTERNAL but rclone CAN authorize it — move it to OAuth`);
+        const setup = Rclone.externalSetup(p.id);
+        assert.ok(setup && setup.steps.length, `${p.id} has no setup instructions`);
     });
 });
 
 test('providers hangar does not mark OAuth have no token flow either', { skip }, () => {
     // The inverse classification error: a credentials provider that actually needs
     // an authorize step would leave the user with no way to finish.
+    // EXTERNAL providers are excluded on purpose: jottacloud genuinely has a token
+    // option and genuinely cannot be authorized by rclone, which is the whole
+    // reason that group exists. Only a CREDENTIALS provider with a token option is
+    // misfiled.
     const misfiled = Rclone.PROVIDERS
-        .filter((p) => !Rclone.isOAuth(p.id) && optionFor(p.type, 'token'))
+        .filter((p) => p.auth === Rclone.AUTH.CREDENTIALS && optionFor(p.type, 'token'))
         .map((p) => p.id);
     assert.deepEqual(misfiled, [],
         `these need an OAuth token but are offered as credentials providers: ${misfiled.join(', ')}`);

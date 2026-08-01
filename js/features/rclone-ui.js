@@ -95,6 +95,12 @@
             id: 'credentials',
             label: 'Sign in with a key, a username or a password',
             hint: 'Everything is typed here. Nothing has to be run on your own computer.'
+        },
+        {
+            id: 'external',
+            label: 'Set up with rclone, then come back',
+            hint: 'rclone has no automated sign-in for these, so hangar cannot finish the job ' +
+                'here. It shows you exactly what to run and then picks the remote up.'
         }
     ];
 
@@ -132,10 +138,21 @@
         }).filter(function (g) { return g.providers.length > 0; });
     }
 
+    // The group IS the auth kind — mapping anything unknown onto 'credentials'
+    // is what would put a provider hangar cannot automate into a form that
+    // pretends it can.
     function groupIdFor(providerId) {
         const p = Rclone.providerFor(providerId);
         if (!p) return '';
-        return p.auth === Rclone.AUTH.OAUTH ? 'oauth' : 'credentials';
+        const known = GROUPS.some(function (g) { return g.id === p.auth; });
+        return known ? p.auth : '';
+    }
+
+    // Instructions for a provider rclone cannot authorize for us. Null for
+    // everything else, so the template can bind on its presence.
+    function externalSetupFor(providerId) {
+        if (typeof Rclone.externalSetup !== 'function') return null;
+        try { return Rclone.externalSetup(providerId); } catch (e) { return null; }
     }
 
     // --- the step machine --------------------------------------------------
@@ -830,7 +847,7 @@
     const HangarRcloneUi = {
         EVENT_OPEN, EVENT_CREATED, EVENT_PROVISION, PROVISION_TOOLS, MODAL_ID,
         GROUPS, STEP_LABEL, WHY_HEADLESS,
-        providerGroups, groupIdFor, providerCard,
+        providerGroups, groupIdFor, externalSetupFor, providerCard,
         stepLabel, stepsFor, stepIndex, nextStep, prevStep,
         formFieldsFor, blankValues, secretKeys, clearSecrets, fieldProblems,
         nameProblems, suggestName,

@@ -60,7 +60,8 @@ test('every provider has the declared shape', () => {
         assert.notEqual(p.label, '');
         assert.equal(typeof p.type, 'string');
         assert.notEqual(p.type, '');
-        assert.ok([Rclone.AUTH.OAUTH, Rclone.AUTH.CREDENTIALS, Rclone.AUTH.NONE].includes(p.auth),
+        assert.ok([Rclone.AUTH.OAUTH, Rclone.AUTH.CREDENTIALS,
+            Rclone.AUTH.EXTERNAL, Rclone.AUTH.NONE].includes(p.auth),
             p.id + ' has auth ' + p.auth);
         assert.ok(Array.isArray(p.fields), p.id + ' has no fields array');
         assert.equal(typeof p.notes, 'string');
@@ -127,11 +128,27 @@ test('providerFor returns null for anything unknown instead of throwing', () => 
         .forEach((v) => assert.equal(Rclone.providerFor(v), null, label(v)));
 });
 
-test('isOAuth is true for exactly the OAuth destinations', () => {
-    ['drive', 'dropbox', 'onedrive', 'box', 'pcloud', 'yandex', 'jottacloud']
+test('isOAuth is true for exactly the destinations rclone can authorize', () => {
+    // jottacloud is deliberately NOT here. Verified by running it:
+    // `rclone authorize jottacloud` answers "not supported by this backend",
+    // even though the backend HAS a token option — which is the proxy that let a
+    // broken command ship. Marking it OAuth would print a command that errors.
+    ['drive', 'dropbox', 'onedrive', 'box', 'pcloud', 'yandex']
         .forEach((id) => assert.equal(Rclone.isOAuth(id), true, id));
-    ['webdav', 'sftp', 'ftp', 'smb', 's3', 'b2', 'swift', 'koofr', 'mega']
+    ['webdav', 'sftp', 'ftp', 'smb', 's3', 'b2', 'swift', 'koofr', 'mega', 'jottacloud']
         .forEach((id) => assert.equal(Rclone.isOAuth(id), false, id));
+});
+
+test('a provider rclone cannot authorize offers instructions, not a command', () => {
+    assert.equal(Rclone.authorizeCommand('jottacloud'), null,
+        'a command that errors is worse than no command');
+    const setup = Rclone.externalSetup('jottacloud');
+    assert.ok(setup, 'no setup instructions for an external provider');
+    assert.ok(setup.steps.length >= 2, 'instructions too thin to follow');
+    assert.equal(setup.command, 'rclone config');
+    // And the opposite direction: an OAuth provider has no external setup.
+    assert.equal(Rclone.externalSetup('drive'), null);
+    assert.equal(Rclone.authorizeCommand('drive'), 'rclone authorize "drive"');
 });
 
 test('isOAuth is total — unknown input is false, never a throw', () => {
@@ -948,7 +965,10 @@ test('module exposes the expected surface', () => {
         'createRemote', 'deleteRemote']
         .forEach((fn) => assert.equal(typeof Rclone[fn], 'function', 'missing ' + fn));
     assert.equal(typeof Rclone.MAX_NAME_LEN, 'number');
-    assert.deepEqual(Rclone.AUTH, { OAUTH: 'oauth', CREDENTIALS: 'credentials', NONE: 'none' });
+    // EXTERNAL means rclone has no `authorize` hook for the backend, so hangar
+    // shows instructions instead of a command that would error.
+    assert.deepEqual(Rclone.AUTH,
+        { OAUTH: 'oauth', CREDENTIALS: 'credentials', EXTERNAL: 'external', NONE: 'none' });
 });
 
 test('the module is a plain script with a dual export and no cockpit in its pure half', () => {
