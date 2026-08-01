@@ -439,6 +439,12 @@
             nextRunText: nextRunText(summary.nextRun, now),
             lastRun: last,
             lastRunText: lastRunText(last, now),
+            // Distinct from lastRun on purpose: the last RUN of a job that has
+            // been failing for three weeks was last night, and reporting that as
+            // if the backups were fine is the misreading this feature exists to
+            // prevent.
+            lastSuccess: lastSuccessMs(state),
+            lastSuccessText: lastRunText(lastSuccessMs(state), now),
             snapshot: s && typeof s.snapshot === 'string' ? s.snapshot : null,
             unreadable: s && isNum(s.unreadable) ? s.unreadable : files.length,
             unreadableFiles: files.slice(0, MAX_LISTED),
@@ -482,18 +488,257 @@
         };
     }
 
+    // ------------------------------------------------- expired destinations
+    //
+    // This is the screen someone opens after a bad night, so an expired cloud
+    // destination has to be unmissable AND carry its fix. Three facts decide
+    // whether the banner is useful or is one more red box to scroll past:
+    //
+    //   which repository — "a destination" is not something anyone can act on;
+    //   that it is failing NOW, in the present tense, not "may fail";
+    //   when it last worked — "my backups have been broken for three weeks" is
+    //     the discovery this whole feature exists to make impossible.
+
+    const DAY_MS = 86400000;
+
+    // How far ahead of a provider's own deadline the amber warning starts. Two
+    // weeks is long enough to act on without being so early that the warning
+    // becomes furniture — and the fix (one sign-in, or one backup) takes minutes.
+    const EXPIRY_WARN_DAYS = 14;
+
+    // A run that WROTE something. 'prune-failed' is included deliberately: the
+    // snapshot exists, so the destination accepted a write, which is exactly the
+    // activity a provider's inactivity clock measures.
+    const WROTE = { ok: true, partial: true, 'prune-failed': true };
+
+    // The last run hangar can honestly call a success.
+    //
+    // `last_success` is read first and is not written by today's helper: a state
+    // file that carries one is believed, so the day the helper records it across
+    // a failure this screen improves with no change here. Until then the truth
+    // available is the finish time of a state file that says a snapshot was
+    // written — and when the most recent run failed, hangar genuinely does not
+    // know, which the caller must be able to say rather than guess.
+    function lastSuccessMs(state) {
+        const s = obj(state);
+        if (!s) return null;
+        const recorded = toMillis(s.last_success !== undefined ? s.last_success : s.lastSuccess);
+        if (recorded !== null) return recorded;
+        if (!has(WROTE, typeof s.status === 'string' ? s.status : '')) return null;
+        return toMillis(s.finished);
+    }
+
+    // The most recent success across every job that writes to one repository. A
+    // repository with two jobs is not failing "since last night" because one of
+    // them failed; the other may have written an hour ago.
+    function repoLastSuccess(jobRows, repoId) {
+        const id = typeof repoId === 'string' ? repoId : '';
+        if (!Array.isArray(jobRows) || id === '') return null;
+        let best = null;
+        jobRows.forEach(function (j) {
+            const r = obj(j);
+            if (!r || r.repoId !== id) return;
+            if (!isNum(r.lastSuccess)) return;
+            if (best === null || r.lastSuccess > best) best = r.lastSuccess;
+        });
+        return best;
+    }
+
+    /**
+     * The proactive half — the case reactive detection serves worst.
+     *
+     * Box expires a refresh token after 60 days of INACTIVITY, so a repository
+     * nobody writes to expires on its own and the first sign is a failed backup.
+     * Waiting for that failure is a choice to be told late.
+     *
+     * Returns null unless the provider declares a policy AND hangar knows when
+     * the destination was last written to — a deadline computed from a date we
+     * do not have would be a number invented to look precise.
+     */
+    function expiryWarning(policy, lastSuccess, now) {
+        const p = obj(policy);
+        if (!p || !isNum(p.inactivityDays) || p.inactivityDays <= 0) return null;
+        if (!isNum(lastSuccess) || lastSuccess <= 0) return null;
+        const at = isNum(now) ? now : Date.now();
+        const idleDays = Math.floor((at - lastSuccess) / DAY_MS);
+        if (idleDays < 0) return null;              // a clock skew, not a deadline
+        const daysLeft = p.inactivityDays - idleDays;
+        if (daysLeft > EXPIRY_WARN_DAYS) return null;
+        return {
+            provider: typeof p.provider === 'string' ? p.provider : '',
+            label: typeof p.label === 'string' ? p.label : '',
+            inactivityDays: p.inactivityDays,
+            idleDays: idleDays,
+            daysLeft: daysLeft,
+            // Past the deadline but not yet observed failing. Said as "may
+            // already have lapsed", because hangar has not seen it fail and
+            // claiming that it has would be a report of something that did not
+            // happen.
+            overdue: daysLeft <= 0,
+            deadline: lastSuccess + p.inactivityDays * DAY_MS
+        };
+    }
+
+    function repoTitle(repoRow) {
+        const r = obj(repoRow) || {};
+        return typeof r.id === 'string' && r.id !== '' ? r.id : 'this repository';
+    }
+
+    function lastSuccessSentence(ms, now) {
+        if (!isNum(ms)) {
+            // Not "never backed up": hangar only knows what its state files say,
+            // and overstating that on a red banner is the kind of wrong that
+            // costs trust exactly when it is most needed.
+            return 'hangar has no record of a successful backup to this destination.';
+        }
+        return 'It last backed up successfully ' + (relative(ms, now) || 'at an unknown time') + '.';
+    }
+
+    // Which jobs stop working while this destination is refused. Named, because
+    // "backups are failing" is abstract until you see which of yours.
+    function jobsForRepo(jobRows, repoId) {
+        if (!Array.isArray(jobRows)) return [];
+        return jobRows.filter(function (j) {
+            const r = obj(j);
+            return !!r && r.repoId === repoId;
+        }).map(function (j) { return j.name; }).filter(function (n) { return typeof n === 'string' && n !== ''; });
+    }
+
+    // A repository is failing on authorisation if its own health read said so, or
+    // if any job that writes to it recorded AUTH_EXPIRED overnight. The job is
+    // the important half — that is the run nobody watched.
+    function repoAuthExpired(repoRow, jobRows) {
+        const r = obj(repoRow) || {};
+        if (r.remediation === 'reauthorize') return true;
+        if (!Array.isArray(jobRows)) return false;
+        return jobRows.some(function (j) {
+            const row = obj(j);
+            return !!row && row.repoId === r.id && row.remediation === 'reauthorize';
+        });
+    }
+
+    /**
+     * Pure: the banners this screen shows above everything else.
+     *
+     * Built from the SAME typed-error/remediation machinery as every other
+     * action here — a row's remediation is 'reauthorize' because errors.js says
+     * AUTH_EXPIRED maps to it — rather than from a second, parallel notion of
+     * "the cloud is broken".
+     */
+    function authBanners(jobRows, repoRows, now) {
+        const out = [];
+        if (!Array.isArray(repoRows)) return out;
+        const at = isNum(now) ? now : Date.now();
+
+        repoRows.forEach(function (row) {
+            const r = obj(row);
+            if (!r) return;
+            const remote = typeof r.remote === 'string' ? r.remote : '';
+            const label = typeof r.providerLabel === 'string' && r.providerLabel !== ''
+                ? r.providerLabel : 'The cloud destination';
+            // EXTERNAL is the one auth kind with no flow to offer: rclone has no
+            // authorize hook for it, so there is no token to paste and no command
+            // hangar can print that would produce one.
+            const external = r.providerAuth === 'external';
+            const last = repoLastSuccess(jobRows, r.id);
+            const jobs = jobsForRepo(jobRows, r.id);
+
+            if (repoAuthExpired(r, jobRows)) {
+                out.push({
+                    id: 'auth:' + r.id,
+                    level: 'danger',
+                    kind: 'expired',
+                    repoId: r.id,
+                    remote: remote,
+                    provider: typeof r.providerId === 'string' ? r.providerId : '',
+                    providerLabel: label,
+                    external: external,
+                    // Present tense and unqualified. "May fail" is what people
+                    // scroll past; this already happened last night.
+                    title: 'Backups to ' + repoTitle(r) + ' are failing',
+                    message: label + ' has stopped accepting this server\'s sign-in' +
+                        (remote ? ' for "' + remote + '"' : '') + '. Every backup to ' +
+                        repoTitle(r) + ' fails until it is signed in again — retrying ' +
+                        'produces the same failure every night.',
+                    lastSuccess: last,
+                    lastSuccessText: lastSuccessSentence(last, at),
+                    jobs: jobs,
+                    warning: null,
+                    // Only EXTERNAL is refused a flow. An unidentified provider
+                    // still gets the button: the wizard reads rclone's config
+                    // itself and will show instructions if it turns out it must.
+                    canReconnect: !external,
+                    actionLabel: external ? 'What to do' : 'Reconnect'
+                });
+                return;
+            }
+
+            const warning = expiryWarning(r.expiryPolicy, last, at);
+            if (!warning) return;
+            out.push({
+                id: 'expiry:' + r.id,
+                // Amber, and explicitly about the future: nothing has failed yet,
+                // and colouring this red is how people learn to ignore red.
+                level: 'warning',
+                kind: 'expiring',
+                repoId: r.id,
+                remote: remote,
+                provider: typeof r.providerId === 'string' ? r.providerId : '',
+                providerLabel: label,
+                external: external,
+                title: warning.overdue
+                    ? label + ' may already have expired this sign-in'
+                    : 'Sign-in for ' + repoTitle(r) + ' expires in about ' +
+                      warning.daysLeft + ' day' + (warning.daysLeft === 1 ? '' : 's'),
+                message: label + ' expires its sign-in after ' + warning.inactivityDays +
+                    ' days without activity, and nothing has been written to ' + repoTitle(r) +
+                    ' for ' + warning.idleDays + ' day' + (warning.idleDays === 1 ? '' : 's') + '. ' +
+                    (warning.overdue
+                        ? 'It may already have lapsed — nothing has failed yet only because ' +
+                          'nothing has tried. Sign in again, or run a backup, before the next ' +
+                          'scheduled run finds out.'
+                        : 'Backing up to it now resets that clock; signing in again also does.'),
+                lastSuccess: last,
+                lastSuccessText: lastSuccessSentence(last, at),
+                jobs: jobs,
+                warning: warning,
+                canReconnect: !external,
+                actionLabel: external ? 'What to do' : 'Sign in again'
+            });
+        });
+
+        return out;
+    }
+
     // Pure: repository + its stats (or the error that stopped us getting them).
     //
     // `fatal` is carried separately from `error` so the template can colour a
     // non-fatal outcome amber. A READ_ERRORS-shaped result is a warning about part
     // of the answer, never a red row claiming the repository is broken.
-    function repoRow(repo, stats, error, deps) {
+    //
+    // `info` is what this repository's destination IS — the rclone remote it
+    // writes through and which provider that remote is. It is optional because
+    // reading it needs rclone's own configuration, which a screen with no
+    // cockpit session (or a host with no rclone) simply does not have; the row
+    // then carries empty strings and the banner logic offers nothing it cannot
+    // honour.
+    function repoRow(repo, stats, error, deps, info) {
         const r = obj(repo) || {};
         const st = obj(stats);
         const E = (deps && deps.errors) || Errors;
+        const i = obj(info) || {};
+        const provider = obj(i.provider);
         return {
             id: typeof r.id === 'string' ? r.id : '',
             kind: typeof r.kind === 'string' ? r.kind : '',
+            remote: typeof i.remote === 'string' ? i.remote : '',
+            providerId: provider && typeof provider.id === 'string' ? provider.id : '',
+            providerLabel: provider && typeof provider.label === 'string' ? provider.label : '',
+            providerAuth: provider && typeof provider.auth === 'string' ? provider.auth : '',
+            // The provider's own rule about expiring an idle authorisation, read
+            // from core/rclone.js. Null for every provider that declares none —
+            // "no deadline" and "a deadline far away" must not look alike.
+            expiryPolicy: obj(i.expiryPolicy),
             description: Repos && typeof Repos.describe === 'function' ? Repos.describe(r) : '',
             size: st && isNum(st.totalSize) ? st.totalSize : null,
             sizeText: formatBytes(st && isNum(st.totalSize) ? st.totalSize : NaN),
@@ -568,6 +813,7 @@
             secrets: d.secrets || Secrets,
             restic: d.restic || Restic,
             logbook: d.logbook || Logbook,
+            rclone: d.rclone || Rclone,
             // app.js loads after the feature scripts, so the dialogs global is only
             // guaranteed to exist by the time a handler runs.
             dialogs: d.dialogs || null
@@ -594,6 +840,10 @@
             loading: true,
             jobs: [],
             repos: [],
+            // Expired and expiring cloud destinations, above everything else.
+            // Derived, never accumulated: a banner that outlived its cause would
+            // be a failure report for a repository that is working.
+            banners: [],
             totals: sumStats([]),
             overall: STATUS.NEVER,
             error: null,
@@ -619,6 +869,12 @@
             expands: expands,
 
             init() {
+                // A destination signed in again from anywhere — this screen's own
+                // banner or the Repositories screen — must stop being reported as
+                // failing here. Re-read rather than clear: whether the repair
+                // worked is the host's answer, not this screen's assumption.
+                if (typeof root.addEventListener === 'function')
+                    root.addEventListener('hangar:rclone-remote-reconnected', () => { this.refresh(); });
                 this.refresh();
             },
 
@@ -667,6 +923,7 @@
                     this.repos = repos;
                     this.totals = sumStats(repos);
                     this.overall = overallStatus(jobs);
+                    this.banners = authBanners(jobs, repos, this.now);
                     this.loading = false;
                 }
             },
@@ -736,9 +993,53 @@
                     } catch (e) {
                         err = e;
                     }
-                    rows.push(repoRow(def, stats, err, D));
+                    rows.push(repoRow(def, stats, err, D, await this.destinationOf(def)));
                 }
                 return rows;
+            },
+
+            // Which cloud destination a repository writes through, if any.
+            //
+            // Never rejects and never throws: this is decoration on a row that
+            // must render regardless, and a host with no rclone, no cockpit
+            // session or an unreadable rclone config is an ordinary state — not a
+            // reason to lose the repository from the screen.
+            //
+            // The provider lookup goes through core/rclone.js, which reads the
+            // config, extracts the one `type` line it needs and lets the rest —
+            // every other remote's obscured credentials — go. None of it is
+            // returned here.
+            async destinationOf(repo) {
+                const R = D.rclone;
+                if (!R || typeof R.remoteNameFromRepoUrl !== 'function') return null;
+                let remote = '';
+                try {
+                    remote = obj(repo) && typeof repo.remote === 'string' && repo.kind === 'rclone'
+                        ? repo.remote.trim()
+                        : (R.remoteNameFromRepoUrl(D.repos ? D.repos.buildUrl(repo) : '') || '');
+                } catch (e) {
+                    remote = '';
+                }
+                if (!remote) return null;
+                let provider = null;
+                try {
+                    provider = typeof R.providerOfRemote === 'function'
+                        ? await R.providerOfRemote(remote) : null;
+                } catch (e) {
+                    // The remote exists in the repository definition but hangar
+                    // could not read rclone's config to say what it is. The banner
+                    // still works — it just cannot rule out a token flow, which is
+                    // the safe direction: the wizard identifies the remote itself.
+                    provider = null;
+                }
+                let policy = null;
+                try {
+                    policy = (provider && typeof R.expiryPolicy === 'function')
+                        ? R.expiryPolicy(provider.id) : null;
+                } catch (e) {
+                    policy = null;
+                }
+                return { remote: remote, provider: provider, expiryPolicy: policy };
             },
 
             // HangarRestic.run() folds a JSON-LINES stream, but `stats` emits a
@@ -824,9 +1125,92 @@
                     return this.withRepo(row, resticOp('init'));
                 case 'reprompt':
                     return this.reprompt(row);
+                case 'reauthorize':
+                    // Deliberately not backupNow: a run against a destination
+                    // whose sign-in has lapsed fails identically, which is how
+                    // the failure survived unnoticed in the first place.
+                    return this.reconnect(this.bannerFor(row.repoId) || { repoId: row.repoId });
                 default:
                     return this.backupNow(row);
                 }
+            },
+
+            bannerFor(repoId) {
+                const id = typeof repoId === 'string' ? repoId : '';
+                if (id === '') return null;
+                return this.banners.filter(function (b) { return b.repoId === id; })[0] || null;
+            },
+
+            // The journey back. It opens the SAME wizard the destination was
+            // created in — features/rclone-ui.js — pointed at the remote that
+            // expired, because `rclone config reconnect` cannot run unattended
+            // and the recovery is therefore the same steps as creation.
+            //
+            // `verify` travels with the request so the wizard can show the
+            // repository answering again instead of asserting that it will.
+            reconnect(banner) {
+                const b = obj(banner) || {};
+                const repoId = typeof b.repoId === 'string' ? b.repoId : '';
+                if (typeof root.dispatchEvent !== 'function' || typeof root.CustomEvent !== 'function')
+                    return false;
+                const remote = typeof b.remote === 'string' && b.remote !== ''
+                    ? b.remote : this.remoteOf(repoId);
+                if (!remote) {
+                    // No remote means nothing to sign in to. Saying so beats
+                    // opening a dialog about a destination this repository does
+                    // not use.
+                    this.failAction(failure(D,
+                        'This repository does not write through an rclone remote, so there is no ' +
+                        'sign-in to renew.'), { id: repoId, repoId: repoId }, 'repo');
+                    return false;
+                }
+                const self = this;
+                root.dispatchEvent(new root.CustomEvent('hangar:rclone-remote', {
+                    detail: {
+                        existing: [],
+                        reauthorize: remote,
+                        repoId: repoId,
+                        verify: async function () {
+                            const repo = await D.config.readRepo(repoId);
+                            if (!obj(repo)) throw failure(D, 'Repository "' + repoId + '" is gone.');
+                            const stats = await self.fetchStats(Object.assign({}, repo, { id: repoId }));
+                            await self.refresh();
+                            return {
+                                message: 'The repository answered: ' +
+                                    formatBytes(stats && isNum(stats.totalSize) ? stats.totalSize : NaN) +
+                                    ' in ' + (stats && isNum(stats.snapshotsCount) ? stats.snapshotsCount : 0) +
+                                    ' snapshot(s).'
+                            };
+                        }
+                    }
+                }));
+                return true;
+            },
+
+            remoteOf(repoId) {
+                const row = this.repos.filter(function (r) { return r.id === repoId; })[0];
+                return row && typeof row.remote === 'string' ? row.remote : '';
+            },
+
+            // A destination that cannot be signed in to from here (Jottacloud —
+            // rclone has no authorize hook for it at all) gets the instructions
+            // the creation flow uses, never a flow that cannot complete.
+            instructionsFor(banner) {
+                const b = obj(banner) || {};
+                const R = D.rclone;
+                if (!R || typeof R.externalSetup !== 'function') return null;
+                try { return R.externalSetup(b.provider); } catch (e) { return null; }
+            },
+
+            toggleBanner(id) { this.expanded = this.expanded === id ? null : id; },
+
+            // One button, two honest behaviours: repair it, or say why it cannot
+            // be repaired from here and what to do instead.
+            actOnBanner(banner) {
+                const b = obj(banner) || {};
+                if (b.canReconnect) return this.reconnect(b);
+                this.toggleBanner(b.id);
+                return false;
             },
 
             // A repository row is not a job: there is no unit to start, so the
@@ -843,6 +1227,8 @@
                     return this.withRepo(target, resticOp('init'), 'repo');
                 case 'reprompt':
                     return this.reprompt(target, 'repo');
+                case 'reauthorize':
+                    return this.reconnect(this.bannerFor(id) || { repoId: id });
                 default:
                     this.clearAction();
                     return this.refresh();
@@ -976,6 +1362,51 @@
         '      </div>',
         '      <button type="button" class="btn btn-sm btn-danger" @click="refresh()">Try again</button>',
         '    </div>',
+        '  </div>',
+
+        // An expired cloud destination, above everything else on the screen.
+        //
+        // aria-live is on the REGION, which is always in the DOM, not on the
+        // banner: a live region announces changes to its own contents, so one
+        // that is inserted already-populated announces nothing at all. Assertive
+        // rather than polite because this is a report of backups failing right
+        // now, which is the one thing on this screen worth interrupting for.
+        '  <div aria-live="assertive" aria-atomic="false">',
+        '    <template x-for="b in banners" :key="b.id">',
+        '      <div class="alert" role="alert"',
+        '           :class="b.level === \'danger\' ? \'alert-danger\' : \'alert-warning\'">',
+        '        <div class="d-flex align-items-start gap-3 flex-wrap">',
+        '          <div class="flex-grow-1">',
+        '            <strong x-text="b.title"></strong>',
+        '            <div class="small mt-1" x-text="b.message"></div>',
+        // When it last worked. The sentence people need and never have.
+        '            <div class="small mt-1" x-text="b.lastSuccessText"></div>',
+        '            <div class="small mt-1" x-show="b.jobs.length">',
+        '              Affected: <span x-text="b.jobs.join(\', \')"></span>',
+        '            </div>',
+        '          </div>',
+        '          <button type="button" class="btn btn-sm"',
+        '                  :class="b.level === \'danger\' ? \'btn-danger\' : \'btn-warning\'"',
+        '                  :aria-expanded="b.canReconnect ? null : (expanded === b.id ? \'true\' : \'false\')"',
+        '                  :aria-controls="b.canReconnect ? null : (\'hangar-banner-\' + b.repoId)"',
+        '                  :aria-label="b.actionLabel + \' for repository \' + b.repoId"',
+        '                  @click="actOnBanner(b)" x-text="b.actionLabel"></button>',
+        '        </div>',
+        // The provider hangar cannot sign in to for us. rclone has no authorize
+        // hook for it, so there is no token to paste — the honest offer is the
+        // steps, taken from the same externalSetup() the creation flow uses.
+        '        <div x-show="expanded === b.id" class="small mt-2"',
+        '             :id="\'hangar-banner-\' + b.repoId">',
+        '          <div x-text="instructionsFor(b) ? instructionsFor(b).reason : \'\'"></div>',
+        '          <ol class="mb-1 mt-1">',
+        '            <template x-for="(s, i) in (instructionsFor(b) ? instructionsFor(b).steps : [])"',
+        '                      :key="i"><li x-text="s"></li></template>',
+        '          </ol>',
+        '          <div class="hangar-mono" x-show="instructionsFor(b)"',
+        '               x-text="instructionsFor(b) ? instructionsFor(b).command : \'\'"></div>',
+        '        </div>',
+        '      </div>',
+        '    </template>',
         '  </div>',
 
         // A partial listing: some files were unreadable, the rest are below. Amber
@@ -1141,9 +1572,11 @@
 
     const HangarOverview = {
         STATUS, RANK, LABEL, DOT_CLASS, BADGE_CLASS, KIND_DETAIL, REMEDIATION_LABEL, TEMPLATE,
-        MAX_LISTED,
+        MAX_LISTED, EXPIRY_WARN_DAYS, DAY_MS,
         hangarOverview,
         summarizeJob, overallStatus,
+        lastSuccessMs, repoLastSuccess, expiryWarning, authBanners,
+        lastSuccessSentence, jobsForRepo, repoAuthExpired,
         formatBytes, formatDuration,
         statusClass, statusBadgeClass, statusLabel, remediationLabel,
         normRemediation, expands, expansionFor,

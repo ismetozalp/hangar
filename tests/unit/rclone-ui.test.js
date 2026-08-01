@@ -1451,6 +1451,405 @@ test('the markup never renders the token, and never widens a password field', ()
     });
 });
 
+// ==========================================================================
+// Reconnect mode — the journey back from an expired authorisation.
+//
+// The rule these tests exist to hold: this is the SAME step the user already
+// walked when they created the remote, pointed at one that exists. A second
+// paste box, a second token path or a second set of instructions would be a
+// second place for the token handling to drift, and the token handling is the
+// part that must not.
+// ==========================================================================
+
+const EXTERNAL_IDS = Rclone.providers().filter((p) => p.auth === Rclone.AUTH.EXTERNAL).map((p) => p.id);
+
+test('reconnect is one step: the provider and the name are already known', () => {
+    // Asking again is asking the user to re-derive facts rclone's own config
+    // already holds — and to get the name wrong is to overwrite a working remote.
+    for (const id of OAUTH_IDS)
+        assert.deepEqual(Ui.stepsFor(id, 'reconnect'), ['authorize'], id);
+    // The creation flow is untouched by the new argument.
+    for (const id of OAUTH_IDS)
+        assert.deepEqual(Ui.stepsFor(id), ['provider', 'authorize', 'name'], id);
+    for (const id of CRED_IDS)
+        assert.deepEqual(Ui.stepsFor(id), ['provider', 'details', 'name'], id);
+});
+
+test('a backend rclone cannot authorize gets instructions, never a paste box', () => {
+    // `rclone authorize jottacloud` answers "not supported by this backend", so
+    // there is no token for the user to paste and no command worth printing.
+    assert.ok(EXTERNAL_IDS.length, 'guard: the table still has an EXTERNAL provider');
+    for (const id of EXTERNAL_IDS) {
+        assert.deepEqual(Ui.stepsFor(id, 'reconnect'), ['instructions'], id);
+        assert.equal(Ui.authorizeCommandFor(id), null, id);
+    }
+    // And a remote whose backend hangar has no entry for is treated the same way.
+    assert.deepEqual(Ui.stepsFor('', 'reconnect'), ['instructions']);
+    assert.deepEqual(Ui.stepsFor('not-a-provider', 'reconnect'), ['instructions']);
+});
+
+test('the step machine agrees with itself in reconnect mode', () => {
+    assert.equal(Ui.stepIndex('drive', 'authorize', 'reconnect'), 0);
+    assert.equal(Ui.nextStep('drive', 'authorize', 'reconnect'), null);
+    assert.equal(Ui.prevStep('drive', 'authorize', 'reconnect'), null);
+    assert.equal(Ui.stepLabel('instructions'), 'Sign in with rclone itself');
+});
+
+test('modeOf reads repair mode off the open event, and only off a real name', () => {
+    assert.equal(Ui.modeOf({ reauthorize: 'gdrive' }), 'reconnect');
+    assert.equal(Ui.modeOf({ existing: ['gdrive'] }), 'create');
+    assert.equal(Ui.modeOf({ reauthorize: '   ' }), 'create');
+    assert.equal(Ui.modeOf({ reauthorize: null }), 'create');
+    assert.equal(Ui.modeOf(null), 'create');
+    assert.equal(Ui.modeOf(undefined), 'create');
+});
+
+test('the dialog names the remote it is repairing, in the title and in the prose', () => {
+    assert.equal(Ui.reconnectTitle('gdrive'), 'Sign in to gdrive again');
+    assert.equal(Ui.reconnectTitle('  '), 'Sign in again');
+    const intro = Ui.reconnectIntro('gdrive', 'drive');
+    assert.match(intro, /Google Drive/);
+    assert.match(intro, /gdrive/);
+    // Present tense: this already happened, it is not a warning about later.
+    assert.match(intro, /are failing/);
+});
+
+test('the dialog answers "why not rclone config reconnect", because everyone asks', () => {
+    const why = Ui.whyNotReconnect('gdrive');
+    assert.match(why, /rclone config reconnect gdrive:/);
+    assert.match(why, /127\.0\.0\.1/);
+    // A name rclone would refuse produces no command rather than a wrong one.
+    assert.ok(!/reconnect\s+:/.test(Ui.whyNotReconnect('has space')));
+});
+
+test('the external instructions are the provider table\'s own, not a second copy', () => {
+    for (const id of EXTERNAL_IDS) {
+        const ins = Ui.reconnectInstructions(id, 'jotta');
+        const core = Rclone.externalSetup(id);
+        assert.deepEqual(ins.steps, core.steps, id);
+        assert.equal(ins.command, core.command, id);
+        assert.match(ins.reason, /rclone has no automated sign-in/i);
+        // Never a token flow for a backend that has none.
+        assert.ok(!/paste/i.test(ins.reason), id);
+    }
+});
+
+test('a credentials backend is told what it actually needs, not offered a token', () => {
+    const ins = Ui.reconnectInstructions('webdav', 'nc');
+    assert.match(ins.reason, /credentials/i);
+    // It says there is NO token to paste, rather than offering one.
+    assert.match(ins.reason, /no token to paste/i);
+    assert.equal(ins.command, 'rclone config');
+    // The remote's name is in the steps: picking the wrong one in `rclone config`
+    // is how people end up with a second, half-configured remote.
+    assert.ok(ins.steps.some((s) => s.includes('nc')));
+});
+
+test('an unidentifiable remote still gets usable instructions', () => {
+    const ins = Ui.reconnectInstructions('', 'mystery');
+    assert.match(ins.reason, /backend hangar does not know/i);
+    assert.equal(ins.command, 'rclone config');
+    assert.ok(ins.steps.length >= 2);
+});
+
+test('the verification wording never claims more than it checked', () => {
+    assert.equal(Ui.verifyMessage(''), '');
+    assert.match(Ui.verifyMessage('running'), /Checking/);
+    assert.match(Ui.verifyMessage('ok', ''), /answered/);
+    const failed = Ui.verifyMessage('failed', 'no such host');
+    assert.match(failed, /sign-in was saved/);
+    assert.match(failed, /no such host/);
+});
+
+test('openReconnect reads the provider from rclone\'s config, and asks for nothing', async () => {
+    await withStubs([
+        [Prov, 'probe', present()],
+        [Rclone, 'providerOfRemote', async (name) => {
+            assert.equal(name, 'gdrive');
+            return Rclone.providerFor('drive');
+        }]
+    ], async () => {
+        const c = Ui.hangarRcloneUi();
+        await c.open({ reauthorize: 'gdrive', repoId: 'nas' });
+        assert.equal(c.reconnecting(), true);
+        assert.equal(c.mode, 'reconnect');
+        assert.equal(c.remote, 'gdrive');
+        assert.equal(c.repoId, 'nas');
+        assert.equal(c.providerId, 'drive');
+        assert.equal(c.step, 'authorize');
+        assert.deepEqual(c.steps(), ['authorize']);
+        assert.equal(c.title(), 'Sign in to gdrive again');
+        // The command shown is the same one creation shows for this provider.
+        assert.equal(c.authorizeCommand(), Rclone.authorizeCommand('drive'));
+    });
+});
+
+test('a remote hangar cannot identify opens on instructions rather than on nothing', async () => {
+    await withStubs([
+        [Prov, 'probe', present()],
+        [Rclone, 'providerOfRemote', async () => { throw Errors.create('GENERIC', 'no rclone here'); }]
+    ], async () => {
+        const c = Ui.hangarRcloneUi();
+        await c.open({ reauthorize: 'mystery' });
+        assert.equal(c.step, 'instructions');
+        assert.equal(c.providerId, '');
+        // Not an error box on top of it: "hangar could not tell what this is" is
+        // exactly what the instructions step answers.
+        assert.equal(c.alert, null);
+        assert.equal(c.canReconnect(), false);
+    });
+});
+
+test('Jottacloud is never shown a flow that cannot complete', async () => {
+    await withStubs([
+        [Prov, 'probe', present()],
+        [Rclone, 'providerOfRemote', async () => Rclone.providerFor('jottacloud')]
+    ], async () => {
+        const c = Ui.hangarRcloneUi();
+        await c.open({ reauthorize: 'jotta' });
+        assert.equal(c.step, 'instructions');
+        assert.equal(c.canReconnect(), false);
+        assert.deepEqual(c.instructions().steps, Rclone.externalSetup('jottacloud').steps);
+    });
+});
+
+test('reconnect sends the token to updateRemoteToken — never to createRemote', async () => {
+    const calls = [];
+    await withStubs([
+        [Prov, 'probe', present()],
+        [Rclone, 'providerOfRemote', async () => Rclone.providerFor('drive')],
+        [Rclone, 'createRemote', async () => { calls.push(['createRemote']); return {}; }],
+        [Rclone, 'updateRemoteToken', async (name, token) => {
+            calls.push(['updateRemoteToken', name, token]);
+            return { name: name, updated: 'token' };
+        }]
+    ], async () => {
+        await withEvents(async (seen) => {
+            const c = Ui.hangarRcloneUi();
+            await c.open({ reauthorize: 'gdrive', repoId: 'nas' });
+            c.paste = PASTE;
+            assert.equal(await c.submit(), true);
+            assert.equal(calls.length, 1, 'nothing was created');
+            assert.equal(calls[0][0], 'updateRemoteToken');
+            assert.equal(calls[0][1], 'gdrive');
+            assert.equal(calls[0][2], TOKEN_JSON, 'the parsed token, markers stripped');
+            assert.equal(c.step, 'done');
+            // And the world is told, as a repair rather than as a creation.
+            const ev = seen.filter((e) => e.type === 'hangar:rclone-remote-reconnected');
+            assert.equal(ev.length, 1);
+            assert.deepEqual(ev[0].detail, { name: 'gdrive', repoId: 'nas', provider: 'drive' });
+            assert.equal(seen.some((e) => e.type === 'hangar:rclone-remote-created'), false);
+        });
+    });
+});
+
+test('the pasted token is unreachable from the component and gone once it is used', async () => {
+    await withStubs([
+        [Prov, 'probe', present()],
+        [Rclone, 'providerOfRemote', async () => Rclone.providerFor('drive')],
+        [Rclone, 'updateRemoteToken', async () => ({ name: 'gdrive', updated: 'token' })]
+    ], async () => {
+        await withEvents(async (seen) => {
+            const c = Ui.hangarRcloneUi();
+            await c.open({ reauthorize: 'gdrive' });
+            c.paste = PASTE;
+            await c.submit();
+            const dump = JSON.stringify(c);
+            assert.ok(!dump.includes('ya29.a0FAKE-ACCESS-TOKEN-0123456789'), 'access token reachable');
+            assert.ok(!dump.includes('1//0fFAKE-REFRESH-TOKEN-9876543210'), 'refresh token reachable');
+            assert.equal(c.paste, '', 'the textarea still holds the paste');
+            assert.equal(c.hasToken, false);
+            for (const ev of seen)
+                assert.ok(!JSON.stringify(ev.detail || {}).includes('ya29.'), 'a token left in an event');
+        });
+    });
+});
+
+test('a successful reconnect proves it, by re-testing the repository', async () => {
+    let ran = 0;
+    await withStubs([
+        [Prov, 'probe', present()],
+        [Rclone, 'providerOfRemote', async () => Rclone.providerFor('drive')],
+        [Rclone, 'updateRemoteToken', async () => ({ name: 'gdrive', updated: 'token' })]
+    ], async () => {
+        await withEvents(async () => {
+            const c = Ui.hangarRcloneUi();
+            await c.open({
+                reauthorize: 'gdrive',
+                repoId: 'nas',
+                verify: async () => { ran++; return { message: 'The repository answered: 2.0 KiB.' }; }
+            });
+            c.paste = PASTE;
+            await c.submit();
+            assert.equal(ran, 1);
+            assert.equal(c.verifyState, 'ok');
+            assert.match(c.verifyText(), /answered/);
+            assert.equal(c.verifyClass(), 'text-success');
+        });
+    });
+});
+
+test('a re-test that fails does not turn a saved sign-in into a failed repair', async () => {
+    await withStubs([
+        [Prov, 'probe', present()],
+        [Rclone, 'providerOfRemote', async () => Rclone.providerFor('drive')],
+        [Rclone, 'updateRemoteToken', async () => ({ name: 'gdrive', updated: 'token' })]
+    ], async () => {
+        await withEvents(async () => {
+            const c = Ui.hangarRcloneUi();
+            await c.open({
+                reauthorize: 'gdrive',
+                verify: async () => { throw Errors.create('NETWORK', 'dial tcp: no such host'); }
+            });
+            c.paste = PASTE;
+            assert.equal(await c.submit(), true, 'the token WAS written');
+            assert.equal(c.step, 'done');
+            assert.equal(c.verifyState, 'failed');
+            assert.match(c.verifyText(), /no such host/);
+            assert.equal(c.alert, null, 'the repair itself did not fail');
+        });
+    });
+});
+
+test('a verify that leaks a credential is redacted before it is shown', async () => {
+    await withStubs([
+        [Prov, 'probe', present()],
+        [Rclone, 'providerOfRemote', async () => Rclone.providerFor('drive')],
+        [Rclone, 'updateRemoteToken', async () => ({ name: 'gdrive', updated: 'token' })]
+    ], async () => {
+        await withEvents(async () => {
+            const c = Ui.hangarRcloneUi();
+            await c.open({
+                reauthorize: 'gdrive',
+                verify: async () => {
+                    throw Errors.create('GENERIC', 'Fatal: unable to open repository at ' +
+                        'rest:https://alice:hunter2@rest.example:8000/');
+                }
+            });
+            c.paste = PASTE;
+            await c.submit();
+            assert.equal(c.verifyState, 'failed');
+            assert.ok(!/hunter2/.test(c.verifyText()), 'a password reached the screen');
+        });
+    });
+});
+
+test('a failed reconnect keeps the user on the step that can retry it', async () => {
+    await withStubs([
+        [Prov, 'probe', present()],
+        [Rclone, 'providerOfRemote', async () => Rclone.providerFor('drive')],
+        [Rclone, 'updateRemoteToken', async () => {
+            throw Errors.create('GENERIC', 'could not write rclone.conf');
+        }]
+    ], async () => {
+        await withEvents(async (seen) => {
+            const c = Ui.hangarRcloneUi();
+            await c.open({ reauthorize: 'gdrive' });
+            c.paste = PASTE;
+            assert.equal(await c.submit(), false);
+            assert.equal(c.step, 'authorize');
+            assert.ok(c.alert);
+            assert.equal(c.alert.level, 'danger');
+            assert.match(c.alert.message, /rclone\.conf/);
+            assert.equal(seen.some((e) => e.type === 'hangar:rclone-remote-reconnected'), false);
+        });
+    });
+});
+
+test('the Reconnect button is offered only when it can do something', async () => {
+    await withStubs([
+        [Prov, 'probe', present()],
+        [Rclone, 'providerOfRemote', async () => Rclone.providerFor('drive')]
+    ], async () => {
+        const c = Ui.hangarRcloneUi();
+        await c.open({ reauthorize: 'gdrive' });
+        assert.equal(c.canReconnect(), false, 'nothing pasted yet');
+        c.paste = 'x';
+        assert.equal(c.canReconnect(), true, 'a paste is enough — submit parses it');
+        c.busy = true;
+        assert.equal(c.canReconnect(), false);
+        c.busy = false;
+        c.remote = '';
+        assert.equal(c.canReconnect(), false);
+        // And it is never offered in creation mode, where "Create destination" is.
+        const d = Ui.hangarRcloneUi();
+        assert.equal(d.canReconnect(), false);
+    });
+});
+
+test('a paste that is not a token refuses with the reason, and writes nothing', async () => {
+    let wrote = 0;
+    await withStubs([
+        [Prov, 'probe', present()],
+        [Rclone, 'providerOfRemote', async () => Rclone.providerFor('drive')],
+        [Rclone, 'updateRemoteToken', async () => { wrote++; return {}; }]
+    ], async () => {
+        await withEvents(async () => {
+            const c = Ui.hangarRcloneUi();
+            await c.open({ reauthorize: 'gdrive' });
+            c.paste = 'I clicked allow in the browser';
+            assert.equal(await c.submit(), false);
+            assert.equal(wrote, 0);
+            assert.equal(c.problems.length, 1);
+            assert.match(c.problems[0], /authorisation token/i);
+            assert.equal(c.step, 'authorize');
+        });
+    });
+});
+
+test('Continue means nothing in a one-step repair, and does not move', async () => {
+    await withStubs([
+        [Prov, 'probe', present()],
+        [Rclone, 'providerOfRemote', async () => Rclone.providerFor('drive')]
+    ], async () => {
+        const c = Ui.hangarRcloneUi();
+        await c.open({ reauthorize: 'gdrive' });
+        assert.equal(c.next(), false);
+        assert.equal(c.step, 'authorize');
+        assert.equal(c.back(), false);
+        assert.equal(c.step, 'authorize');
+    });
+});
+
+test('opening the wizard normally afterwards is a creation again, with nothing carried over', async () => {
+    await withStubs([
+        [Prov, 'probe', present()],
+        [Rclone, 'providerOfRemote', async () => Rclone.providerFor('drive')]
+    ], async () => {
+        const c = Ui.hangarRcloneUi();
+        await c.open({ reauthorize: 'gdrive', repoId: 'nas' });
+        await c.open({ existing: ['gdrive'] });
+        assert.equal(c.reconnecting(), false);
+        assert.equal(c.mode, 'create');
+        assert.equal(c.remote, '');
+        assert.equal(c.repoId, '');
+        assert.equal(c.step, 'provider');
+        assert.equal(c.verifyState, '');
+        assert.equal(c.title(), 'Add a cloud destination');
+    });
+});
+
+test('the markup reuses the one paste box rather than growing a second', () => {
+    // The duplication that would matter most: two textareas means two places for
+    // the token handling to drift apart.
+    assert.equal((MODAL.match(/<textarea/g) || []).length, 1);
+    assert.equal((MODAL.match(/x-model="paste"/g) || []).length, 1);
+    // Repair mode is rendered by the SAME authorize step.
+    assert.match(MODAL, /x-if="at\('authorize'\)"/);
+    assert.match(MODAL, /x-show="reconnecting\(\) && at\('authorize'\)"/);
+    assert.match(MODAL, /x-if="at\('instructions'\)"/);
+    // Real buttons, and the title is bound so the dialog says which job it is on.
+    assert.match(MODAL, /x-text="title\(\)"/);
+    assert.ok(!/<a [^>]*@click="submit\(\)"/.test(MODAL), 'actions must be buttons');
+});
+
+test('repair mode does not re-ask for settings that are still correct', () => {
+    // Re-showing client_id and scope empty invites someone to blank a working
+    // setting while fixing an unrelated one.
+    assert.match(MODAL, /x-if="!reconnecting\(\)"/);
+    assert.match(MODAL, /x-show="!reconnecting\(\)"/);
+});
+
 test('the module still touches no DOM and no cockpit at load time', () => {
     // Re-asserted at the END: every test above installs and removes its own fakes,
     // and a leak would make the first assertion in this file a lie.

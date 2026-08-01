@@ -1332,6 +1332,7 @@
 
 '  <div class="hangar-tree d-flex flex-column">' +
 
+'    <template x-if="repos.length">' +
 '    <div class="d-flex align-items-center gap-2 p-2 border-bottom flex-wrap">' +
 '      <label class="form-label mb-0 small text-secondary" for="hangar-logbook-repo">Repository</label>' +
 '      <select id="hangar-logbook-repo" class="form-select form-select-sm w-auto"' +
@@ -1356,6 +1357,7 @@
 '              :disabled="!selected.length || busy" @click="restore()">Restore…</button>' +
 '      <span class="small text-secondary" x-text="selectionLabel()"></span>' +
 '    </div>' +
+'    </template>' +
 
 '    <div x-show="busy" class="p-2 small text-secondary" role="status" aria-live="polite">' +
 '      <span x-text="busyLabel"></span>' +

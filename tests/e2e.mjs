@@ -237,6 +237,36 @@ async function main() {
                     'the overview shows a load error and the "no backups yet" empty state at once');
             });
 
+            await check('an empty Logbook guides instead of showing dead chrome', async () => {
+                // With no repository the picker has nothing to pick, the breadcrumb
+                // leads nowhere and Restore cannot act. Showing them makes a screen
+                // that is merely empty look broken.
+                await page.click('.nav-pills .nav-link:text-is("Logbook")');
+                await settle();
+
+                const shown = await page.evaluate(() => {
+                    const scope = document.querySelector('#hangar-logbook');
+                    const vis = (el) => !!el && getComputedStyle(el).display !== 'none' &&
+                        el.getClientRects().length > 0;
+                    return {
+                        picker: vis(scope && scope.querySelector('#hangar-logbook-repo')),
+                        restore: Array.from(scope ? scope.querySelectorAll('button') : [])
+                            .some((b) => /^Restore/.test(b.textContent.trim()) &&
+                                b.getClientRects().length > 0),
+                        text: scope ? scope.innerText : ''
+                    };
+                });
+
+                assertEqual(shown.picker, false, 'an empty repository dropdown is still on screen');
+                assertEqual(shown.restore, false, 'Restore is offered with nothing to restore');
+                assert(/No repositories yet/i.test(shown.text),
+                    `the screen does not say what is missing:\n${shown.text.slice(0, 200)}`);
+                assert(/Add a repository/i.test(shown.text),
+                    'no way forward is offered');
+                assert(!/Nothing to show here/i.test(shown.text),
+                    'the old non-guidance text is still there');
+            });
+
             await check('switching tabs changes the visible panel', async () => {
                 for (const [label, id] of [['Logbook', 'hangar-logbook'], ['Settings', 'hangar-settings'],
                     ['Recovery', 'hangar-recovery'], ['Overview', 'hangar-overview']]) {
