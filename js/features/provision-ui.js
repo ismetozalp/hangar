@@ -356,8 +356,15 @@
         partial: 'Finished with warnings'
     };
 
-    function statusLabel(state) {
-        return own(STATUS_LABELS, str(state)) || 'Waiting';
+    // `pending` means two different things and must not read the same way in both.
+    // Before the user presses Install nothing is waiting on anything — labelling an
+    // untouched row "Waiting" makes an idle dialog look like a stalled one. Once a
+    // run is under way, a pending row genuinely is queued behind another.
+    function statusLabel(state, started) {
+        const s = str(state);
+        const idle = started ? 'Waiting' : 'Not installed';
+        if (s === 'pending') return idle;
+        return own(STATUS_LABELS, s) || idle;
     }
 
     // ------------------------------------------------------------- DOM edges
@@ -544,7 +551,7 @@
                 });
             },
 
-            label(state) { return statusLabel(state); },
+            label(state) { return statusLabel(state, this.started); },
 
             // The unreadable-file list is rendered, not hidden behind the button:
             // a partial result the user has to click to understand is a partial

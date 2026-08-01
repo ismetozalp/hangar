@@ -447,9 +447,25 @@ test('every state a row can reach has a label', () => {
     assert.equal(UI.statusLabel('blocked'), 'Needs your confirmation');
 });
 
-test('an unknown state reads as waiting rather than blank', () => {
-    assert.equal(UI.statusLabel('wat'), 'Waiting');
-    assert.equal(UI.statusLabel(undefined), 'Waiting');
+test('an unknown state reads as the idle label rather than blank', () => {
+    assert.equal(UI.statusLabel('wat', false), 'Not installed');
+    assert.equal(UI.statusLabel(undefined, false), 'Not installed');
+    assert.equal(UI.statusLabel('wat', true), 'Waiting');
+    assert.equal(UI.statusLabel(undefined, true), 'Waiting');
+});
+
+test('a pending row reads differently before and during an install run', () => {
+    // Before Install is pressed nothing is waiting on anything, and calling an
+    // untouched row "Waiting" makes an idle dialog look like a stalled one.
+    assert.equal(UI.statusLabel('pending', false), 'Not installed');
+    // Once a run is under way the row genuinely is queued behind another.
+    assert.equal(UI.statusLabel('pending', true), 'Waiting');
+});
+
+test('the started flag never changes a state that is not pending', () => {
+    for (const state of ['installing', 'done', 'failed', 'skipped', 'blocked', 'manual', 'partial']) {
+        assert.equal(UI.statusLabel(state, false), UI.statusLabel(state, true), state);
+    }
 });
 
 // --------------------------------------------------------------- installing
@@ -1190,7 +1206,10 @@ test('unicode and newlines in a path survive into the list unmangled', () => {
 
 test('an inherited property is never mistaken for a status label', () => {
     ['constructor', 'toString', 'hasOwnProperty', '__proto__', 'valueOf']
-        .forEach((k) => assert.equal(UI.statusLabel(k), 'Waiting', k));
+        .forEach((k) => {
+            assert.equal(UI.statusLabel(k, false), 'Not installed', k);
+            assert.equal(UI.statusLabel(k, true), 'Waiting', k);
+        });
 });
 
 test('an inherited property is never mistaken for a button label', () => {

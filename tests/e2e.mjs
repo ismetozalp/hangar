@@ -276,6 +276,22 @@ async function main() {
                 assert(/engine|backup/i.test(text), `no reason given: ${text}`);
             });
 
+            await check('an untouched install dialog does not claim to be waiting', async () => {
+                // "Waiting" before anything has been started reads as a stalled
+                // dialog. Nothing is waiting on anything until Install is pressed.
+                await page.click('.alert-warning button:text-is("Install")');
+                await page.waitForSelector('#hangar-provision.show', { timeout: 5000 });
+                await page.waitForTimeout(600);
+                const shown = await page.evaluate(() =>
+                    document.querySelector('#hangar-provision').innerText);
+                assert(!/\bWaiting\b/.test(shown),
+                    `an untouched dialog says "Waiting":\n${shown.slice(0, 400)}`);
+                assert(/Not installed/.test(shown),
+                    `rows do not state they are not installed:\n${shown.slice(0, 400)}`);
+                await page.click('#hangar-provision button:text-is("Close")');
+                await page.waitForTimeout(300);
+            });
+
             if (process.env.SHOT) await page.screenshot({ path: 'tests/e2e-provision.png', fullPage: true });
             await ctx.close();
         }
