@@ -441,8 +441,27 @@
 
     function mountUnitService(repoId) { return mountUnitName(repoId) + '.service'; }
 
-    function mountPoint(repoId) {
-        return MOUNT_ROOT + '/' + Secrets.validateRepoId(repoIdOf(repoId));
+    // The root is configurable (Settings -> Mount folder), so it has to be threaded
+    // through rather than assumed: a setting that validates, saves, and then has no
+    // effect is worse than not offering the setting at all.
+    //
+    // core/config.js validates it too, but this module does not get to trust that —
+    // the value reaches an argv, and a relative or traversing root would mount
+    // somewhere other than where the UI claims.
+    function normalizeMountRoot(root) {
+        if (root === undefined || root === null || root === '') return MOUNT_ROOT;
+        const s = String(root).trim().replace(/\/+$/, '');
+        if (s === '' || s === '/') return MOUNT_ROOT;
+        if (s.charAt(0) !== '/')
+            throw fail('mount folder must be an absolute path', { mountRoot: root });
+        if (s.split('/').indexOf('..') >= 0)
+            throw fail('mount folder must not contain ".."', { mountRoot: root });
+        // Same rule the rest of the module applies to anything reaching argv.
+        return requireSafe(s, 'mount folder');
+    }
+
+    function mountPoint(repoId, mountRoot) {
+        return normalizeMountRoot(mountRoot) + '/' + Secrets.validateRepoId(repoIdOf(repoId));
     }
 
     // ---- relative labels ----------------------------------------------------
@@ -508,7 +527,7 @@
     function buildMountArgv(opts) {
         const o = opts || {};
         const repoId = Secrets.validateRepoId(repoIdOf(o.repoId !== undefined ? o.repoId : o.repo));
-        const point = requireSafe(o.mountPoint || mountPoint(repoId), 'mount point');
+        const point = requireSafe(o.mountPoint || mountPoint(repoId, o.mountRoot), 'mount point');
         const url = requireSafe(o.repoUrl, 'repository url', { repoId: repoId });
         const passwordFile = requireSafe(o.passwordFile || Secrets.keyPath(repoId), 'password file');
         const binary = requireSafe(o.resticBinary || 'restic', 'restic binary');
@@ -613,7 +632,7 @@
         return Promise.resolve().then(() => {
             const o = opts || {};
             const repoId = Secrets.validateRepoId(repoIdOf(o.repoId !== undefined ? o.repoId : o.repo));
-            const point = o.mountPoint || mountPoint(repoId);
+            const point = o.mountPoint || mountPoint(repoId, o.mountRoot);
             const argv = buildMountArgv(o);
             // The spawn check mirrors bus(): every way out of this module is a
             // typed rejection, including "cockpit is here but not usable".
@@ -666,7 +685,7 @@
         snapshotTimestampDir, snapshotPath,
         diffToBadges, badgeForModifier,
         parseLsJson,
-        mountUnitName, mountUnitService, mountPoint,
+        mountUnitName, mountUnitService, mountPoint, normalizeMountRoot,
         formatRelative,
         buildMountArgv, unwrapProps, normalizeMountState,
         // impure

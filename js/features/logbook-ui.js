@@ -601,6 +601,7 @@
             progress: null,
 
             idleSec: 900,
+            mountRootSetting: '',
             visible: false,
             _idle: null,
 
@@ -610,6 +611,7 @@
                 try {
                     const settings = await Cfg.readGlobal();
                     this.idleSec = Number(settings.mountIdleTimeoutSec) || this.idleSec;
+                this.mountRootSetting = settings.mountRoot || '';
                 } catch (e) {
                     // Defaults are enough to browse; a broken global config is the
                     // Settings screen's problem, not the Logbook's.
@@ -636,6 +638,10 @@
             // setTimeout to 1ms, which would drop the mount the instant the screen
             // opened. Bounded to a day: longer than that is a forgotten mount, not
             // an idle one.
+            // Empty means "use the built-in default"; core/logbook.js decides what
+            // that is, so the default lives in exactly one place.
+            mountRoot() { return this.mountRootSetting || ''; },
+
             idleMs() {
                 const sec = Number(this.idleSec);
                 if (!Number.isFinite(sec)) return 900 * 1000;
@@ -868,11 +874,15 @@
                             // fractional mountIdleTimeoutSec from config would
                             // otherwise reject the mount and drop us to the slow
                             // path for a reason no user could guess.
-                            maxRuntimeSec: Math.round(Math.max(600, this.idleMs() / 250))
+                            maxRuntimeSec: Math.round(Math.max(600, this.idleMs() / 250)),
+                            // Settings -> Mount folder. Without threading it here the
+                            // setting validates and saves but changes nothing, which
+                            // is worse than not offering it.
+                            mountRoot: this.mountRoot()
                         });
                     }
                     this.reader = 'mount';
-                    this.mountPoint = L.mountPoint(this.repoId);
+                    this.mountPoint = L.mountPoint(this.repoId, this.mountRoot());
                     return true;
                 } catch (e) {
                     this.fallback((e && e.message) || 'the repository could not be mounted');

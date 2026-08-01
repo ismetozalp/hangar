@@ -80,6 +80,9 @@
 <script src="js/core/errors.js"></script>
 <script src="js/core/secrets.js"></script>
 <script src="js/core/repos.js"></script>
+<!-- Creates rclone remotes. After repos.js: it completes the rclone repository
+     kind that repos.js already knows how to address. -->
+<script src="js/core/rclone.js"></script>
 <script src="js/core/sources.js"></script>
 <!-- v2 source kinds. These call HangarSources.registerKind() at load, so they must
      come after sources.js and before anything that enumerates the kinds. -->
