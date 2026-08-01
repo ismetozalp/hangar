@@ -32,16 +32,18 @@
         <span x-show="ready && missing.length" class="badge text-bg-warning"
               x-text="missing.length + ' tool(s) missing'"></span>
 
-        <!-- Version badge doubles as the update affordance: a plain label when
-             current, a button only when there is genuinely something to install. -->
-        <button class="btn btn-sm btn-success py-0"
-                x-show="update.available"
-                @click="openUpdateModal()"
-                :aria-label="'Update Hangar to version ' + update.version"
-                x-text="'Update to ' + update.version"></button>
-        <span class="text-secondary small hangar-mono"
-              x-show="!update.available && installedVersion"
-              x-text="'v' + installedVersion"></span>
+        <!-- One control with two jobs, like explorer's: it checks for an update when
+             there is nothing to install, and opens the installer when there is. A
+             separate "check" button would sit unused almost always.
+             A real <button>, not a clickable <span>, so it is keyboard-reachable. -->
+        <button type="button"
+                :class="badgeClass()"
+                x-show="installedVersion || update.checking || update.error"
+                :disabled="update.checking"
+                @click="onBadgeClick(settings)"
+                :title="badgeTitle()"
+                :aria-label="badgeTitle()"
+                x-text="updateBadgeLabel()"></button>
     </div>
 
     <!-- Body ------------------------------------------------------------ -->
@@ -94,6 +96,8 @@
 <script src="js/core/dr.js"></script>
 <script src="js/core/logbook.js"></script>
 <script src="js/core/themes.js"></script>
+<script src="js/core/wordlist.js"></script>
+<script src="js/core/passgen.js"></script>
 <script src="js/core/semver.js"></script>
 <script src="js/core/config.js"></script>
 

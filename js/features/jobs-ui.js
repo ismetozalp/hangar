@@ -126,6 +126,9 @@
         init: 'Initialise repository',
         'list-unreadable': 'Show unreadable files',
         'free-space': 'Try again after freeing space',
+        // Not "try again": a destination whose sign-in has expired fails
+        // identically on every retry, which is how a nightly job dies quietly.
+        reauthorize: 'Sign in to the destination again',
         retry: 'Try again'
     };
 
@@ -1762,6 +1765,14 @@
                         await Secrets.writeKey(repo.id, password);
                         break;
                     }
+                    case 'reauthorize':
+                        // Nothing here can repair it: the OAuth flow needs the
+                        // user's own browser, and it lives on the Repositories
+                        // screen beside the destination it belongs to. Repeating
+                        // the operation would fail exactly the same way, so the
+                        // banner is left standing rather than cleared.
+                        this.working = false;
+                        return;
                     default:
                         break;      // 'free-space' and 'retry' just repeat the operation
                     }

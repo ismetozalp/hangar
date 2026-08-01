@@ -404,6 +404,7 @@
         'init': 'Initialise repository',
         'list-unreadable': 'Show unreadable files',
         'free-space': 'Show what to free',
+        'reauthorize': 'Sign in again',
         'retry': 'Try again'
     };
 

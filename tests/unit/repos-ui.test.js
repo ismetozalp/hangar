@@ -860,7 +860,7 @@ test('a READ_ERRORS alert with nothing to list offers no dead button', () => {
 test('every remediation errors.js can emit reaches a component action', () => {
     // The rule is that a typed error becomes a button. A remediation with no
     // handler would be a button that does nothing.
-    const handled = ['unlock', 'init', 'reprompt', 'retry', 'list-unreadable'];
+    const handled = ['unlock', 'init', 'reprompt', 'retry', 'list-unreadable', 'reauthorize'];
     for (const r of new Set(Object.values(Errors.REMEDIATION)))
         assert.ok(handled.includes(r) || r === 'free-space', 'unhandled remediation ' + r);
     // free-space has no one-click fix here, so it must at least still be labelled.

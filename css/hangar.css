@@ -149,6 +149,59 @@ body {
 .hangar-badge.modified { background: var(--bs-warning-bg-subtle, rgba(237, 108, 2, 0.18)); color: var(--hangar-warn); }
 .hangar-badge.removed  { background: var(--bs-danger-bg-subtle, rgba(198, 40, 40, 0.18));  color: var(--hangar-err); }
 
+/* --- version / update badge -------------------------------------------- */
+
+/* One control, two jobs: check when idle, install when an update is waiting.
+ * Styled as a badge but built as a <button> so it is keyboard-reachable. */
+.hangar-badge-update {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.1rem 0.6rem;
+    border-radius: 999px;
+    border: 1px solid var(--bs-border-color, rgba(0, 0, 0, 0.2));
+    background: transparent;
+    color: var(--bs-secondary-color, #6c757d);
+    font-family: var(--bs-font-monospace, monospace);
+    font-size: 0.75rem;
+    line-height: 1.6;
+    white-space: nowrap;
+    cursor: pointer;
+}
+
+.hangar-badge-update:hover:not(:disabled) {
+    background: var(--bs-secondary-bg, rgba(0, 0, 0, 0.06));
+    color: var(--bs-body-color, inherit);
+}
+
+.hangar-badge-update:disabled { cursor: default; opacity: 0.7; }
+
+.hangar-badge-update:focus-visible {
+    outline: 2px solid var(--bs-primary, #0d6efd);
+    outline-offset: 2px;
+}
+
+/* An available update is the one state worth colouring — it is an action the
+ * user has not taken yet, not a status. */
+.hangar-badge-update.available {
+    background: var(--bs-success, #198754);
+    border-color: var(--bs-success, #198754);
+    color: #fff;
+    font-family: inherit;
+    font-weight: 600;
+}
+
+.hangar-badge-update.available:hover:not(:disabled) {
+    filter: brightness(1.1);
+    color: #fff;
+}
+
+/* A failed check is not an emergency — the plugin still works — so it is
+ * marked, not alarmed. */
+.hangar-badge-update.failed {
+    border-color: var(--bs-warning, #ffc107);
+    color: var(--bs-warning, #ffc107);
+}
+
 /* --- theme picker ------------------------------------------------------ */
 
 .hangar-swatch {

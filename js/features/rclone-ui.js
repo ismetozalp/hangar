@@ -27,6 +27,18 @@
 //    parses, for the same reason: a secret on screen is a secret in a
 //    screenshot, in a screen share, and in the browser's form restore.
 //
+// 4. The wizard has a SECOND mode. When a destination's authorisation expires,
+//    the way back is the same journey as creation — `rclone authorize` on the
+//    user's own computer, token pasted back — because `rclone config reconnect`
+//    re-enters the interactive flow, binds 127.0.0.1 on THIS machine and asks
+//    questions on stdin. There is no non-interactive form. So reconnect mode is
+//    this file's existing OAuth step pointed at a remote that already exists:
+//    the provider and the name are read from rclone's config rather than asked
+//    for, and the token goes to updateRemoteToken instead of createRemote.
+//    Reusing the step is the point — a second paste box, drifting out of sync
+//    with this one, is exactly the duplication this module refuses everywhere
+//    else.
+//
 // Pure: the grouping, the step machine, the form descriptors, name suggestion
 // and every validation message. The component below is the only impure part,
 // and it touches cockpit only through HangarRclone and HangarProvision.
@@ -67,7 +79,20 @@
     // reaches into this component's scope, and vice versa.
     const EVENT_OPEN = 'hangar:rclone-remote';
     const EVENT_CREATED = 'hangar:rclone-remote-created';
+    // Reported separately from EVENT_CREATED: nothing was created, and a screen
+    // that reacted to this by adding a remote to its list would show a duplicate.
+    const EVENT_RECONNECTED = 'hangar:rclone-remote-reconnected';
     const EVENT_PROVISION = 'hangar:provision';
+
+    // The two things this dialog does. `reconnect` targets a remote that already
+    // exists, so it asks neither for a provider nor for a name — both are read
+    // out of rclone's own configuration, where they are already correct.
+    const MODE = { CREATE: 'create', RECONNECT: 'reconnect' };
+
+    function modeOf(detail) {
+        const o = (detail && typeof detail === 'object') ? detail : {};
+        return trimmed(o.reauthorize) !== '' ? MODE.RECONNECT : MODE.CREATE;
+    }
 
     // What hangar asks its own provisioner to install when rclone is absent. The
     // wizard never names a package manager — that is provision.js's job across
@@ -165,6 +190,8 @@
         provider: 'Choose a destination',
         details: 'Enter the credentials',
         authorize: 'Authorise on your own computer',
+        // Reconnect only, and only for a backend rclone cannot authorize for us.
+        instructions: 'Sign in with rclone itself',
         name: 'Name the remote',
         done: 'Ready'
     };
@@ -175,24 +202,36 @@
 
     // Which middle step a provider gets is the ONLY branch in the wizard, and it
     // is derived from the table rather than from a list of provider ids here.
-    function stepsFor(providerId) {
+    //
+    // Reconnect is one step, never three: the provider and the name of an
+    // existing remote are already known, and asking a user to re-choose them is
+    // asking them to re-derive facts hangar can read out of rclone's config —
+    // and to get them wrong is to overwrite a working remote.
+    function stepsFor(providerId, mode) {
+        if (str(mode) === MODE.RECONNECT) {
+            // Anything hangar cannot finish itself gets instructions instead of a
+            // paste box. That covers Jottacloud (AUTH.EXTERNAL — `rclone
+            // authorize jottacloud` answers "not supported by this backend") and
+            // a remote whose backend is not in the provider table at all.
+            return [Rclone.isOAuth(providerId) ? 'authorize' : 'instructions'];
+        }
         if (!Rclone.providerFor(providerId)) return ['provider'];
         return ['provider', Rclone.isOAuth(providerId) ? 'authorize' : 'details', 'name'];
     }
 
-    function stepIndex(providerId, step) {
-        return stepsFor(providerId).indexOf(str(step));
+    function stepIndex(providerId, step, mode) {
+        return stepsFor(providerId, mode).indexOf(str(step));
     }
 
-    function nextStep(providerId, step) {
-        const steps = stepsFor(providerId);
+    function nextStep(providerId, step, mode) {
+        const steps = stepsFor(providerId, mode);
         const i = steps.indexOf(str(step));
         if (i < 0 || i >= steps.length - 1) return null;
         return steps[i + 1];
     }
 
-    function prevStep(providerId, step) {
-        const steps = stepsFor(providerId);
+    function prevStep(providerId, step, mode) {
+        const steps = stepsFor(providerId, mode);
         const i = steps.indexOf(str(step));
         if (i <= 0) return null;
         return steps[i - 1];
@@ -415,6 +454,104 @@
         return { name: trimmed(name), provider: p ? p.id : '', type: p ? p.type : '' };
     }
 
+    // --- reconnect copy ----------------------------------------------------
+    //
+    // Said as repair, not as setup. A user who arrives here did not ask to add a
+    // destination — something broke, and the dialog has to open by agreeing with
+    // them about what broke before it asks for anything.
+
+    function reconnectTitle(remoteName) {
+        const n = trimmed(remoteName);
+        return n === '' ? 'Sign in again' : 'Sign in to ' + n + ' again';
+    }
+
+    function reconnectIntro(remoteName, providerId) {
+        const p = Rclone.providerFor(providerId);
+        const n = trimmed(remoteName) || 'this destination';
+        const label = p ? p.label : 'The service';
+        return label + ' has stopped accepting this server\'s sign-in for "' + n + '", so backups ' +
+            'to it are failing. Signing in again is the whole fix — nothing else about the ' +
+            'destination changes, and the next run works.';
+    }
+
+    // Why the same command as first-time setup, rather than the reconnect command
+    // rclone documents. Stated once, here, because a user who has done this before
+    // WILL have found `rclone config reconnect` and will wonder why hangar does
+    // not just run it.
+    function whyNotReconnect(remoteName) {
+        const cmd = Rclone.reconnectCommand(remoteName);
+        return 'rclone\'s own repair command' + (cmd ? ' (' + cmd + ')' : '') + ' re-enters the ' +
+            'interactive sign-in: it opens a browser and waits for the answer on 127.0.0.1 of ' +
+            'whichever machine runs it — this server, which you are not sitting at. There is no ' +
+            'unattended form of it. So the way back is the same one you came in by.';
+    }
+
+    // For a backend rclone cannot authorize for us. `steps` comes from
+    // core/rclone.js's externalSetup, so the instructions are the provider's, not
+    // a second set written here that could disagree with the creation flow.
+    function reconnectInstructions(providerId, remoteName) {
+        const n = trimmed(remoteName);
+        const external = externalSetupFor(providerId);
+        if (external) {
+            return {
+                provider: external.provider,
+                reason: external.reason + ' Its sign-in has to be renewed with rclone itself, on ' +
+                    'this server.',
+                steps: (external.steps || []).slice(),
+                command: external.command,
+                // The remote already exists, so `rclone config` is an edit of it
+                // rather than a new one. Saying which name to pick is the step
+                // people get wrong and end up with a second, half-configured remote.
+                remote: n
+            };
+        }
+        const p = Rclone.providerFor(providerId);
+        return {
+            provider: p ? p.id : '',
+            reason: p
+                ? p.label + ' signs in with credentials rather than a browser, so there is no ' +
+                  'token to paste. Edit the remote and enter the current credentials.'
+                : 'This remote uses a backend hangar does not know, so it cannot offer the right ' +
+                  'sign-in. Repair it with rclone on this server.',
+            steps: [
+                'On this server run rclone config.',
+                n === '' ? 'Choose the remote that is failing and edit it.'
+                    : 'Choose "e" to edit an existing remote, then "' + n + '".',
+                'Enter the current credentials, then come back here and test the repository.'
+            ],
+            command: 'rclone config',
+            remote: n
+        };
+    }
+
+    function reconnectSuccessMessage(remoteName, providerId) {
+        const p = Rclone.providerFor(providerId);
+        const n = trimmed(remoteName) || 'the destination';
+        return (p ? p.label : 'The destination') + ' accepted the new sign-in for "' + n + '". ' +
+            'Nothing else about the remote was touched — its settings, and every other remote ' +
+            'in rclone\'s configuration, are exactly as they were.';
+    }
+
+    // The re-test after a successful reconnect. "It should work now" is what this
+    // exists to avoid: the user is shown the repository actually answering.
+    const VERIFY = {
+        IDLE: '',
+        RUNNING: 'running',
+        OK: 'ok',
+        FAILED: 'failed'
+    };
+
+    function verifyMessage(state, message) {
+        switch (str(state)) {
+        case VERIFY.RUNNING: return 'Checking that the repository answers…';
+        case VERIFY.OK: return trimmed(message) || 'The repository answered. Backups will run as scheduled.';
+        case VERIFY.FAILED:
+            return 'The sign-in was saved, but the repository still did not answer: ' +
+                (trimmed(message) || 'no reason was reported.');
+        default: return '';
+        }
+    }
+
     const MISSING_RCLONE = {
         title: 'rclone is not installed on this host',
         text: 'rclone is what actually talks to the cloud service — restic runs it for every ' +
@@ -513,8 +650,22 @@
         // browser. It is cleared the moment the remote exists.
         let token = '';
 
+        // Also a closure: the caller hands in how to prove the repository works
+        // again (repos-ui runs its own connection test, overview re-reads the
+        // repository's health). Holding a function on the component would put a
+        // caller's closure inside Alpine's reactive proxy for no reason.
+        let verify = null;
+
         return {
             step: 'provider',
+            mode: MODE.CREATE,
+            // The remote being repaired. A name only — never a credential.
+            remote: '',
+            // Which repository the caller was looking at, echoed back so the
+            // screen that opened this dialog can re-test the right one.
+            repoId: '',
+            verifyState: VERIFY.IDLE,
+            verifyDetail: '',
             providerId: '',
             values: {},
             paste: '',
@@ -547,17 +698,57 @@
 
             // `detail.existing` is the remote list the caller already has, used to
             // reject a duplicate name before rclone silently overwrites a remote.
+            //
+            // `detail.reauthorize` is the name of an EXISTING remote, and it puts
+            // the dialog into repair mode instead: same OAuth step, no provider
+            // choice, no naming.
             async open(detail) {
                 const o = (detail && typeof detail === 'object') ? detail : {};
                 this.reset();
                 this.existing = Array.isArray(o.existing) ? o.existing.map(trimmed) : [];
+                if (modeOf(o) === MODE.RECONNECT) return this.openReconnect(o);
                 showModal(MODAL_ID);
                 await this.checkRclone();
             },
 
+            // Repair mode. The provider is not asked for — it is read from
+            // rclone's own configuration, which is the only place that cannot be
+            // wrong about what this remote is. A remote we cannot identify still
+            // opens the dialog: it gets instructions rather than a token box,
+            // because the alternative is a screen that says nothing at all.
+            async openReconnect(detail) {
+                const o = (detail && typeof detail === 'object') ? detail : {};
+                this.mode = MODE.RECONNECT;
+                this.remote = trimmed(o.reauthorize);
+                this.repoId = trimmed(o.repoId);
+                verify = typeof o.verify === 'function' ? o.verify : null;
+                this.providerId = '';
+                this.step = 'instructions';
+                showModal(MODAL_ID);
+                await this.checkRclone();
+                try {
+                    const p = await Rclone.providerOfRemote(this.remote);
+                    this.providerId = (p && p.id) ? p.id : '';
+                } catch (e) {
+                    // Not fatal, and deliberately not an alert: the instructions
+                    // step below is a correct answer for "hangar could not tell
+                    // what this remote is", and a red box on top of it would send
+                    // the user looking for a second problem.
+                    this.providerId = '';
+                }
+                this.step = stepsFor(this.providerId, MODE.RECONNECT)[0];
+                return this.step;
+            },
+
             reset() {
                 token = '';
+                verify = null;
                 this.step = 'provider';
+                this.mode = MODE.CREATE;
+                this.remote = '';
+                this.repoId = '';
+                this.verifyState = VERIFY.IDLE;
+                this.verifyDetail = '';
                 this.providerId = '';
                 this.values = {};
                 this.paste = '';
@@ -606,14 +797,38 @@
             },
 
             steps() {
-                return stepsFor(this.providerId);
+                return stepsFor(this.providerId, this.mode);
+            },
+
+            reconnecting() {
+                return this.mode === MODE.RECONNECT;
+            },
+
+            // The dialog is a repair, so it says so in the one place a screen
+            // reader announces on open.
+            title() {
+                return this.reconnecting()
+                    ? reconnectTitle(this.remote)
+                    : 'Add a cloud destination';
+            },
+
+            intro() {
+                return this.reconnecting() ? reconnectIntro(this.remote, this.providerId) : '';
+            },
+
+            whyNotReconnect() {
+                return whyNotReconnect(this.remote);
+            },
+
+            instructions() {
+                return reconnectInstructions(this.providerId, this.remote);
             },
 
             stepNumber() {
                 // 'done' is the outcome, not a fourth thing to do — so it reads as
                 // the last step completed rather than "step 0 of 3".
                 if (this.step === 'done') return this.stepCount();
-                const i = stepIndex(this.providerId, this.step);
+                const i = stepIndex(this.providerId, this.step, this.mode);
                 return i < 0 ? 1 : i + 1;
             },
 
@@ -665,7 +880,7 @@
             },
 
             back() {
-                const prev = prevStep(this.providerId, this.step);
+                const prev = prevStep(this.providerId, this.step, this.mode);
                 if (!prev) return false;
                 this.problems = [];
                 this.alert = null;
@@ -678,6 +893,10 @@
             // refusal to advance reads as a broken button.
             next() {
                 this.problems = [];
+
+                // Repair mode has exactly one step, so "Continue" would have
+                // nowhere to go. The token is accepted by the submit button.
+                if (this.reconnecting()) return false;
 
                 if (this.step === 'provider') {
                     if (!this.provider()) {
@@ -784,7 +1003,89 @@
                 return trimmed(this.name) !== '';
             },
 
+            // Repair mode's own gate. It deliberately does NOT require the token
+            // to have been accepted already — pressing the one obvious button
+            // with text in the paste box accepts it first, because a user who has
+            // just pasted a block does not expect a second button to be the real
+            // one.
+            canReconnect() {
+                if (this.busy || this.missing()) return false;
+                if (!this.reconnecting() || this.remote === '') return false;
+                if (!Rclone.isOAuth(this.providerId)) return false;
+                return this.hasToken || trimmed(this.paste) !== '';
+            },
+
+            // Impure. Replaces ONLY this remote's token line; everything else in
+            // rclone's configuration — this remote's client id and scope, every
+            // other remote, the comments — is left byte for byte by
+            // mergeConfigSection. The token goes through updateRemoteToken, which
+            // keeps it off argv.
+            async reconnect() {
+                if (this.busy) return false;
+                if (!this.hasToken && !this.acceptPaste()) return false;
+
+                this.alert = null;
+                this.problems = [];
+                this.busy = true;
+                const name = trimmed(this.remote);
+                try {
+                    await Rclone.updateRemoteToken(name, token);
+                    // Forget the token before anything else can go wrong: rclone's
+                    // config now holds it, and this component has no further use
+                    // for it.
+                    this.forget();
+                    this.created = name;
+                    this.step = 'done';
+                    dispatch(EVENT_RECONNECTED, { name: name, repoId: this.repoId,
+                        provider: this.providerId });
+                    // Then prove it. Being told a destination "should work now" is
+                    // what sends people away to find out at 03:00 that it does not.
+                    await this.runVerify();
+                    return true;
+                } catch (e) {
+                    this.alert = toAlert(e, 'Sign in again');
+                    return false;
+                } finally {
+                    this.busy = false;
+                }
+            },
+
+            // Never rejects and never throws: the sign-in HAS been saved by the
+            // time this runs, and a failing check must not read as a failed
+            // repair. It reports what it found and leaves the dialog usable.
+            async runVerify() {
+                if (typeof verify !== 'function') {
+                    this.verifyState = VERIFY.IDLE;
+                    this.verifyDetail = '';
+                    return VERIFY.IDLE;
+                }
+                this.verifyState = VERIFY.RUNNING;
+                this.verifyDetail = '';
+                try {
+                    const r = await verify();
+                    this.verifyState = VERIFY.OK;
+                    this.verifyDetail = scrub(r && r.message);
+                } catch (e) {
+                    this.verifyState = VERIFY.FAILED;
+                    // Redacted like every other error here: a restic or rclone
+                    // failure routinely quotes a URL with credentials in it.
+                    this.verifyDetail = scrub(e && e.message);
+                }
+                return this.verifyState;
+            },
+
+            verifyText() {
+                return verifyMessage(this.verifyState, this.verifyDetail);
+            },
+
+            verifyClass() {
+                if (this.verifyState === VERIFY.OK) return 'text-success';
+                if (this.verifyState === VERIFY.FAILED) return 'text-warning-emphasis';
+                return 'text-secondary';
+            },
+
             async submit() {
+                if (this.reconnecting()) return this.reconnect();
                 if (this.busy) return false;
                 this.problems = this.nameProblems();
                 if (this.problems.length) return false;
@@ -823,7 +1124,13 @@
             },
 
             successMessage() {
-                return successMessage(this.created, this.providerId);
+                return this.reconnecting()
+                    ? reconnectSuccessMessage(this.created || this.remote, this.providerId)
+                    : successMessage(this.created, this.providerId);
+            },
+
+            doneTitle() {
+                return this.reconnecting() ? 'Signed in again.' : 'Destination added.';
             },
 
             // --- display ---------------------------------------------------
@@ -845,15 +1152,17 @@
     root.hangarRcloneUi = hangarRcloneUi;
 
     const HangarRcloneUi = {
-        EVENT_OPEN, EVENT_CREATED, EVENT_PROVISION, PROVISION_TOOLS, MODAL_ID,
-        GROUPS, STEP_LABEL, WHY_HEADLESS,
-        providerGroups, groupIdFor, externalSetupFor, providerCard,
+        EVENT_OPEN, EVENT_CREATED, EVENT_RECONNECTED, EVENT_PROVISION, PROVISION_TOOLS, MODAL_ID,
+        GROUPS, STEP_LABEL, WHY_HEADLESS, MODE, VERIFY,
+        providerGroups, groupIdFor, externalSetupFor, providerCard, modeOf,
         stepLabel, stepsFor, stepIndex, nextStep, prevStep,
         formFieldsFor, blankValues, secretKeys, clearSecrets, fieldProblems,
         nameProblems, suggestName,
         authorizeCommandFor, whyHeadless, authorizeSteps, clientIdAdvice, providerNote,
         extractToken, tokenProblems,
         successMessage, createdDetail, missingRcloneMessage, toAlert,
+        reconnectTitle, reconnectIntro, whyNotReconnect, reconnectInstructions,
+        reconnectSuccessMessage, verifyMessage,
         hangarRcloneUi
     };
     root.HangarRcloneUi = HangarRcloneUi;

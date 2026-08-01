@@ -21,6 +21,7 @@
     const Secrets = root.HangarSecrets || (req ? req('../core/secrets.js') : null);
     const Config = root.HangarConfig || (req ? req('../core/config.js') : null);
     const Restic = root.HangarRestic || (req ? req('../engine/restic.js') : null);
+    const Rclone = root.HangarRclone || (req ? req('../core/rclone.js') : null);
 
     // app.js loads AFTER the feature scripts, so HangarDialogs cannot be captured
     // at load time — it is resolved on first use instead.
@@ -96,6 +97,9 @@
         'init': 'Initialise repository',
         'list-unreadable': 'Show unreadable files',
         'free-space': 'Show what to free',
+        // Never 'Try again': a destination whose authorisation has lapsed answers
+        // every retry the same way, so retrying is how the failure goes unnoticed.
+        'reauthorize': 'Sign in again',
         'retry': 'Try again'
     };
 
@@ -431,6 +435,58 @@
         };
     }
 
+    // buildUrl throws on a repository definition that no longer validates, and
+    // this one is called from a click handler on a row that is already failing.
+    // An empty string means "no URL to read", which every caller can handle.
+    function safeUrl(repo) {
+        try {
+            return Repos ? str(Repos.buildUrl(repo)) : '';
+        } catch (e) {
+            return '';
+        }
+    }
+
+    // The rclone remote a repository is written through, or '' for a repository
+    // that does not go through rclone at all. `repo.remote` is the definition's
+    // own field; the URL is the fallback for a definition that carries a full
+    // URL instead — and the URL parse is the one that also refuses a "remote"
+    // containing a slash or a space, which would be a path we misread.
+    function remoteOf(repo) {
+        const r = repo && typeof repo === 'object' ? repo : {};
+        if (str(r.kind) === 'rclone' && trimmed(r.remote) !== '') return trimmed(r.remote);
+        if (!Rclone || typeof Rclone.remoteNameFromRepoUrl !== 'function') return '';
+        return str(Rclone.remoteNameFromRepoUrl(safeUrl(r)));
+    }
+
+    // Test connection has to find an expired authorisation BEFORE the next
+    // scheduled run does — that is the whole reason the button exists.
+    //
+    // classifyExit already reads restic's stderr for rclone's expiry wording, so
+    // the common path arrives here typed correctly. This is the path it cannot
+    // cover: a failure that never became a restic exit status (the channel died,
+    // the spawn threw) still carries rclone's text, and reporting THAT as a
+    // generic error is how a lapsed sign-in gets a "Try again" button and another
+    // week of silent failures.
+    //
+    // Only for a repository that actually goes through rclone: a plain SFTP
+    // repository whose server said "403 Forbidden" has a permission problem, and
+    // sending its owner through a cloud sign-in would hide it.
+    function classifyRepoFailure(e, repo) {
+        if (!e || !Rclone || typeof Rclone.isAuthExpired !== 'function') return e;
+        if (Errors.isHangarError(e) && e.kind === Errors.KIND.AUTH_EXPIRED) return e;
+        if (remoteOf(repo) === '') return e;
+
+        const detail = (Errors.isHangarError(e) && e.detail && typeof e.detail === 'object')
+            ? e.detail : null;
+        const text = str(e.message) + '\n' + (detail ? str(detail.stderr) : '');
+        if (!Rclone.isAuthExpired(text)) return e;
+
+        // The original text is kept in the detail — it is what the log needs —
+        // while the message becomes the one a person can act on.
+        return Errors.create(Errors.KIND.AUTH_EXPIRED, Rclone.AUTH_EXPIRED_MESSAGE,
+            detail || { stderr: str(e.message) });
+    }
+
     function resticOptions(repo) {
         return {
             repoUrl: Repos.buildUrl(repo),
@@ -512,7 +568,30 @@
             showFiles: false,
 
             async init() {
+                // A destination repaired anywhere — this screen's own rows, or the
+                // Overview banner — leaves this list showing a failure that is no
+                // longer true. The row is re-read rather than patched, because the
+                // host is what decides whether the repair worked.
+                if (typeof root.addEventListener === 'function') {
+                    root.addEventListener('hangar:rclone-remote-reconnected', (ev) => {
+                        this.remoteReconnected((ev && ev.detail) || {});
+                    });
+                }
                 await this.refresh();
+            },
+
+            // Never rejects: it runs from an event listener, where a rejection has
+            // nowhere to go.
+            async remoteReconnected(detail) {
+                const id = trimmed(detail && detail.repoId);
+                const rows = id === ''
+                    ? this.rows.filter(function (r) { return !!r.alert; })
+                    : this.rows.filter(function (r) { return r.id === id; });
+                for (const row of rows) {
+                    row.alert = null;
+                    try { await this.loadStats(row); } catch (e) { /* the row shows its own alert */ }
+                }
+                return rows.length;
             },
 
             // Never rejects. x-init has nowhere to put a rejection, and a throw here
@@ -575,7 +654,10 @@
                         Object.assign({ mode: 'raw-data' }, opts)));
                     row.stats = { snapshots: snaps.length, size: stats.totalSize };
                 } catch (e) {
-                    row.alert = toAlert(e, 'Reading repository', row.id);
+                    // Same reclassification as the Test button: the row that
+                    // failed to load its size is usually the first sight of an
+                    // expired destination, and it must offer the same fix.
+                    row.alert = toAlert(classifyRepoFailure(e, row.repo), 'Reading repository', row.id);
                 } finally {
                     row.busy = '';
                 }
@@ -701,7 +783,10 @@
                     row.stats = Object.assign({ size: null }, row.stats, { snapshots: snaps.length });
                     row.alert = okAlert('Test', 'Reachable — ' + snaps.length + ' snapshot(s).', row.id);
                 } catch (e) {
-                    row.alert = toAlert(e, 'Test connection', row.id);
+                    // Classified before it is rendered, so an expired sign-in gets
+                    // "Sign in again" here rather than being discovered by the
+                    // next nightly run.
+                    row.alert = toAlert(classifyRepoFailure(e, row.repo), 'Test connection', row.id);
                 } finally {
                     row.busy = '';
                 }
@@ -783,6 +868,44 @@
                 }
             },
 
+            // The one-click fix for an expired cloud destination. It hands off to
+            // features/rclone-ui.js — the SAME wizard that created the remote,
+            // because the recovery is the same journey: `rclone authorize` runs on
+            // the user's own computer and the token is pasted back. hangar cannot
+            // run `rclone config reconnect` itself; it re-enters the interactive
+            // flow, binds 127.0.0.1 on THIS machine and asks questions on stdin.
+            //
+            // `verify` travels with the request so the wizard can prove the repair
+            // rather than assert it: the user watches this row's own connection
+            // test succeed, in the dialog, before they close it.
+            reauthorize(row) {
+                const remote = remoteOf(row && row.repo);
+                if (remote === '') {
+                    // Not an rclone repository, so there is no sign-in to renew.
+                    // Expanding the detail says more than a wizard about a
+                    // destination this row does not use.
+                    if (row) row.showFiles = true;
+                    return false;
+                }
+                if (typeof root.dispatchEvent !== 'function' || typeof CustomEvent !== 'function')
+                    return false;
+                root.dispatchEvent(new CustomEvent('hangar:rclone-remote', {
+                    detail: {
+                        existing: [],
+                        reauthorize: remote,
+                        repoId: row.id,
+                        verify: async () => {
+                            await this.testConnection(row);
+                            const a = row.alert;
+                            if (a && a.level !== 'success')
+                                throw Errors.create(a.kind || Errors.KIND.UNKNOWN, a.message);
+                            return { message: a ? a.message : '' };
+                        }
+                    }
+                }));
+                return true;
+            },
+
             // The remediation of a typed error is a button, and this is where the
             // button lands. Unmapped remediations simply expand the detail.
             async remediate(row) {
@@ -792,6 +915,7 @@
                 if (r === 'init') return this.initRepo(row);
                 if (r === 'reprompt') return this.reprompt(row);
                 if (r === 'retry') return this.loadStats(row);
+                if (r === 'reauthorize') return this.reauthorize(row);
                 row.showFiles = true;
                 return null;
             },
@@ -804,8 +928,9 @@
             },
 
             // A screen-level alert only offers a button it can actually honour.
-            // 'unlock' / 'init' / 'reprompt' need a repository to act on; offering
-            // them with no row would be a button that silently does nothing.
+            // 'unlock' / 'init' / 'reprompt' / 'reauthorize' need a repository to
+            // act on; offering them with no row would be a button that silently
+            // does nothing.
             alertActionLabel() {
                 const a = this.alert;
                 if (!a || !a.actionLabel) return '';
@@ -817,7 +942,8 @@
                 const a = this.alert;
                 if (!a) return null;
                 const row = this.alertRow();
-                if (row && (a.remediation === 'unlock' || a.remediation === 'init' || a.remediation === 'reprompt')) {
+                if (row && (a.remediation === 'unlock' || a.remediation === 'init' ||
+                            a.remediation === 'reprompt' || a.remediation === 'reauthorize')) {
                     this.alert = null;
                     row.alert = a;
                     return this.remediate(row);
@@ -938,6 +1064,33 @@
                     return false;
                 root.dispatchEvent(new CustomEvent('hangar:rclone-remote',
                     { detail: { existing: this.remotes.slice() } }));
+                return true;
+            },
+
+            // The one-click fix for an expired cloud destination. It hands off to
+            // features/rclone-ui.js — the SAME wizard that created the remote,
+            // because the recovery is the same journey: `rclone authorize` runs on
+            // the user's own computer and the token is pasted back. `reauthorize`
+            // names the remote to repair, so the wizard reopens on that remote
+            // instead of asking for a new name.
+            //
+            // hangar cannot run `rclone config reconnect` itself: it re-enters the
+            // interactive OAuth flow, binds 127.0.0.1 on THIS machine — a server
+            // nobody is sitting at — and asks questions on stdin.
+            reauthorize(row) {
+                const repo = (row && row.repo) || row;
+                const remote = trimmed(repo && repo.remote) ||
+                    (Rclone && Repos ? Rclone.remoteNameFromRepoUrl(safeUrl(repo)) : '') || '';
+                if (!remote) {
+                    // Nothing to re-authorise: this is not an rclone repository, so
+                    // say so rather than opening a wizard about someone else.
+                    if (row) row.showFiles = true;
+                    return false;
+                }
+                if (typeof root.dispatchEvent !== 'function' || typeof CustomEvent !== 'function')
+                    return false;
+                root.dispatchEvent(new CustomEvent('hangar:rclone-remote',
+                    { detail: { existing: this.remotes.slice(), reauthorize: remote } }));
                 return true;
             },
 
@@ -1141,7 +1294,7 @@
         kindLabel, kindChoices, remediationLabel, busyLabelFor, BUSY_LABEL,
         fieldsFor, blankForm, repoToFormState, formStateToRepo, mergeKind, validateForm,
         formatSize, formatCount, toRow, unreadableFrom, toAlert, okAlert, resultAlert,
-        isAlreadyInitialised, deleteMessage, resticOptions,
+        isAlreadyInitialised, deleteMessage, resticOptions, remoteOf, classifyRepoFailure,
         mount, repoEditDialog, hangarReposUi, hangarRepoEdit
     };
     root.HangarReposUi = HangarReposUi;

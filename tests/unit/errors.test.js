@@ -6,7 +6,8 @@ const E = require('../../js/core/errors.js');
 
 test('KIND is exhaustive and self-consistent', () => {
     const expected = ['OK', 'GENERIC', 'GO_RUNTIME', 'READ_ERRORS', 'REPO_MISSING',
-        'REPO_LOCKED', 'WRONG_PASSWORD', 'CANCELLED', 'NO_SPACE', 'NETWORK', 'UNKNOWN'];
+        'REPO_LOCKED', 'WRONG_PASSWORD', 'CANCELLED', 'NO_SPACE', 'NETWORK',
+        'AUTH_EXPIRED', 'UNKNOWN'];
     assert.deepEqual(Object.keys(E.KIND).sort(), expected.slice().sort());
     // Every key maps to itself — callers pass kind strings around freely.
     for (const k of Object.keys(E.KIND)) assert.equal(E.KIND[k], k);
@@ -73,10 +74,54 @@ test('remediation maps the kinds the UI can offer a one-click fix for', () => {
     assert.equal(E.create('READ_ERRORS').remediation, 'list-unreadable');
     assert.equal(E.create('NO_SPACE').remediation, 'free-space');
     assert.equal(E.create('NETWORK').remediation, 'retry');
+    assert.equal(E.create('AUTH_EXPIRED').remediation, 'reauthorize');
     // No pretend fix for these.
     assert.equal(E.create('GENERIC').remediation, null);
     assert.equal(E.create('GO_RUNTIME').remediation, null);
     assert.equal(E.create('UNKNOWN').remediation, null);
+});
+
+// ----------------------------------------------------------- AUTH_EXPIRED
+
+test('AUTH_EXPIRED is fatal — the backup did not happen', () => {
+    // The remediation matters more than the severity here, but the severity is
+    // still the truth: nothing was written. Reporting it as non-fatal would hide
+    // a destination that has silently stopped receiving backups.
+    const e = E.create('AUTH_EXPIRED', 'sign-in expired');
+    assert.equal(e.fatal, true);
+    assert.equal(E.isFatal(e), true);
+    assert.equal(E.NON_FATAL.has('AUTH_EXPIRED'), false);
+});
+
+test('AUTH_EXPIRED offers reauthorize, and specifically not retry', () => {
+    // Retrying a backup whose destination will not authorise fails identically,
+    // every night, in a unit nobody reads. That is the failure mode this whole
+    // kind exists to end, so the two must never be confused.
+    const e = E.create('AUTH_EXPIRED', 'x');
+    assert.equal(e.remediation, 'reauthorize');
+    assert.notEqual(e.remediation, E.create('NETWORK').remediation);
+    assert.equal(E.remediationFor(e), 'reauthorize');
+});
+
+test('AUTH_EXPIRED carries its detail like every other kind', () => {
+    const e = E.create('AUTH_EXPIRED', 'sign-in expired', { remote: 'gdrive', code: 1 });
+    assert.equal(e.kind, 'AUTH_EXPIRED');
+    assert.deepEqual(e.detail, { remote: 'gdrive', code: 1 });
+    assert.ok(e instanceof Error);
+    assert.equal(e.name, 'HangarError');
+});
+
+test('every remediation is a distinct slug — a duplicate would route two kinds to one button', () => {
+    const slugs = Object.keys(E.REMEDIATION).map((k) => E.REMEDIATION[k]);
+    assert.equal(new Set(slugs).size, slugs.length, 'duplicate remediation slug: ' + slugs.join(', '));
+    assert.ok(slugs.includes('reauthorize'));
+});
+
+test('every remediation belongs to a real kind', () => {
+    // A remediation keyed on a kind that does not exist is a button that can
+    // never appear, which is the quiet way this table rots.
+    for (const k of Object.keys(E.REMEDIATION))
+        assert.ok(E.KIND[k], 'remediation for unknown kind ' + k);
 });
 
 test('remediationFor() is null for foreign errors', () => {

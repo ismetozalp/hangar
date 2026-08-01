@@ -259,7 +259,8 @@ test('the badge label reflects each state', () => {
     assert.equal(c.updateBadgeLabel(), 'v1.0.0');
 
     c.update = Object.assign(U.blankState(), { available: true, version: '2.0.0' });
-    assert.equal(c.updateBadgeLabel(), 'Update to 2.0.0');
+    // The arrow marks an action waiting to be taken, the way explorer's badge does.
+    assert.equal(c.updateBadgeLabel(), '↑ Update to 2.0.0');
 
     c.update = Object.assign(U.blankState(), { checking: true });
     assert.equal(c.updateBadgeLabel(), 'Checking…');
@@ -281,4 +282,87 @@ test('the module never uses browser fetch to reach GitHub', () => {
     assert.equal(fetchLines.length, 1, `unexpected fetch() calls:\n${fetchLines.join('\n')}`);
     assert.match(fetchLines[0], /'VERSION'/);
     assert.ok(!/fetch\([^)]*github/i.test(src), 'fetch() must never target github.com');
+});
+
+// --- the badge is also the check button ----------------------------------
+
+test('clicking the badge checks when there is nothing to install', async () => {
+    // One control, two jobs: a separate "check for updates" button would sit
+    // unused almost always, and a version label that does nothing is a dead end
+    // when someone wants to know whether they are current.
+    const c = U.hangarUpdateUi();
+    c.installedVersion = '1.0.0';
+    c.updateRepo = 'appuser/hangar';
+    let asked = null;
+    c.checkForUpdate = async (manual, settings) => { asked = { manual, settings }; };
+
+    assert.equal(await c.onBadgeClick({ updateRepo: 'appuser/hangar' }), true);
+    assert.ok(asked, 'the badge did not trigger a check');
+    assert.equal(asked.manual, true, 'a badge click is a manual check');
+    assert.ok(c.checkedAt > 0, 'the check was not recorded');
+});
+
+test('clicking the badge opens the installer when an update is waiting', async () => {
+    const c = U.hangarUpdateUi();
+    c.update = Object.assign(U.blankState(), {
+        available: true, version: '2.0.0',
+        assetUrl: 'https://github.com/o/r/releases/download/v2/x.zip'
+    });
+    let checked = false;
+    c.checkForUpdate = async () => { checked = true; };
+    // No DOM, so openUpdateModal returns false — what matters is that it did NOT
+    // run another check.
+    await c.onBadgeClick({});
+    assert.equal(checked, false, 'it re-checked instead of offering the install');
+});
+
+test('the badge does nothing while a check or an install is already running', async () => {
+    const c = U.hangarUpdateUi();
+    let calls = 0;
+    c.checkForUpdate = async () => { calls++; };
+
+    c.update = Object.assign(U.blankState(), { checking: true });
+    assert.equal(await c.onBadgeClick({}), false);
+
+    c.update = U.blankState();
+    c._inFlight = true;
+    assert.equal(await c.onBadgeClick({}), false);
+    assert.equal(calls, 0);
+});
+
+test('a check that finds nothing says so, rather than looking like a no-op', async () => {
+    const c = U.hangarUpdateUi();
+    c.installedVersion = '1.0.0';
+    assert.equal(c.updateBadgeLabel(), 'v1.0.0');
+    c.checkedAt = Date.now();
+    assert.match(c.updateBadgeLabel(), /up to date/);
+});
+
+test('the badge title explains what a click will do in every state', () => {
+    const c = U.hangarUpdateUi();
+    c.installedVersion = '1.0.0';
+
+    c.updateRepo = '';
+    assert.match(c.badgeTitle(), /Settings/, 'no repository configured');
+
+    c.updateRepo = 'appuser/hangar';
+    assert.match(c.badgeTitle(), /check for updates/i);
+
+    c.update = Object.assign(U.blankState(), { checking: true });
+    assert.match(c.badgeTitle(), /Checking/);
+
+    c.update = Object.assign(U.blankState(), { available: true, version: '2.0.0' });
+    assert.match(c.badgeTitle(), /click to install/i);
+
+    c.update = Object.assign(U.blankState(), { error: 'boom' });
+    assert.match(c.badgeTitle(), /try again/i);
+});
+
+test('badgeClass marks an available update and a failed check differently', () => {
+    const c = U.hangarUpdateUi();
+    assert.equal(c.badgeClass(), 'hangar-badge-update');
+    c.update = Object.assign(U.blankState(), { available: true, version: '2' });
+    assert.match(c.badgeClass(), /available/);
+    c.update = Object.assign(U.blankState(), { error: 'x' });
+    assert.match(c.badgeClass(), /failed/);
 });

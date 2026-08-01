@@ -437,6 +437,48 @@
         };
     }
 
+    // ---- pure: empty states -------------------------------------------------
+    //
+    // The Logbook is the LAST screen a user opens — you browse snapshots after you
+    // have a repository, a job and a run. So an empty Logbook is almost never "the
+    // Logbook is broken"; it is a step earlier in the chain that has not happened.
+    // "Nothing to show here." describes that without helping, and leaves the user
+    // looking at a Restore button that cannot do anything.
+    //
+    // Pure, so the wording and the routing are testable without a browser.
+    function emptyGuidance(state) {
+        const s = state || {};
+        if (s.busy) return null;                      // still loading: say nothing yet
+        const repos = Array.isArray(s.repos) ? s.repos : [];
+        const snapshots = Array.isArray(s.snapshots) ? s.snapshots : [];
+
+        if (!repos.length) {
+            return {
+                reason: 'no-repos',
+                title: 'No repositories yet',
+                text: 'The Logbook shows what was in a backup at a chosen moment, so it ' +
+                    'needs a repository to read from — the encrypted destination your ' +
+                    'backups are written to.',
+                actionLabel: 'Add a repository',
+                tab: 'repos'
+            };
+        }
+        if (!snapshots.length) {
+            return {
+                reason: 'no-snapshots',
+                title: 'Nothing has been backed up yet',
+                text: 'This repository exists but holds no snapshots, so there is no moment ' +
+                    'to scroll back to. A job decides what gets backed up and when; the ' +
+                    'first run creates the first snapshot.',
+                actionLabel: 'Create a backup job',
+                tab: 'jobs'
+            };
+        }
+        // Repositories and snapshots both exist — an empty folder is just an empty
+        // folder and needs no advice.
+        return null;
+    }
+
     // ---- pure: error presentation -------------------------------------------
 
     // A typed failure becomes a button, never a toast (design §8).
@@ -446,6 +488,9 @@
         'init': 'Initialise repository',
         'list-unreadable': 'Show unreadable files',
         'free-space': 'Check free space',
+        // Deliberately not 'Try again': retrying an expired sign-in fails
+        // identically, every time, which is how the failure stays invisible.
+        'reauthorize': 'Sign in again',
         'retry': 'Try again'
     };
 
@@ -566,6 +611,14 @@
 
     function hangarLogbookUi() {
         return {
+            // What to tell the user when there is nothing to browse, and which
+            // step to send them to. Null once there are snapshots.
+            guidance() {
+                return emptyGuidance({
+                    repos: this.repos, snapshots: this.snapshots, busy: this.busy
+                });
+            },
+
             // repositories
             repos: [],
             repoId: '',
@@ -1068,6 +1121,18 @@
                     return;
                 }
 
+                if (action === 'reauthorize') {
+                    // The Logbook is read-only about credentials: signing in again
+                    // needs the user's own browser and belongs beside the
+                    // destination on the Repositories screen. Saying so is a fix
+                    // the user can act on; a spinner that ends in the same error
+                    // is not.
+                    this.noticeKind = 'warning';
+                    this.notice = 'This destination\'s sign-in has expired. Re-authorise it on the ' +
+                        'Repositories screen, then open the Logbook again: ' + Repos.describe(this.repo);
+                    return;
+                }
+
                 if (action === 'free-space') {
                     // hangar cannot free space on the user's behalf, and pretending
                     // to would be worse than naming the destination that is full.
@@ -1332,8 +1397,19 @@
 '    </div>' +
 
 '    <div class="flex-grow-1 overflow-auto">' +
-'      <div x-show="!rows.length && !busy" class="hangar-empty">' +
-'        Nothing to show here.' +
+'      <template x-if="guidance()">' +
+'        <div class="hangar-empty" role="status">' +
+'          <h3 class="h5" x-text="guidance().title"></h3>' +
+'          <p class="mb-3 mx-auto" style="max-width: 34rem;" x-text="guidance().text"></p>' +
+'          <button type="button" class="btn btn-primary"' +
+'                  @click="tab = guidance().tab"' +
+'                  x-text="guidance().actionLabel"></button>' +
+'        </div>' +
+'      </template>' +
+// An empty FOLDER inside a repository that does have snapshots is just empty —
+// no advice needed, and offering some would be noise.
+'      <div x-show="!rows.length && !busy && !guidance()" class="hangar-empty">' +
+'        This folder was empty at the moment you are looking at.' +
 '      </div>' +
 '      <table class="table table-sm table-hover mb-0" x-show="rows.length">' +
 '        <thead>' +
@@ -1373,7 +1449,8 @@
      // screen reader announces a listbox with nothing in it. The band heading is
      // hidden from the accessibility tree because the group label already says it.
 '  <div class="hangar-scrubber" role="listbox" aria-label="Snapshot moments">' +
-'    <div x-show="!bands.length" class="small text-secondary p-2">No snapshots yet.</div>' +
+'    <div x-show="!bands.length" class="small text-secondary p-2"' +
+'         x-text="guidance() ? guidance().title : \'No snapshots yet.\'"></div>' +
 '    <template x-for="band in bands" :key="band.key">' +
 '      <div role="group" :aria-label="band.label">' +
 '        <div class="hangar-band-label" aria-hidden="true" x-text="band.label"></div>' +
@@ -1424,7 +1501,7 @@
         timelineModel, momentFor, lsEntriesFor, parseFindOutput, listDirArgv,
         breadcrumbsFor, parentOf, joinPath, normalizePath,
         formatBytes, absoluteLabel, clockLabel, badgeClassFor, remediationLabel,
-        errorView, errorAlertClass, noticeAlertClass,
+        errorView, errorAlertClass, noticeAlertClass, emptyGuidance,
         unreadableFromMessages, unreadableFromError,
         compareEntries, includePathsFrom, template,
         // components and glue

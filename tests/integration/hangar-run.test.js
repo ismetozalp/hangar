@@ -484,3 +484,204 @@ test('a forget that emits a JSON document instead of JSON lines does not crash t
         fs.rmSync(dir, { recursive: true, force: true });
     }
 });
+
+// --- an expired cloud destination is recorded, not just failed ---------------
+//
+// restic spawns rclone for an `rclone:` repository, so when the destination's
+// authorisation lapses the evidence is a line in RESTIC's stderr and nothing
+// else — there is no exit code for it. These tests run the helper for real
+// against a restic stand-in that fails the way a real one does at 03:00, and
+// assert the state file the UI reads in the morning says which failure it was.
+//
+// The stubs' stderr is the wording rclone and the providers really produce.
+
+const Rclone = require('../../js/core/rclone.js');
+const Restic = require('../../js/engine/restic.js');
+
+const RCLONE_REPO = { id: 'main', kind: 'rclone', remote: 'gdrive', prefix: 'backups' };
+
+// A restic that fails the way one does when rclone's token has expired.
+const RESTIC_STUB_EXPIRED = '#!/bin/sh\n' +
+    "cat >&2 <<'EOS'\n" +
+    '2026/07/31 03:00:12 ERROR : backups/db: Failed to copy: failed to open source object: ' +
+    'couldn\'t fetch token - maybe it has expired? - refresh with "rclone config reconnect gdrive:"\n' +
+    '{"message_type":"exit_error","code":1,"message":"backup failed"}\n' +
+    'EOS\n' +
+    'exit 1\n';
+
+// The counter-example: same exit code, same HTTP-ish shape, entirely different
+// cause. Re-authorising would not free a byte of quota.
+const RESTIC_STUB_QUOTA = '#!/bin/sh\n' +
+    "echo '403: User Rate Limit Exceeded, userRateLimitExceeded' >&2\n" +
+    'exit 1\n';
+
+// A snapshot that WAS written, with an unreadable file — and an expiry-shaped
+// line in the noise. Exit 3 must stay exit 3.
+const RESTIC_STUB_READ_ERRORS = '#!/bin/sh\n' +
+    'printf \'{"message_type":"summary","snapshot_id":"deadbeef","files_new":1}\\n\'\n' +
+    'echo "couldn\'t fetch token - maybe it has expired?" >&2\n' +
+    'exit 3\n';
+
+function runWithStubRestic(repo, job, stub) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hangar-auth-'));
+    const bin = path.join(dir, 'bin');
+    try {
+        fs.mkdirSync(bin, { recursive: true });
+        fs.mkdirSync(path.join(dir, 'repos'), { recursive: true });
+        fs.mkdirSync(path.join(dir, 'jobs'), { recursive: true });
+        fs.writeFileSync(path.join(dir, 'repos', repo.id + '.json'), JSON.stringify(repo));
+        fs.writeFileSync(path.join(dir, 'jobs', job.id + '.json'), JSON.stringify(job));
+        fs.writeFileSync(path.join(bin, 'restic'), stub, { mode: 0o755 });
+
+        const r = require('node:child_process').spawnSync('python3', [HELPER, job.id], {
+            env: Object.assign({}, process.env, {
+                HANGAR_CONF_DIR: dir,
+                HANGAR_STATE_DIR: path.join(dir, 'state'),
+                CREDENTIALS_DIRECTORY: '',
+                PATH: bin + ':' + process.env.PATH
+            }),
+            encoding: 'utf8'
+        });
+        const statePath = path.join(dir, 'state', job.id + '.json');
+        return {
+            status: r.status,
+            stderr: r.stderr || '',
+            state: fs.existsSync(statePath) ? JSON.parse(fs.readFileSync(statePath, 'utf8')) : null
+        };
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+}
+
+test('an expired destination is recorded as AUTH_EXPIRED in the state file', () => {
+    // This is what makes the failure survivable: the UI can show an expired
+    // destination in the morning without re-running the backup to find out.
+    const job = Object.assign({}, SIMPLE_JOB, { id: 'nightly', repo: 'main' });
+    const r = runWithStubRestic(RCLONE_REPO, job, RESTIC_STUB_EXPIRED);
+
+    assert.ok(r.state, 'no state file was written for the failed run');
+    assert.equal(r.state.kind, 'AUTH_EXPIRED');
+    assert.equal(r.state.status, 'failed');
+    assert.equal(r.state.exit_code, 1);
+    assert.ok(!/Traceback/.test(r.stderr), 'the run raised:\n' + r.stderr);
+});
+
+test('the exit contract is preserved — an expired destination is still exit 2', () => {
+    // A recoverable failure is still a failure. The unit must fail, or nothing
+    // downstream (systemd, a monitoring check, an operator) ever notices.
+    const job = Object.assign({}, SIMPLE_JOB, { id: 'nightly', repo: 'main' });
+    const r = runWithStubRestic(RCLONE_REPO, job, RESTIC_STUB_EXPIRED);
+    assert.equal(r.status, 2);
+    // …and the journal says it in words, not only as a kind.
+    assert.match(r.stderr, /authorisation has expired/);
+    assert.match(r.stderr, /"kind": "AUTH_EXPIRED"/);
+});
+
+test('a quota refusal with the same exit code is NOT recorded as expired', () => {
+    // The false positive that matters: it would send the operator to re-authorise
+    // a destination that authenticated perfectly, and hide the real cause.
+    const job = Object.assign({}, SIMPLE_JOB, { id: 'nightly', repo: 'main' });
+    const r = runWithStubRestic(RCLONE_REPO, job, RESTIC_STUB_QUOTA);
+    assert.equal(r.status, 2);
+    assert.equal(r.state.kind, 'GENERIC');
+    assert.equal(/AUTH_EXPIRED/.test(r.stderr), false);
+});
+
+test('a written snapshot stays a success even with an expiry-shaped line in the noise', () => {
+    // restic exit 3 WROTE the snapshot. Reclassifying it as a fatal expiry would
+    // report a backup that happened as one that did not — the one direction of
+    // error that costs the most trust.
+    const job = { id: 'partial', repo: 'main', retention: null,
+        sources: [{ kind: 'filesystem', paths: ['/etc'] }] };
+    const r = runWithStubRestic(RCLONE_REPO, job, RESTIC_STUB_READ_ERRORS);
+    assert.equal(r.status, 0);
+    assert.equal(r.state.status, 'partial');
+    assert.equal(r.state.kind, 'READ_ERRORS');
+    assert.equal(r.state.snapshot, 'deadbeef');
+});
+
+// --- the two implementations of the signal must not drift -------------------
+//
+// hangar-run duplicates isAuthExpired from js/core/rclone.js because it has to
+// run with no Cockpit session and no node present. Duplication is only safe if
+// it is policed, so this drives both over the same table — including the whole
+// false-positive half, which is the half that costs a user a pointless
+// re-authorisation if the two ever disagree.
+
+const SIGNAL_CASES = [
+    // Expiry, as rclone and the providers really word it.
+    ["couldn't fetch token - maybe it has expired?", true],
+    ['refresh with "rclone config reconnect gdrive:"', true],
+    ['oauth2: token expired and refresh token is not set', true],
+    ['{"error":"invalid_grant","error_description":"Token has been expired or revoked."}', true],
+    ['AADSTS700082: The refresh token has expired due to inactivity.', true],
+    ['Refresh token has expired', true],
+    ['{"error_summary":"expired_access_token/..."}', true],
+    ['401 Unauthorized: the bearer token is no longer accepted', true],
+    ['googleapi: Error 401: Expected OAuth 2 access token, ..., unauthorized', true],
+    ['INVALID_GRANT', true],
+    // Not expiry. Every one of these has a different remedy.
+    ['401 Unauthorized', false],
+    ['403 Forbidden', false],
+    ['403 Forbidden: The user does not have permission to access this folder', false],
+    ['403: User Rate Limit Exceeded, userRateLimitExceeded', false],
+    ['Failed to copy: 403 storageQuotaExceeded', false],
+    ['error listing: permission denied', false],
+    ['AccessDenied: Access Denied, status code: 403', false],
+    ['dial tcp 142.250.0.1:443: i/o timeout', false],
+    ['connection refused', false],
+    ['no such host', false],
+    ['Fatal: wrong password or no key found', false],
+    ['write /srv/repo/data/ab: no space left on device', false],
+    ['NOTICE: using token from the config file', false],
+    ['', false],
+    // Per-line pairing: a quota refusal and a token mention are not one fact.
+    ['ERROR : db.sql: Failed to copy: 403 Forbidden: storageQuotaExceeded\n' +
+        'NOTICE: using token from the config file', false]
+];
+
+function pythonAnswers(fn, inputs) {
+    const script = [
+        'import importlib.util, json, sys',
+        'from importlib.machinery import SourceFileLoader',
+        'loader = SourceFileLoader("hangar_run", sys.argv[1])',
+        'spec = importlib.util.spec_from_loader("hangar_run", loader)',
+        'mod = importlib.util.module_from_spec(spec)',
+        'loader.exec_module(mod)',
+        'data = json.load(sys.stdin)',
+        'print(json.dumps([getattr(mod, sys.argv[2])(*args) for args in data]))'
+    ].join('\n');
+    return JSON.parse(execFileSync('python3', ['-c', script, HELPER, fn], {
+        input: JSON.stringify(inputs), encoding: 'utf8'
+    }));
+}
+
+test('hangar-run agrees with js/core/rclone.js on every expiry signal', () => {
+    const answers = pythonAnswers('auth_expired', SIGNAL_CASES.map(([t]) => [t]));
+    SIGNAL_CASES.forEach(([text, expected], i) => {
+        assert.equal(Rclone.isAuthExpired(text), expected,
+            'javascript disagrees with the table: ' + JSON.stringify(text));
+        assert.equal(answers[i], expected,
+            'python disagrees with the table: ' + JSON.stringify(text));
+    });
+});
+
+test('hangar-run agrees with js/engine/restic.js on which kind a run gets', () => {
+    // Not just the signal — the gate around it. Only GENERIC and UNKNOWN may be
+    // refined; 0/3/130 must never be, and 10/11/12 carry restic's own answer.
+    const codes = [0, 1, 2, 3, 10, 11, 12, 130, 99];
+    const expiry = "couldn't fetch token - maybe it has expired?";
+    const quota = '403: User Rate Limit Exceeded, userRateLimitExceeded';
+    const pairs = [];
+    codes.forEach((c) => { pairs.push([c, expiry]); pairs.push([c, quota]); });
+
+    const answers = pythonAnswers('classify_run', pairs);
+    pairs.forEach(([code, text], i) => {
+        assert.equal(answers[i], Restic.classifyExit(code, text).kind,
+            'python and javascript disagree for exit ' + code + ' / ' + JSON.stringify(text));
+    });
+    // And the specific claim, spelled out rather than left to the loop.
+    assert.equal(answers[pairs.findIndex(([c, t]) => c === 1 && t === expiry)], 'AUTH_EXPIRED');
+    assert.equal(answers[pairs.findIndex(([c, t]) => c === 3 && t === expiry)], 'READ_ERRORS');
+    assert.equal(answers[pairs.findIndex(([c, t]) => c === 1 && t === quota)], 'GENERIC');
+});

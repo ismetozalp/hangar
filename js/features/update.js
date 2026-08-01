@@ -104,10 +104,15 @@
             updatePhase: PHASE.IDLE,
             updateLog: [],
             installedVersion: '',
+            // Remembered so the badge can distinguish "not checked yet" from
+            // "checked, nothing new" — without it a click looks like a no-op.
+            checkedAt: 0,
+            updateRepo: '',
             _inFlight: false,
 
             async initUpdate(settings) {
                 this.installedVersion = await this.readInstalledVersion();
+                this.updateRepo = (settings && settings.updateRepo) || '';
                 // settings must be forwarded: checkForUpdate reads the repository from
                 // it, and without it the check silently resolves to "no repository
                 // configured" instead of contacting GitHub.
@@ -233,8 +238,44 @@
             updateBadgeLabel() {
                 if (this.update.checking) return 'Checking…';
                 if (this.update.error) return 'Update check failed';
-                if (this.update.available) return 'Update to ' + this.update.version;
+                if (this.update.available) return '↑ Update to ' + this.update.version;
+                // Confirming "no update" matters as much as announcing one: without
+                // it, clicking Check looks like nothing happened.
+                if (this.checkedAt && this.installedVersion) return 'v' + this.installedVersion + ' — up to date';
                 return this.installedVersion ? 'v' + this.installedVersion : '';
+            },
+
+            // The badge is one control with two jobs, the way explorer's is: it
+            // checks when there is nothing to install, and installs when there is.
+            // A separate "check" button would sit unused ~99% of the time.
+            badgeTitle() {
+                if (this.update.checking) return 'Checking for updates…';
+                if (this.update.error) return 'Update check failed: ' + this.update.error + ' — click to try again';
+                if (this.update.available)
+                    return 'Version ' + this.update.version + ' is available — click to install';
+                if (!this.updateRepo) return 'Set a GitHub repository in Settings to check for updates';
+                if (this.checkedAt) return 'No update found. Click to check again.';
+                return 'Click to check for updates';
+            },
+
+            badgeClass() {
+                if (this.update.available) return 'hangar-badge-update available';
+                if (this.update.error) return 'hangar-badge-update failed';
+                return 'hangar-badge-update';
+            },
+
+            // Routes the single click. Deliberately does NOT install directly the way
+            // explorer does — hangar's update runs `make install` as root, so it goes
+            // through the confirm modal rather than starting on one click.
+            async onBadgeClick(settings) {
+                if (this.update.checking || this._inFlight) return false;
+                if (this.update.available) return this.openUpdateModal();
+                await this.checkForUpdate(true, settings || { updateRepo: this.updateRepo });
+                this.checkedAt = Date.now();
+                // The "up to date" confirmation is a response to a click, not a
+                // permanent claim: a repository can gain a release a minute later.
+                if (root.setTimeout) root.setTimeout(() => { this.checkedAt = 0; }, 20000);
+                return true;
             }
         };
     }

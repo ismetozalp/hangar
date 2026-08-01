@@ -427,6 +427,7 @@
         'init':            'Initialise repository',
         'list-unreadable': 'Show unreadable files',
         'free-space':      'Show what is using the space',
+        'reauthorize':     'Sign in to the destination again',
         'retry':           'Try again'
     };
 

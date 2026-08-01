@@ -320,6 +320,11 @@
         'init': 'Initialise repository',
         'list-unreadable': 'Show unreadable files',
         'free-space': 'I freed some space — retry',
+        // Reachable here only because the table is shared with core/errors.js; a
+        // package install has no cloud destination to re-authorise. Labelled all
+        // the same, so a kind that gains this remediation can never ship a
+        // button with no words on it.
+        'reauthorize': 'Sign in again',
         'retry': 'Retry'
     };
 

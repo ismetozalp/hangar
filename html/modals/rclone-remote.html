@@ -4,6 +4,12 @@
      answers with 'hangar:rclone-remote-created' — the same contract as the shared
      confirm/password dialogs, so neither screen reaches into the other's scope.
 
+     The SAME event with `reauthorize: '<remote>'` opens it in repair mode: one
+     step, the same paste box, aimed at a remote that already exists. It answers
+     with 'hangar:rclone-remote-reconnected'. There is deliberately no second
+     dialog for that — a duplicated OAuth step is a duplicated place for the
+     token handling to drift.
+
      Nothing about a provider is hardcoded here. The groups, the fields, which
      field is masked and which providers need the headless OAuth dance all come
      from HangarRclone.PROVIDERS by way of HangarRcloneUi's pure helpers. Adding a
@@ -19,12 +25,15 @@
 
             <div class="modal-header">
                 <div>
-                    <h5 class="modal-title" id="hangar-rclone-title">Add a cloud destination</h5>
+                    <h5 class="modal-title" id="hangar-rclone-title" x-text="title()">Add a cloud destination</h5>
                     <!-- aria-live so moving between steps is announced: the heading
                          is the only thing that changes, and it changes in place. -->
                     <div class="small text-secondary" role="status" aria-live="polite">
-                        <span x-text="'Step ' + stepNumber() + ' of ' + stepCount()"></span>
-                        <span aria-hidden="true">·</span>
+                        <!-- "Step 1 of 1" is noise, not progress: repair mode has
+                             one step by design. -->
+                        <span x-show="!reconnecting()"
+                              x-text="'Step ' + stepNumber() + ' of ' + stepCount()"></span>
+                        <span x-show="!reconnecting()" aria-hidden="true">·</span>
                         <span x-text="stepTitle()"></span>
                     </div>
                 </div>
@@ -45,6 +54,16 @@
                         <button type="button" class="btn btn-sm btn-primary mt-2"
                                 @click="installRclone()"
                                 x-text="missingMessage().actionLabel"></button>
+                    </div>
+                </template>
+
+                <!-- Repair mode opens by agreeing with the user about what broke.
+                     They did not come here to add a destination — something
+                     stopped working, and the dialog has to say so first. -->
+                <template x-if="reconnecting() && !at('done')">
+                    <div class="alert alert-warning" role="status">
+                        <strong>This destination's sign-in has expired.</strong>
+                        <div class="small mt-1" x-text="intro()"></div>
                     </div>
                 </template>
 
@@ -134,58 +153,72 @@
                      paste the result back. -->
                 <template x-if="at('authorize')">
                     <div>
-                        <!-- The client-ID advice sits with the client-ID field, not
-                             in a footnote: for Google Drive this is the difference
-                             between a backup that finishes and one that crawls. -->
-                        <template x-if="advice()">
-                            <div class="alert py-2 px-3"
-                                 :class="advice().severity === 'warning' ? 'alert-warning' : 'alert-secondary'"
-                                 role="note">
-                                <strong x-text="advice().title"></strong>
-                                <div class="small mt-1" x-text="advice().text"></div>
-                            </div>
-                        </template>
+                        <!-- Repair mode asks for none of this: the client id, the
+                             secret and the scope are already in rclone's config and
+                             are still correct. Only the token died. Re-showing them
+                             empty invites someone to blank a working setting. -->
+                        <template x-if="!reconnecting()">
+                            <div>
+                                <!-- The client-ID advice sits with the client-ID field, not
+                                     in a footnote: for Google Drive this is the difference
+                                     between a backup that finishes and one that crawls. -->
+                                <template x-if="advice()">
+                                    <div class="alert py-2 px-3"
+                                         :class="advice().severity === 'warning' ? 'alert-warning' : 'alert-secondary'"
+                                         role="note">
+                                        <strong x-text="advice().title"></strong>
+                                        <div class="small mt-1" x-text="advice().text"></div>
+                                    </div>
+                                </template>
 
-                        <template x-for="f in fields()" :key="f.key">
-                            <div class="mb-3">
-                                <label class="form-label" :for="f.domId">
-                                    <span x-text="f.label"></span>
-                                    <span x-show="!f.required" class="text-secondary small">(optional)</span>
-                                </label>
+                                <template x-for="f in fields()" :key="f.key">
+                                    <div class="mb-3">
+                                        <label class="form-label" :for="f.domId">
+                                            <span x-text="f.label"></span>
+                                            <span x-show="!f.required" class="text-secondary small">(optional)</span>
+                                        </label>
 
-                                <template x-if="f.control === 'select'">
-                                    <select class="form-select" :id="f.domId" x-model="values[f.key]"
-                                            :aria-describedby="f.help ? f.domId + '-help' : null">
-                                        <option value="">Not set</option>
-                                        <template x-for="o in f.options" :key="o.value">
-                                            <option :value="o.value" x-text="o.label"></option>
+                                        <template x-if="f.control === 'select'">
+                                            <select class="form-select" :id="f.domId" x-model="values[f.key]"
+                                                    :aria-describedby="f.help ? f.domId + '-help' : null">
+                                                <option value="">Not set</option>
+                                                <template x-for="o in f.options" :key="o.value">
+                                                    <option :value="o.value" x-text="o.label"></option>
+                                                </template>
+                                            </select>
                                         </template>
-                                    </select>
+
+                                        <template x-if="f.control !== 'select'">
+                                            <input class="form-control"
+                                                   :id="f.domId"
+                                                   :type="f.inputType"
+                                                   :placeholder="f.placeholder"
+                                                   :required="f.required"
+                                                   :autocomplete="f.autocomplete"
+                                                   spellcheck="false"
+                                                   x-model="values[f.key]"
+                                                   :aria-describedby="f.help ? f.domId + '-help' : null">
+                                        </template>
+
+                                        <div x-show="f.help" class="form-text" :id="f.domId + '-help'"
+                                             x-text="f.help"></div>
+                                    </div>
                                 </template>
 
-                                <template x-if="f.control !== 'select'">
-                                    <input class="form-control"
-                                           :id="f.domId"
-                                           :type="f.inputType"
-                                           :placeholder="f.placeholder"
-                                           :required="f.required"
-                                           :autocomplete="f.autocomplete"
-                                           spellcheck="false"
-                                           x-model="values[f.key]"
-                                           :aria-describedby="f.help ? f.domId + '-help' : null">
-                                </template>
-
-                                <div x-show="f.help" class="form-text" :id="f.domId + '-help'"
-                                     x-text="f.help"></div>
+                                <hr>
                             </div>
                         </template>
-
-                        <hr>
 
                         <h6 class="mb-1">Authorise on your own computer</h6>
                         <!-- Cause and effect. Without the reason, "run it over there"
                              reads as an arbitrary hoop and gets skipped. -->
                         <p class="small text-secondary" x-text="whyHeadless()"></p>
+
+                        <!-- Anyone who has met this failure before has found
+                             `rclone config reconnect` and will ask why hangar does
+                             not just run it. Answering beats looking evasive. -->
+                        <p class="small text-secondary" x-show="reconnecting()"
+                           x-text="whyNotReconnect()"></p>
 
                         <ol class="mb-3">
                             <template x-for="s in authorizeSteps()" :key="s.n">
@@ -243,6 +276,31 @@
                     </div>
                 </template>
 
+                <!-- REPAIR, the provider hangar cannot finish for you ------
+                     Jottacloud has no `rclone authorize` hook at all — running it
+                     answers "not supported by this backend" — so there is no token
+                     to paste and no command hangar can print that would produce
+                     one. Showing the paste box here would be offering a flow that
+                     cannot complete, which costs more than saying so plainly. -->
+                <template x-if="at('instructions')">
+                    <div>
+                        <p class="small" x-text="instructions().reason"></p>
+                        <ol class="small">
+                            <template x-for="(s, i) in instructions().steps" :key="i">
+                                <li class="mb-1" x-text="s"></li>
+                            </template>
+                        </ol>
+                        <div class="d-flex align-items-center gap-2">
+                            <code class="hangar-rawlog flex-grow-1 mb-0"
+                                  x-text="instructions().command"></code>
+                        </div>
+                        <p class="small text-secondary mt-2 mb-0">
+                            Then come back and test the repository — the destination and its
+                            backups are untouched by any of this.
+                        </p>
+                    </div>
+                </template>
+
                 <!-- STEP 3 — name it --------------------------------------- -->
                 <template x-if="at('name')">
                     <div>
@@ -263,8 +321,13 @@
                 <!-- Done ---------------------------------------------------- -->
                 <template x-if="at('done')">
                     <div class="alert alert-success mb-0" role="status">
-                        <strong>Destination added.</strong>
+                        <strong x-text="doneTitle()"></strong>
                         <div class="small mt-1" x-text="successMessage()"></div>
+                        <!-- The re-test. "It should work now" is exactly the
+                             sentence that sends someone away to discover at 03:00
+                             that it does not, so the repository is asked. -->
+                        <div class="small mt-2" x-show="verifyText()" role="status"
+                             aria-live="polite" :class="verifyClass()" x-text="verifyText()"></div>
                     </div>
                 </template>
 
@@ -288,17 +351,26 @@
             </div>
 
             <div class="modal-footer">
-                <button type="button" class="btn btn-outline-secondary" x-show="!at('provider') && !at('done')"
+                <!-- Repair mode has one step, so there is nowhere to go Back to and
+                     no Continue that would mean anything. -->
+                <button type="button" class="btn btn-outline-secondary"
+                        x-show="!at('provider') && !at('done') && !reconnecting()"
                         @click="back()">Back</button>
                 <button type="button" class="btn btn-secondary" data-bs-dismiss="modal"
                         x-show="!at('done')" @click="close()">Cancel</button>
                 <button type="button" class="btn btn-primary"
-                        x-show="at('details') || at('authorize')"
+                        x-show="(at('details') || at('authorize')) && !reconnecting()"
                         @click="next()">Continue</button>
                 <button type="button" class="btn btn-primary"
                         x-show="at('name')" :disabled="!canCreate()"
                         @click="submit()"
                         x-text="busy ? 'Creating…' : 'Create destination'"></button>
+                <!-- The repair. Same paste, same token handling; only the
+                     destination of the token differs. -->
+                <button type="button" class="btn btn-primary"
+                        x-show="reconnecting() && at('authorize')" :disabled="!canReconnect()"
+                        @click="submit()"
+                        x-text="busy ? 'Signing in…' : 'Reconnect'"></button>
                 <button type="button" class="btn btn-primary" data-bs-dismiss="modal"
                         x-show="at('done')" @click="close()">Done</button>
             </div>

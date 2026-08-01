@@ -20,6 +20,13 @@
         CANCELLED: 'CANCELLED',
         NO_SPACE: 'NO_SPACE',
         NETWORK: 'NETWORK',
+        // A cloud destination whose OAuth authorisation has lapsed: the refresh
+        // token expired, was revoked, or (Box) timed out after 60 days of
+        // inactivity. Deliberately its own kind rather than a flavour of NETWORK
+        // or GENERIC, because it is the only failure here that a user can fix
+        // completely in two minutes — and because retrying it, which is what
+        // NETWORK invites, will fail every night until someone re-authorises.
+        AUTH_EXPIRED: 'AUTH_EXPIRED',
         UNKNOWN: 'UNKNOWN'
     };
 
@@ -35,7 +42,13 @@
         [KIND.REPO_MISSING]: 'init',
         [KIND.READ_ERRORS]: 'list-unreadable',
         [KIND.NO_SPACE]: 'free-space',
-        [KIND.NETWORK]: 'retry'
+        [KIND.NETWORK]: 'retry',
+        // AUTH_EXPIRED is fatal — the backup did not happen — but it is the most
+        // recoverable failure hangar has, so the remediation carries more weight
+        // than the severity: the user signs in again and the next run works.
+        // Note this is NOT 'retry': re-running a backup against a destination
+        // whose token has expired fails identically, every night, in silence.
+        [KIND.AUTH_EXPIRED]: 'reauthorize'
     };
 
     function create(kind, message, detail) {

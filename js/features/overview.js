@@ -24,6 +24,10 @@
     const Secrets = need('HangarSecrets', '../core/secrets.js');
     const Logbook = need('HangarLogbook', '../core/logbook.js');
     const Restic = need('HangarRestic', '../engine/restic.js');
+    // Only for what a cloud destination IS: which remote a repository writes
+    // through, which provider that remote is, and whether that provider declares
+    // an expiry rule of its own. No provider fact is restated in this file.
+    const Rclone = need('HangarRclone', '../core/rclone.js');
 
     // ------------------------------------------------------------------ status
 
@@ -82,6 +86,7 @@
         WRONG_PASSWORD: 'The stored repository password was rejected.',
         NO_SPACE: 'The backup destination is out of space.',
         NETWORK: 'The repository could not be reached.',
+        AUTH_EXPIRED: 'The cloud destination\'s sign-in has expired.',
         CANCELLED: 'The last run was cancelled.',
         UNKNOWN: 'The backup did not complete.'
     };
@@ -92,6 +97,9 @@
         init: 'Initialise repository',
         'list-unreadable': 'Show unreadable files',
         'free-space': 'Show space used',
+        // Not 'Try again'. The next run fails identically until someone signs
+        // in again, and offering a retry is what lets that repeat unnoticed.
+        reauthorize: 'Sign in again',
         retry: 'Try again'
     };
 
@@ -111,7 +119,17 @@
     // button this screen has, and must not become one by accident.
     function normRemediation(r) { return has(REMEDIATION_LABEL, r) ? r : null; }
 
-    function expands(r) { return r === 'list-unreadable' || r === 'free-space'; }
+    // The remediations whose button opens the panel under the row instead of
+    // running something.
+    //
+    // 'reauthorize' used to be one of them, back when this screen could only
+    // describe the fix. It is not any more: the button opens the same wizard the
+    // destination was created in, aimed at the remote that expired. Telling
+    // someone where to go to fix a thing, on a screen that could take them
+    // there, is how a failure survives another night.
+    function expands(r) {
+        return r === 'list-unreadable' || r === 'free-space';
+    }
 
     function statusClass(status) { return lookup(DOT_CLASS, status, ''); }
     function statusBadgeClass(status) { return lookup(BADGE_CLASS, status, 'text-bg-secondary'); }
@@ -437,6 +455,13 @@
     function expansionFor(row) {
         const r = obj(row) || {};
         const files = Array.isArray(r.unreadableFiles) ? r.unreadableFiles : [];
+        if (r.remediation === 'reauthorize')
+            return {
+                kind: 'auth', files: [], more: 0,
+                text: 'The cloud destination stopped accepting this server\'s sign-in, so nothing '
+                    + 'was backed up. "Sign in again" reopens the sign-in for that destination; '
+                    + 'the backups resume on the next run.'
+            };
         if (r.remediation === 'free-space')
             return {
                 kind: 'space', files: [], more: 0,
@@ -790,6 +815,7 @@
                 switch (normRemediation(row.remediation)) {
                 case 'list-unreadable':
                 case 'free-space':
+                case 'reauthorize':
                     this.toggle(row.id);
                     return;
                 case 'unlock':

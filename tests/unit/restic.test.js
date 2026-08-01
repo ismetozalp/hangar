@@ -1881,3 +1881,179 @@ test('run: the rejection carries the raw stderr for verbatim display', async () 
         });
     });
 });
+
+// ============================== classifyExit: an expired cloud destination
+//
+// restic SPAWNS rclone as a subprocess for an `rclone:` repository, so rclone's
+// authorisation error arrives inside RESTIC's stderr — never as an exit code of
+// its own, because restic collapses every backend failure into 1. This is the
+// detection point that matters: a check that only looked at direct rclone
+// invocations would miss every scheduled backup, which is to say every failure
+// nobody is watching when it happens.
+//
+// The strings are the ones rclone and the providers really produce, spelled out
+// by hand rather than captured; the ones marked as counter-examples are what an
+// ordinary permission or quota failure looks like, and must stay GENERIC.
+
+// A whole run's stderr as it arrives from cockpit: restic's own prose, the
+// rclone subprocess's line inside it, and restic's JSON exit_error at the end.
+const EXPIRED_STDERR = [
+    '2026/07/31 03:00:12 ERROR : backups/db: Failed to copy: failed to open source object: ' +
+        'couldn\'t fetch token - maybe it has expired? - refresh with "rclone config reconnect gdrive:"',
+    'Fatal: unable to save snapshot: Save(<data/0a1b2c>) returned error',
+    '{"message_type":"exit_error","code":1,"message":"backup failed"}'
+].join('\n');
+
+test('classifyExit: exit 1 whose stderr carries rclone\'s expiry becomes AUTH_EXPIRED', () => {
+    // The single most important assertion in this file: this is how a 03:00
+    // scheduled failure becomes a button the user can press in the morning.
+    const e = R.classifyExit(1, EXPIRED_STDERR);
+    assert.equal(e.kind, Errors.KIND.AUTH_EXPIRED);
+    assert.equal(e.remediation, 'reauthorize');
+    assert.equal(e.fatal, true, 'the backup did not happen — this is fatal');
+});
+
+test('classifyExit: every provider\'s expiry wording reaches the same kind', () => {
+    [
+        'oauth2: token expired and refresh token is not set',
+        '{"error":"invalid_grant","error_description":"Token has been expired or revoked."}',
+        'Error "invalid_grant" (): AADSTS700082: The refresh token has expired due to inactivity.',
+        '{"error_summary":"expired_access_token/..."}',
+        'Failed to list: couldn\'t fetch token - maybe it has expired?',
+        'refresh with "rclone config reconnect box:"'
+    ].forEach((s) => assert.equal(R.classifyExit(1, s).kind, Errors.KIND.AUTH_EXPIRED, 'missed: ' + s));
+});
+
+test('classifyExit: AUTH_EXPIRED says it plainly and keeps restic\'s text in detail', () => {
+    // "invalid_grant" is not a sentence anyone can act on, and it is what restic
+    // would otherwise put in front of the user as the failure's message.
+    const stderr = '{"message_type":"exit_error","code":1,"message":"invalid_grant"}';
+    const e = R.classifyExit(1, stderr);
+    assert.equal(e.kind, Errors.KIND.AUTH_EXPIRED);
+    assert.match(e.message, /authorised again/);
+    assert.equal(e.message.includes('invalid_grant'), false);
+    // Nothing is lost: the raw text is still there for the log and the detail view.
+    assert.equal(e.detail.stderr, stderr);
+    assert.equal(e.detail.exitError.message, 'invalid_grant');
+    assert.equal(e.detail.code, 1);
+});
+
+test('classifyExit: a missing exit status still classifies from the message', () => {
+    // A channel that dies without an exit status is exactly when the text is all
+    // there is — and UNKNOWN offers no remediation at all, so this is a strict
+    // improvement over the status quo rather than a reclassification.
+    const e = R.classifyExit(null, 'oauth2: cannot fetch token: token expired');
+    assert.equal(e.kind, Errors.KIND.AUTH_EXPIRED);
+    assert.equal(e.detail.code, null);
+    assert.equal(R.classifyExit(undefined, 'invalid_grant').kind, Errors.KIND.AUTH_EXPIRED);
+    assert.equal(R.classifyExit('not-a-number', 'invalid_grant').kind, Errors.KIND.AUTH_EXPIRED);
+});
+
+test('classifyExit: expiry beats the network guess for the same exit 1', () => {
+    // Both signals in one stderr, which is the common case — the HTTP call that
+    // failed is reported next to the reason it failed. NETWORK's remediation is
+    // 'retry', and retrying an expired token fails identically every night.
+    const stderr = 'Get "https://www.googleapis.com/drive/v3/files": ' +
+        'oauth2: cannot fetch token: 400 Bad Request\nResponse: {"error":"invalid_grant"}';
+    const e = R.classifyExit(1, stderr);
+    assert.equal(e.kind, Errors.KIND.AUTH_EXPIRED);
+    assert.equal(e.remediation, 'reauthorize');
+});
+
+test('classifyExit: every existing exit-code mapping is untouched', () => {
+    // The table is restic's own contract and this change must not have moved any
+    // of it. Checked against a stderr that WOULD classify as expiry on its own.
+    const expiry = 'invalid_grant: Token has been expired or revoked.';
+    assert.equal(R.classifyExit(0, expiry).kind, Errors.KIND.OK);
+    assert.equal(R.classifyExit(2, expiry).kind, Errors.KIND.GO_RUNTIME);
+    assert.equal(R.classifyExit(3, expiry).kind, Errors.KIND.READ_ERRORS);
+    assert.equal(R.classifyExit(10, expiry).kind, Errors.KIND.REPO_MISSING);
+    assert.equal(R.classifyExit(11, expiry).kind, Errors.KIND.REPO_LOCKED);
+    assert.equal(R.classifyExit(12, expiry).kind, Errors.KIND.WRONG_PASSWORD);
+    assert.equal(R.classifyExit(130, expiry).kind, Errors.KIND.CANCELLED);
+    // The EXIT_KINDS table itself is unchanged.
+    assert.deepEqual(R.EXIT_KINDS, {
+        0: Errors.KIND.OK, 1: Errors.KIND.GENERIC, 2: Errors.KIND.GO_RUNTIME,
+        3: Errors.KIND.READ_ERRORS, 10: Errors.KIND.REPO_MISSING,
+        11: Errors.KIND.REPO_LOCKED, 12: Errors.KIND.WRONG_PASSWORD,
+        130: Errors.KIND.CANCELLED
+    });
+});
+
+test('classifyExit: exit 3 stays a written snapshot, whatever the text says', () => {
+    // The one that would cost the most trust. Exit 3 WROTE the snapshot; turning
+    // it into a fatal failure because rclone grumbled about a token would report
+    // a backup that happened as a backup that did not.
+    const e = R.classifyExit(3, EXPIRED_STDERR);
+    assert.equal(e.kind, Errors.KIND.READ_ERRORS);
+    assert.equal(e.fatal, false);
+    assert.equal(e.remediation, 'list-unreadable');
+});
+
+test('classifyExit: a cancelled run is never reported as an expired sign-in', () => {
+    const e = R.classifyExit(130, EXPIRED_STDERR);
+    assert.equal(e.kind, Errors.KIND.CANCELLED);
+    assert.equal(e.fatal, false);
+});
+
+test('classifyExit: ordinary permission and quota failures stay GENERIC', () => {
+    // The false-positive direction. Each of these is a real failure with a real
+    // cause, and re-authorising fixes none of them — but it does hide them.
+    [
+        '403 Forbidden: The user does not have permission to access this folder',
+        '403: User Rate Limit Exceeded, userRateLimitExceeded',
+        '401 Unauthorized',
+        'AccessDenied: Access Denied, status code: 403',
+        'error listing: permission denied'
+    ].forEach((s) => assert.equal(R.classifyExit(1, s).kind, Errors.KIND.GENERIC, 'misread: ' + s));
+});
+
+test('classifyExit: no space and network still win their own exit-1 texts', () => {
+    assert.equal(R.classifyExit(1, 'write /srv/repo/data/ab: no space left on device').kind,
+        Errors.KIND.NO_SPACE);
+    assert.equal(R.classifyExit(1, 'dial tcp 10.0.0.9:8000: i/o timeout').kind, Errors.KIND.NETWORK);
+    assert.equal(R.classifyExit(1, 'ssh: connect to host nas.lan port 22: No route to host').kind,
+        Errors.KIND.NETWORK);
+});
+
+test('classifyExit: AUTH_EXPIRED has a message even with an empty stderr shape', () => {
+    // MESSAGES must cover the new kind, or the error would carry `undefined`
+    // where the UI reads its headline.
+    assert.ok(R.MESSAGES[Errors.KIND.AUTH_EXPIRED]);
+    assert.ok(R.MESSAGES[Errors.KIND.AUTH_EXPIRED].length > 0);
+    assert.ok(R.classifyExit(1, 'invalid_grant').message.length > 0);
+});
+
+test('classifyExit: hostile stderr shapes cannot throw on the expiry path', () => {
+    [null, undefined, 0, false, [], {}, NULL_PROTO, THROWING].forEach((v) => {
+        let e;
+        assert.doesNotThrow(() => { e = R.classifyExit(1, v); }, 'threw on ' + typeof v);
+        assert.ok(Errors.isHangarError(e));
+    });
+});
+
+test('run: an expired destination rejects with a reauthorize button, not a retry', async () => {
+    // End to end through the impure layer, because this is the shape cockpit
+    // hands back: the stderr arrives as the rejection's `message`.
+    await withCockpit(() => rejectingProc({ exit_status: 1, message: EXPIRED_STDERR }), async () => {
+        await assert.rejects(R.run('backup', { repoUrl: 'rclone:gdrive:backups', paths: ['/etc'] }), (e) => {
+            assert.equal(e.kind, Errors.KIND.AUTH_EXPIRED);
+            assert.equal(e.remediation, 'reauthorize');
+            assert.equal(e.detail.stderr, EXPIRED_STDERR);
+            return true;
+        });
+    });
+});
+
+test('the expiry signal is the rclone module\'s, not a second copy of it', () => {
+    // Two regex tables that must agree is a bug waiting for the day they do not.
+    // restic.js asks core/rclone.js, and the false-positive matrix lives there.
+    const src = fs.readFileSync(path.join(__dirname, '..', '..', 'js', 'engine', 'restic.js'), 'utf8');
+    assert.ok(src.includes("require('../core/rclone.js')"));
+    assert.ok(src.includes('isAuthExpired'));
+    // Comments stripped first: the one above rcloneAuthExpired quotes the strings
+    // to explain the split, and would otherwise flag itself.
+    const code = src.split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
+    assert.equal(/invalid_grant|fetch token/.test(code), false,
+        'restic.js grew its own copy of the strings');
+});

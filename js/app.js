@@ -193,12 +193,107 @@
     }
 
     function hangarPassword() {
+        const Passgen = root.HangarPassgen ||
+            (typeof require === 'function' ? require('./core/passgen.js') : null);
+
         return {
             title: 'Repository password',
             repoLabel: '',
             password: '', confirm: '', reveal: false,
             confirming: false, error: '',
             _resolve: null,
+
+            // --- generator ------------------------------------------------
+            // A restic repository password is UNRECOVERABLE, so the dialog that
+            // creates one has to do two things: make a strong password easy to
+            // get, and make it impossible to close without noticing it must be
+            // stored. Everything below serves that second half as much as the first.
+            generated: false,
+            copied: false,
+            // 'memorable' by default: the one time this password is guaranteed to
+            // be typed by hand is at a rescue console during a bare-metal recovery,
+            // and words survive an unfamiliar keyboard layout far better than
+            // symbols do.
+            genMode: 'memorable',            // 'memorable' | 'random'
+            genPattern: Passgen ? Passgen.DEFAULT_PATTERN : 'strong',
+            genLength: Passgen ? Passgen.DEFAULT_LENGTH : 24,
+            genAlphabet: Passgen ? Passgen.DEFAULT_ALPHABET : 'safe',
+            genError: '',
+
+            canGenerate() { return !!(Passgen && Passgen.hasSecureRandom()); },
+            alphabets() { return Passgen ? Passgen.alphabets() : []; },
+            patterns() { return Passgen ? Passgen.patterns() : []; },
+
+            // One accessor for both modes, so the meter and the warning below it
+            // never disagree with what pressing Generate would actually produce.
+            strength() {
+                if (!Passgen) return null;
+                return this.genMode === 'memorable'
+                    ? Passgen.describePassphrase({ pattern: this.genPattern })
+                    : Passgen.describe({ length: this.genLength, alphabet: this.genAlphabet });
+            },
+
+            // Shown next to the shape picker so the trade-off is visible BEFORE the
+            // click, not discovered from a meter afterwards. A memorable password
+            // costs entropy; hiding that would be the dishonest part of offering one.
+            weakChoice() {
+                const s = this.strength();
+                return !!s && (s.strength === 'weak' || s.strength === 'fair');
+            },
+
+            // Shown grouped, because an unbroken 24-character run is where
+            // transcription errors come from. The VALUE is never grouped.
+            displayPassword() {
+                if (!this.password) return '';
+                if (!this.generated || !Passgen) return this.password;
+                // A memorable password carries its own separators; only the random
+                // one needs grouping to be readable.
+                if (this.genMode === 'memorable') return this.password;
+                return Passgen.group(this.password, Passgen.GROUP_SIZE);
+            },
+
+            generatePassword() {
+                this.genError = '';
+                this.copied = false;
+                if (!Passgen) { this.genError = 'The password generator is unavailable.'; return false; }
+                try {
+                    const value = this.genMode === 'memorable'
+                        ? Passgen.generatePassphrase({ pattern: this.genPattern })
+                        : Passgen.generate({ length: this.genLength, alphabet: this.genAlphabet });
+                    this.password = value;
+                    // Both fields, deliberately: the confirmation exists to catch a
+                    // typo, and there is no typo to catch in a value the user never
+                    // typed. Making them retype 24 random characters would only
+                    // invite them to shorten it.
+                    this.confirm = value;
+                    this.generated = true;
+                    this.reveal = true;      // a password you cannot see is one you cannot save
+                    this.error = '';
+                    return true;
+                } catch (e) {
+                    // hasSecureRandom() is checked before the button is offered, so
+                    // this is the browser withdrawing crypto mid-session. Refusing is
+                    // right: a weak password the user believes is strong is worse
+                    // than no generator.
+                    this.genError = (e && e.message) || 'Could not generate a password.';
+                    return false;
+                }
+            },
+
+            async copyPassword() {
+                this.copied = false;
+                if (!this.password) return false;
+                try {
+                    const nav = root.navigator;
+                    if (nav && nav.clipboard && typeof nav.clipboard.writeText === 'function') {
+                        await nav.clipboard.writeText(this.password);
+                        this.copied = true;
+                        return true;
+                    }
+                } catch (e) { /* fall through: the value is on screen to select */ }
+                this.genError = 'Could not copy automatically — select the password and copy it.';
+                return false;
+            },
 
             init() {
                 root.addEventListener('hangar:password', (ev) => {
@@ -210,6 +305,9 @@
                     this.password = '';
                     this.confirm = '';
                     this.reveal = false;
+                    this.generated = false;
+                    this.copied = false;
+                    this.genError = '';
                     this._resolve = o.resolve || null;
                     showModal('hangar-password');
                 });
@@ -233,6 +331,8 @@
                 // core/secrets.js is the only thing allowed to hold it.
                 this.password = '';
                 this.confirm = '';
+                this.generated = false;
+                this.copied = false;
                 this.error = '';
                 hideModal('hangar-password');
                 if (this._resolve) this._resolve(value);

@@ -61,6 +61,84 @@ KIND_BY_CODE = {
     EXIT_CANCELLED: "CANCELLED",
 }
 
+# ---- a cloud destination whose authorisation has lapsed ---------------------
+#
+# restic SPAWNS rclone for an `rclone:` repository, so rclone's authorisation
+# error arrives inside RESTIC's stderr. There is no exit code for it — restic
+# collapses every backend failure into 1 — which makes the text the only signal
+# there is. And this is precisely the failure that happens unattended: Box
+# expires a refresh token after 60 days of inactivity, Google revokes one, a
+# tenant policy retires another. Without this the nightly unit fails at 03:00
+# with a message nobody reads, forever.
+#
+# Deliberately a copy of isAuthExpired in js/core/rclone.js rather than a call
+# into it: this helper must run with no Cockpit session and no node present.
+# tests/integration/hangar-run.test.js holds the two implementations together.
+#
+# The judgement that matters is the same one: a bare "401 Unauthorized" or
+# "403 Forbidden" is NOT expiry — it is also what an ordinary permission
+# problem looks like — so a status code only counts alongside a token signal.
+AUTH_EXPIRED_RES = [
+    re.compile(p, re.IGNORECASE) for p in (
+        r"couldn.?t\s+fetch\s+token",            # rclone: "…maybe it has expired?"
+        r"config\s+reconnect",                   # rclone naming its own remedy
+        r"invalid_grant",                        # Google/Box refresh-token refusal
+        r"\btokens?\b[^\n]{0,48}\b(expired|revoked)\b",
+        r"\b(expired|revoked)\b[^\n]{0,24}\btokens?\b",
+        r"refresh[ _-]?tokens?\b[^\n]{0,32}\b(is\s+not\s+set|not\s+set|missing)\b",
+    )
+]
+
+AMBIGUOUS_AUTH_RE = re.compile(
+    r"(\b40[13]\b|\bunauthoriz(?:ed|ation)\b|\bforbidden\b|access[ _]denied"
+    r"|permission[ _]denied|authentication\s+failed)", re.IGNORECASE)
+
+AUTH_SIGNAL_RE = re.compile(
+    r"(\boauth2?\b|\btokens?\b|\bbearer\b|invalid_grant|grant_type|\bre-?authoriz\w*)",
+    re.IGNORECASE)
+
+# Kinds whose classification is only a guess, and so may be improved by reading
+# the text. 10/11/12 carry restic's own authoritative answer; 0/3/130 must never
+# be reclassified, because exit 3 WROTE the snapshot.
+REFINABLE_KINDS = ("GENERIC", "UNKNOWN")
+
+
+def _line_is_expiry(line):
+    if any(rx.search(line) for rx in AUTH_EXPIRED_RES):
+        return True
+    return bool(AMBIGUOUS_AUTH_RE.search(line) and AUTH_SIGNAL_RE.search(line))
+
+
+def auth_expired(text):
+    """True when this stderr says the destination's sign-in has expired.
+
+    Pairing is per LINE: a stderr tail can carry a quota refusal in one line and
+    the word "token" forty lines later, and joining those two would be exactly
+    the false positive worth avoiding — a wrong "your login expired" sends the
+    operator through a pointless re-authorisation and hides the real cause.
+
+    Each line is also tried with its underscores opened out, because '_' is a
+    word character: r"\\btoken\\b" does not match inside Dropbox's
+    "expired_access_token", which is the API code for precisely this failure.
+    """
+    for line in (text or "").splitlines():
+        if not line:
+            continue
+        if _line_is_expiry(line):
+            return True
+        if "_" in line and _line_is_expiry(re.sub(r"_+", " ", line)):
+            return True
+    return False
+
+
+def classify_run(code, stderr_text):
+    """restic's exit code, refined by its stderr. Mirrors classifyExit in js/engine/restic.js."""
+    kind = KIND_BY_CODE.get(code, "UNKNOWN")
+    if kind in REFINABLE_KINDS and auth_expired(stderr_text):
+        return "AUTH_EXPIRED"
+    return kind
+
+
 # ---- source-kind vocabulary -------------------------------------------------
 #
 # These mirror js/core/sources-container.js and js/core/sources-libvirt.js. The
@@ -933,6 +1011,11 @@ def install_signal_handlers():
 def stream_restic(argv, env, label):
     """Run restic, folding its JSON-lines stream into a final summary.
 
+    Returns (exit code, summary, errors, stderr text). The stderr text is handed
+    back rather than only logged because it is the sole evidence for failures
+    restic has no exit code for — an expired cloud authorisation being the one
+    that otherwise repeats silently every night.
+
     Unknown message types are passed over rather than treated as errors: restic adds
     new ones between releases and a backup must not fail because we did not
     recognise a progress message.
@@ -950,7 +1033,7 @@ def stream_restic(argv, env, label):
         # traceback out of here would be reported as a crash instead of a
         # failure with a reason.
         log("error", "could not start restic", label=label, error=str(e))
-        return 1, None, []
+        return 1, None, [], ""
     summary, errors, last_report = None, [], 0.0
 
     try:
@@ -1016,7 +1099,7 @@ def stream_restic(argv, env, label):
             log("error", "restic exit_error",
                 code=emsg.get("code"), error=emsg.get("message"))
 
-    return code, summary, errors
+    return code, summary, errors, stderr_text
 
 
 def write_state(job_id, record):
@@ -1085,17 +1168,17 @@ def main(argv):
     interrupted = None
     try:
         run_pre_steps(plan["pre"], env)
-        code, summary, errors = stream_restic(plan["backup"], env, "backup")
+        code, summary, errors, stderr_text = stream_restic(plan["backup"], env, "backup")
     except Interrupted as e:
         # Folded into restic's own "cancelled" code rather than a new exit status:
         # a run stopped by an operator is the same outcome however it was stopped,
         # and the UI already knows what CANCELLED means.
         interrupted = e
-        code, summary, errors = EXIT_CANCELLED, None, []
+        code, summary, errors, stderr_text = EXIT_CANCELLED, None, [], ""
     finally:
         post_failures = run_post_steps(plan["post"], env)
 
-    kind = KIND_BY_CODE.get(code, "UNKNOWN")
+    kind = classify_run(code, stderr_text)
 
     if code not in (0, EXIT_READ_ERRORS):
         write_state(job_id, {
@@ -1108,6 +1191,14 @@ def main(argv):
             # is the kind of wrong report that teaches people to ignore the log.
             die(2, "backup was interrupted", exit_code=code, kind=kind,
                 signal=interrupted.signum, post_failures=post_failures)
+        if kind == "AUTH_EXPIRED":
+            # The state file above is what the UI reads in the morning, and it
+            # carries the kind — so the destination shows as needing a new
+            # sign-in without anyone re-running the backup to find out. The exit
+            # status stays 2: this IS a failed backup, and the unit must fail.
+            die(2, "the cloud destination's authorisation has expired — "
+                   "re-authorise it in hangar and the next run will work",
+                exit_code=code, kind=kind)
         die(2, "backup failed", exit_code=code, kind=kind)
 
     status = "partial" if code == EXIT_READ_ERRORS else "ok"
@@ -1127,10 +1218,14 @@ def main(argv):
     }
 
     if plan["forget"]:
-        fcode, _fsummary, _ferrors = stream_restic(plan["forget"], env, "forget")
+        fcode, _fsummary, _ferrors, fstderr = stream_restic(plan["forget"], env, "forget")
         if fcode != 0:
             record["status"] = "prune-failed"
             record["prune_exit_code"] = fcode
+            # The backup itself succeeded, so record["kind"] stays what the backup
+            # was. The prune's own kind is recorded beside it: an authorisation
+            # that lapsed between the two calls is still worth a button.
+            record["prune_kind"] = classify_run(fcode, fstderr)
             write_state(job_id, record)
             run_hook("post", hooks.get("post"), env)
             die(3, "retention/prune failed after a successful backup", exit_code=fcode)

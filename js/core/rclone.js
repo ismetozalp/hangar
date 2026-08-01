@@ -179,6 +179,12 @@ const AUTH = { OAUTH: 'oauth', CREDENTIALS: 'credentials', EXTERNAL: 'external',
                 { key: 'client_secret', label: 'Client secret', type: 'password', required: false,
                   placeholder: '', help: OAUTH_HELP }
             ],
+            // The same sentence as `notes`, in a form a program can act on. It is
+            // here and not in the UI because it is a fact about Box, and the UI
+            // layer repeats nothing about a provider. A destination that is never
+            // written to expires on its own, so a purely reactive design finds out
+            // by failing — see expiryPolicy() below.
+            inactivityDays: 60,
             notes: 'Box expires its refresh token after 60 days of inactivity — a repository that is ' +
                 'never written to will eventually need re-authorising.'
         },
@@ -669,6 +675,29 @@ const AUTH = { OAUTH: 'oauth', CREDENTIALS: 'credentials', EXTERNAL: 'external',
         };
     }
 
+    // A provider's own rule about when an authorisation dies WITHOUT anyone doing
+    // anything wrong. Only Box declares one today (60 days of inactivity), and it
+    // is the case a reactive design serves worst: a repository nobody writes to
+    // expires quietly, and the first sign is a failed backup weeks later.
+    //
+    // Null for every provider that has no such rule — the caller must be able to
+    // tell "no deadline" from "a deadline I have not reached", and a default of
+    // some invented number would produce warnings about nothing.
+    function expiryPolicy(providerId) {
+        const p = providerFor(providerId);
+        if (!p) return null;
+        const days = prop(p, 'inactivityDays');
+        if (typeof days !== 'number' || !isFinite(days) || days <= 0) return null;
+        return {
+            provider: p.id,
+            label: p.label,
+            inactivityDays: days,
+            // Said as the provider's rule, not as hangar's opinion.
+            reason: p.label + ' expires its refresh token after ' + days +
+                ' days of inactivity.'
+        };
+    }
+
     function describeProvider(id) {
         const p = providerFor(id);
         if (!p) return 'Unknown destination.';
@@ -913,12 +942,176 @@ const AUTH = { OAUTH: 'oauth', CREDENTIALS: 'credentials', EXTERNAL: 'external',
         return null;
     }
 
+    // ------------------------------------------------- authorisation expiry
+    //
+    // An OAuth remote stops working long after it was set up: Google and Box
+    // revoke a refresh token, Box also expires one after 60 DAYS OF INACTIVITY,
+    // and a tenant policy can retire one on a schedule. The failure then arrives
+    // at 03:00 inside a systemd unit nobody is reading — which is exactly why it
+    // has to be recognisable from text alone.
+    //
+    // The strings below are the ones rclone and the providers actually produce,
+    // not invented ones:
+    //   couldn't fetch token - maybe it has expired?
+    //   refresh with "rclone config reconnect <remote>:"
+    //   oauth2: token expired and refresh token is not set
+    //   invalid_grant  (Google/Box, usually with "Token has been expired or revoked")
+    //   Refresh token has expired            (OneDrive: AADSTS700082)
+    //
+    // The whole design turns on ONE judgement: a bare "401 Unauthorized" or
+    // "403 Forbidden" is NOT expiry. Those are also what an ordinary permission
+    // problem, a revoked share, a quota rule or a wrong bucket policy looks like.
+    // Telling someone their sign-in expired when it did not sends them through a
+    // pointless re-authorisation AND hides the real cause — so a status code only
+    // counts when a token/oauth/grant signal stands beside it.
+
+    // Decisive on their own: no honest reading of any of these is anything but
+    // "this remote's authorisation is no longer usable".
+    const EXPIRED_RE = [
+        // "couldn't fetch token", with or without the apostrophe a terminal or a
+        // JSON encoder may have mangled.
+        /couldn.?t\s+fetch\s+token/i,
+        // rclone naming its own remedy. Nothing else in rclone's output says this.
+        /config\s+reconnect/i,
+        // The OAuth2 error code for a refresh token that is expired or revoked.
+        /invalid_grant/i,
+        // "token expired", "Token has been expired or revoked", "token was revoked".
+        /\btokens?\b[^\n]{0,48}\b(expired|revoked)\b/i,
+        // The other word order: "expired refresh token", "revoked access token".
+        /\b(expired|revoked)\b[^\n]{0,24}\btokens?\b/i,
+        // "oauth2: token expired and refresh token is not set" — a remote that was
+        // created without a refresh token cannot renew itself at all.
+        /refresh[ _-]?tokens?\b[^\n]{0,32}\b(is\s+not\s+set|not\s+set|missing)\b/i
+    ];
+
+    // Alone, each of these is ordinary permission trouble.
+    const AMBIGUOUS_RE =
+        /(\b40[13]\b|\bunauthoriz(?:ed|ation)\b|\bforbidden\b|access[ _]denied|permission[ _]denied|authentication\s+failed)/i;
+
+    // …and each of these turns one of the above into an authorisation problem
+    // specifically about the credential, rather than about what it may reach.
+    const AUTH_SIGNAL_RE =
+        /(\boauth2?\b|\btokens?\b|\bbearer\b|invalid_grant|grant_type|\bre-?authoriz\w*)/i;
+
+    // Said the way a person would say it. The provider's own wording is jargon
+    // ("invalid_grant"), and it is kept in the error's detail rather than shown.
+    const AUTH_EXPIRED_MESSAGE =
+        'This cloud destination needs to be authorised again — its sign-in has expired.';
+
+    // Underscore is a word character, so `\btoken\b` does not match inside
+    // Dropbox's `expired_access_token` — the API code for exactly this failure.
+    // Testing a copy with the underscores opened out is what catches the
+    // snake_case forms without loosening every pattern into something vaguer.
+    function loosen(line) {
+        return line.indexOf('_') < 0 ? null : line.replace(/_+/g, ' ');
+    }
+
+    function lineIsExpiry(line) {
+        for (let j = 0; j < EXPIRED_RE.length; j++)
+            if (EXPIRED_RE[j].test(line)) return true;
+        // Pairing is per LINE, not across the whole blob. A stderr tail can carry
+        // a quota refusal in one line and the word "token" forty lines later;
+        // joining those two would be the false positive this function exists to
+        // avoid.
+        return AMBIGUOUS_RE.test(line) && AUTH_SIGNAL_RE.test(line);
+    }
+
+    function isAuthExpired(text) {
+        const s = str(text);
+        if (s === '') return false;
+
+        const lines = s.split(/\r?\n/);
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+            if (line === '') continue;
+            if (lineIsExpiry(line)) return true;
+            const loose = loosen(line);
+            if (loose !== null && lineIsExpiry(loose)) return true;
+        }
+        return false;
+    }
+
+    // "rclone:gdrive:backups/x" -> "gdrive". Null for anything else, including a
+    // repository on another backend — the caller uses this to decide whether a
+    // re-authorisation button can even be offered.
+    function remoteNameFromRepoUrl(url) {
+        const s = str(url).trim();
+        if (!/^rclone:/i.test(s)) return null;
+        const rest = s.slice('rclone:'.length);
+        const cut = rest.indexOf(':');
+        // No second colon is a real shape, not a malformed one: hangar itself
+        // builds "rclone:remote" when the repository has no prefix.
+        const name = cut < 0 ? rest : rest.slice(0, cut);
+        if (name === '') return null;
+        // Same rule the name was created under. A "name" carrying a slash or a
+        // space is a path we misread, not a remote.
+        if (validateRemoteName(name).length) return null;
+        return name;
+    }
+
+    // Shown for the record, never run: `rclone config reconnect` re-enters the
+    // interactive OAuth flow and binds 127.0.0.1 on whichever machine runs it,
+    // and it asks questions on stdin that hangar has no way to answer. There is
+    // no non-interactive form. Recovery therefore goes the same way creation
+    // does — `rclone authorize` on the user's own computer, token pasted back.
+    function reconnectCommand(remoteName) {
+        const s = str(remoteName).trim();
+        // A command built from an unusable name is worse than no command: it
+        // would be pasted, and it would either fail or mean something else.
+        if (validateRemoteName(s).length) return null;
+        return 'rclone config reconnect ' + s + ':';
+    }
+
+    // The `type` of one section of an rclone config, or null. Pure so the parsing
+    // is tested without a config file — and so the caller can drop the rest of
+    // the text, which is full of obscured credentials, immediately.
+    function remoteTypeFromConfig(text, name) {
+        const want = str(name);
+        if (want === '') return null;
+
+        const lines = str(text).split(/\r?\n/);
+        let inSection = false;
+        for (let i = 0; i < lines.length; i++) {
+            const header = sectionHeader(lines[i]);
+            if (header !== null) {
+                // The next section began before a type appeared. Stop rather than
+                // read on: the following section's type belongs to another remote.
+                if (inSection) return null;
+                inSection = header === want;
+                continue;
+            }
+            if (!inSection) continue;
+            const m = /^\s*type\s*=\s*(.*)$/.exec(lines[i]);
+            if (m) {
+                const v = m[1].trim();
+                return v === '' ? null : v;      // first wins, as rclone's reader does
+            }
+        }
+        return null;
+    }
+
+    // rclone's backend name back to hangar's provider entry, so the UI knows
+    // which `rclone authorize` command to show — and whether one exists at all.
+    function providerForType(type) {
+        const want = str(type).trim();
+        if (want === '') return null;
+        for (let i = 0; i < PROVIDERS.length; i++)
+            if (PROVIDERS[i].type === want) return PROVIDERS[i];
+        return null;
+    }
+
     // ------------------------------------------------------------- errors
 
     // rclone reports failures as prose on stderr; there is no exit-code contract
     // like restic's, so the message is all there is to classify on.
     function classifyRcloneError(message, detail) {
         const text = str(message).trim();
+        // Before the "not installed" test on purpose: "Token not found" would
+        // otherwise be reported as a missing rclone binary, sending the user to
+        // install something they already have.
+        if (isAuthExpired(text))
+            return Errors.create(KIND.AUTH_EXPIRED,
+                AUTH_EXPIRED_MESSAGE, detail === undefined ? null : detail);
         if (/not\s+found|no\s+such\s+file|ENOENT|command\s+not\s+found/i.test(text))
             return Errors.create(KIND.GENERIC,
                 'rclone is not installed on this host.', detail === undefined ? null : detail);
@@ -1035,6 +1228,85 @@ const AUTH = { OAUTH: 'oauth', CREDENTIALS: 'credentials', EXTERNAL: 'external',
         });
     }
 
+    // Impure. Reads rclone's config file so the pure parsers above can pick one
+    // key out of it. The text this resolves with holds every remote's obscured
+    // credentials, so callers must extract what they need and let it go — it is
+    // never returned to a view, logged, or put in an error detail.
+    function readConfigText() {
+        if (!hasCockpit('file')) return Promise.reject(noCockpit('readConfigText'));
+        return run(configFileArgv()).then(function (out) {
+            const path = parseConfigFilePath(out);
+            if (!path)
+                throw Errors.create(KIND.GENERIC, 'Could not determine the rclone configuration path.',
+                    { output: str(out).slice(0, 200) });
+            const f = cockpit.file(path, { superuser: 'require' });
+            return Promise.resolve(f.read()).then(function (content) {
+                f.close();
+                return { path: path, text: (content === null || content === undefined) ? '' : str(content) };
+            }, function (e) {
+                f.close();
+                // The message only — never the content we failed to read.
+                throw classifyRcloneError(e && (e.message || e.problem), { path: path });
+            });
+        });
+    }
+
+    // Impure. Which hangar provider a configured remote is, so a re-authorisation
+    // can show the right `rclone authorize` command — or, for a backend rclone
+    // cannot authorize at all (Jottacloud), so the UI can say that instead of
+    // offering a flow that would error the moment it was pasted into a terminal.
+    //
+    // Resolves to null for a remote hangar has no provider entry for: an rclone
+    // config may legitimately contain backends the wizard never made.
+    function providerOfRemote(name) {
+        return Promise.resolve().then(function () {
+            const problems = validateRemoteName(name);
+            if (problems.length) fail(problems[0], { name: str(name), problems: problems });
+            if (!hasCockpit('spawn')) throw noCockpit('providerOfRemote');
+            return readConfigText().then(function (cfg) {
+                return providerForType(remoteTypeFromConfig(cfg.text, str(name)));
+            });
+        });
+    }
+
+    // Impure. Replaces ONLY the `token` line of one remote's section.
+    //
+    // This is the whole recovery: `rclone config reconnect` cannot run headless,
+    // so the user re-runs `rclone authorize "<type>"` on their own computer —
+    // the same journey the creation wizard already walks them through — and the
+    // new token is spliced in here. Everything else in the file is left byte for
+    // byte: the other remotes, this remote's client_id and scope, the comments,
+    // the blank lines. mergeConfigSection is what guarantees that, and it is
+    // reused rather than reimplemented precisely so there is one such guarantee.
+    //
+    // The token goes through writeSecrets, which delivers it by editing the
+    // config file. It never becomes an argv element — /proc/<pid>/cmdline is
+    // world-readable, and a token there is a published credential.
+    function updateRemoteToken(name, token) {
+        return Promise.resolve().then(function () {
+            const problems = validateRemoteName(name);
+            if (problems.length) fail(problems[0], { name: str(name), problems: problems });
+
+            // Not trimmed into the value: `str(token).trim()` is what gets written,
+            // so surrounding terminal whitespace cannot end up inside the credential.
+            const tok = str(token).trim();
+            // Details below name the remote, never the value — an error message is
+            // the most-copied text in the product.
+            if (tok === '')
+                fail('Paste the token that `rclone authorize` printed.', { name: str(name) });
+            if (INJECTION.test(tok))
+                fail('The pasted token must be a single line.', { name: str(name) });
+
+            if (!hasCockpit('spawn')) throw noCockpit('updateRemoteToken');
+            // obscure:false — rclone stores `token` as plain JSON, and "obscuring"
+            // it would produce a value rclone reveals into garbage.
+            return writeSecrets(str(name), [{ key: 'token', value: tok, obscure: false }])
+                .then(function () {
+                    return { name: str(name), updated: 'token' };   // never the token
+                });
+        });
+    }
+
     function deleteRemote(name) {
         return Promise.resolve().then(function () {
             const argv = configDeleteArgv(name);
@@ -1044,13 +1316,15 @@ const AUTH = { OAUTH: 'oauth', CREDENTIALS: 'credentials', EXTERNAL: 'external',
     }
 
     const HangarRclone = {
-        AUTH, PROVIDERS, externalSetup, MAX_NAME_LEN,
+        AUTH, PROVIDERS, externalSetup, expiryPolicy, MAX_NAME_LEN,
         providers, providerFor, isOAuth, isSecretField, fieldFor, describeProvider,
         validateRemoteName, validateFields,
         configCreateArgv, configDeleteArgv, configFileArgv, obscureArgv,
         authorizeCommand, parseAuthorizeOutput, looksLikeToken,
         mergeConfigSection, parseConfigFilePath, classifyRcloneError,
-        createRemote, deleteRemote
+        isAuthExpired, AUTH_EXPIRED_MESSAGE, remoteNameFromRepoUrl, reconnectCommand,
+        remoteTypeFromConfig, providerForType,
+        createRemote, deleteRemote, providerOfRemote, updateRemoteToken
     };
     root.HangarRclone = HangarRclone;
     if (typeof module !== 'undefined' && module.exports) module.exports = HangarRclone;

@@ -11,6 +11,32 @@
 
     const KIND = Errors.KIND;
 
+    // Looked up when it is needed rather than captured at load time. index.html
+    // loads core/rclone.js first, but a module that resolves a sibling at load
+    // time breaks the moment someone reorders those script tags — and this one
+    // must degrade to "no rclone knowledge", not to a TypeError on the failure
+    // path, which is the worst possible place to throw.
+    function rcloneModule() {
+        if (typeof require === 'function' && typeof module !== 'undefined' && module.exports) {
+            try {
+                return require('../core/rclone.js');
+            } catch (e) {
+                return null;
+            }
+        }
+        return root.HangarRclone || null;
+    }
+
+    // restic SPAWNS rclone as a subprocess for an `rclone:` repository, so when a
+    // cloud destination's authorisation expires, rclone's message arrives inside
+    // RESTIC's stderr and nowhere else. A check that only looked at direct rclone
+    // invocations would miss every scheduled backup — which is to say, every case
+    // that matters, because those are the ones nobody is watching.
+    function rcloneAuthExpired(text) {
+        const rc = rcloneModule();
+        return !!(rc && typeof rc.isAuthExpired === 'function' && rc.isAuthExpired(text));
+    }
+
     // ---------------------------------------------------------------- constants
 
     const OPS = [
@@ -50,6 +76,7 @@
         [KIND.CANCELLED]: 'Operation was cancelled',
         [KIND.NO_SPACE]: 'No space left on the backup destination',
         [KIND.NETWORK]: 'Could not reach the repository over the network',
+        [KIND.AUTH_EXPIRED]: 'This cloud destination needs to be authorised again — its sign-in has expired',
         [KIND.UNKNOWN]: 'restic exited with an unexpected status'
     };
 
@@ -131,12 +158,29 @@
             ? EXIT_KINDS[n]
             : KIND.UNKNOWN;
 
+        // Expiry is read from the message, never from a code: restic has no exit
+        // status for "the backend's credential lapsed" and collapses it into 1.
+        //
+        // Only GENERIC and UNKNOWN are eligible, and that restraint is the point.
+        // 10/11/12 carry restic's own authoritative answer, and 0/3/130 must never
+        // be reclassified at all — exit 3 WROTE the snapshot, and turning a written
+        // snapshot into a fatal failure because rclone grumbled about a token would
+        // be a lie in the direction that costs the most trust.
+        if (kind === KIND.GENERIC || kind === KIND.UNKNOWN) {
+            if (rcloneAuthExpired(text)) kind = KIND.AUTH_EXPIRED;
+        }
+
         if (kind === KIND.GENERIC) {
             if (NO_SPACE_RE.test(text)) kind = KIND.NO_SPACE;
             else if (NETWORK_RE.test(text)) kind = KIND.NETWORK;
         }
 
-        const message = (exitError && typeof exitError.message === 'string' && exitError.message.trim())
+        // AUTH_EXPIRED is the one kind whose own sentence beats restic's: what
+        // restic relays is rclone's jargon ("invalid_grant", "couldn't fetch
+        // token"), which tells the user nothing they can act on. The raw text is
+        // still carried in detail.stderr and detail.exitError for the log.
+        const message = (kind !== KIND.AUTH_EXPIRED &&
+            exitError && typeof exitError.message === 'string' && exitError.message.trim())
             ? exitError.message.trim()
             : MESSAGES[kind];
 
