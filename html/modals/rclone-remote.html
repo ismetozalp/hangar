@@ -1,0 +1,308 @@
+<!-- Add a cloud destination — creates an rclone remote without leaving hangar.
+
+     Opened by the 'hangar:rclone-remote' event from the repository editor, and it
+     answers with 'hangar:rclone-remote-created' — the same contract as the shared
+     confirm/password dialogs, so neither screen reaches into the other's scope.
+
+     Nothing about a provider is hardcoded here. The groups, the fields, which
+     field is masked and which providers need the headless OAuth dance all come
+     from HangarRclone.PROVIDERS by way of HangarRcloneUi's pure helpers. Adding a
+     provider to core/rclone.js makes it appear here, correctly, with no edit.
+
+     Step branches use x-if rather than x-show: a step is torn down when it is not
+     current, so a half-typed password never lingers in a hidden input. -->
+<div class="modal fade" id="hangar-rclone-remote" tabindex="-1"
+     aria-labelledby="hangar-rclone-title" aria-hidden="true"
+     x-data="hangarRcloneUi()" x-init="init()">
+    <div class="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable">
+        <div class="modal-content">
+
+            <div class="modal-header">
+                <div>
+                    <h5 class="modal-title" id="hangar-rclone-title">Add a cloud destination</h5>
+                    <!-- aria-live so moving between steps is announced: the heading
+                         is the only thing that changes, and it changes in place. -->
+                    <div class="small text-secondary" role="status" aria-live="polite">
+                        <span x-text="'Step ' + stepNumber() + ' of ' + stepCount()"></span>
+                        <span aria-hidden="true">·</span>
+                        <span x-text="stepTitle()"></span>
+                    </div>
+                </div>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"
+                        aria-label="Close" @click="close()"></button>
+            </div>
+
+            <div class="modal-body">
+
+                <!-- rclone absent ------------------------------------------
+                     restic runs rclone for every backup to this destination, so
+                     without it the remote would be created and then never work.
+                     hangar installs it rather than naming a package manager. -->
+                <template x-if="missing()">
+                    <div class="alert alert-warning" role="alert">
+                        <strong x-text="missingMessage().title"></strong>
+                        <div class="small mt-1" x-text="missingMessage().text"></div>
+                        <button type="button" class="btn btn-sm btn-primary mt-2"
+                                @click="installRclone()"
+                                x-text="missingMessage().actionLabel"></button>
+                    </div>
+                </template>
+
+                <!-- STEP 1 — choose a destination --------------------------
+                     Grouped by how you sign in, because that is the only thing
+                     that changes what the next five minutes look like. -->
+                <template x-if="at('provider')">
+                    <div>
+                        <p class="text-secondary small">
+                            Hangar will create an rclone remote for this service. Afterwards you can
+                            point a repository at it and back up to it like any other destination.
+                        </p>
+
+                        <template x-for="g in groups()" :key="g.id">
+                            <fieldset class="mb-4">
+                                <legend class="h6 mb-1" x-text="g.label"></legend>
+                                <p class="small text-secondary" x-text="g.hint"></p>
+                                <div class="list-group">
+                                    <template x-for="p in g.providers" :key="p.id">
+                                        <button type="button"
+                                                class="list-group-item list-group-item-action text-start"
+                                                @click="choose(p.id)"
+                                                :aria-label="'Choose ' + p.label">
+                                            <span class="fw-semibold" x-text="p.label"></span>
+                                            <span class="small text-secondary d-block" x-text="p.summary"></span>
+                                        </button>
+                                    </template>
+                                </div>
+                            </fieldset>
+                        </template>
+                    </div>
+                </template>
+
+                <!-- STEP 2a — credentials ---------------------------------
+                     Every field, its label, its help and — critically — whether it
+                     is masked come from the provider table. -->
+                <template x-if="at('details')">
+                    <div>
+                        <p class="text-secondary small">
+                            <span x-text="providerLabel()"></span> needs the following. Hangar stores
+                            them in rclone's own configuration file, which is readable by root only.
+                        </p>
+
+                        <template x-for="f in fields()" :key="f.key">
+                            <div class="mb-3">
+                                <label class="form-label" :for="f.domId">
+                                    <span x-text="f.label"></span>
+                                    <span x-show="!f.required" class="text-secondary small">(optional)</span>
+                                </label>
+
+                                <template x-if="f.control === 'select'">
+                                    <select class="form-select" :id="f.domId" x-model="values[f.key]"
+                                            :aria-describedby="f.help ? f.domId + '-help' : null">
+                                        <option value="">Not set</option>
+                                        <template x-for="o in f.options" :key="o.value">
+                                            <option :value="o.value" x-text="o.label"></option>
+                                        </template>
+                                    </select>
+                                </template>
+
+                                <template x-if="f.control !== 'select'">
+                                    <input class="form-control"
+                                           :id="f.domId"
+                                           :type="f.inputType"
+                                           :placeholder="f.placeholder"
+                                           :required="f.required"
+                                           :autocomplete="f.autocomplete"
+                                           spellcheck="false"
+                                           x-model="values[f.key]"
+                                           :aria-describedby="f.help ? f.domId + '-help' : null">
+                                </template>
+
+                                <div x-show="f.help" class="form-text" :id="f.domId + '-help'"
+                                     x-text="f.help"></div>
+                            </div>
+                        </template>
+
+                        <div x-show="note()" class="alert alert-secondary py-2 px-3 small mb-0">
+                            <span x-text="note()"></span>
+                        </div>
+                    </div>
+                </template>
+
+                <!-- STEP 2b — headless OAuth ------------------------------
+                     In the order the user actually performs it: register your own
+                     app if you want one, run the command where the browser is,
+                     paste the result back. -->
+                <template x-if="at('authorize')">
+                    <div>
+                        <!-- The client-ID advice sits with the client-ID field, not
+                             in a footnote: for Google Drive this is the difference
+                             between a backup that finishes and one that crawls. -->
+                        <template x-if="advice()">
+                            <div class="alert py-2 px-3"
+                                 :class="advice().severity === 'warning' ? 'alert-warning' : 'alert-secondary'"
+                                 role="note">
+                                <strong x-text="advice().title"></strong>
+                                <div class="small mt-1" x-text="advice().text"></div>
+                            </div>
+                        </template>
+
+                        <template x-for="f in fields()" :key="f.key">
+                            <div class="mb-3">
+                                <label class="form-label" :for="f.domId">
+                                    <span x-text="f.label"></span>
+                                    <span x-show="!f.required" class="text-secondary small">(optional)</span>
+                                </label>
+
+                                <template x-if="f.control === 'select'">
+                                    <select class="form-select" :id="f.domId" x-model="values[f.key]"
+                                            :aria-describedby="f.help ? f.domId + '-help' : null">
+                                        <option value="">Not set</option>
+                                        <template x-for="o in f.options" :key="o.value">
+                                            <option :value="o.value" x-text="o.label"></option>
+                                        </template>
+                                    </select>
+                                </template>
+
+                                <template x-if="f.control !== 'select'">
+                                    <input class="form-control"
+                                           :id="f.domId"
+                                           :type="f.inputType"
+                                           :placeholder="f.placeholder"
+                                           :required="f.required"
+                                           :autocomplete="f.autocomplete"
+                                           spellcheck="false"
+                                           x-model="values[f.key]"
+                                           :aria-describedby="f.help ? f.domId + '-help' : null">
+                                </template>
+
+                                <div x-show="f.help" class="form-text" :id="f.domId + '-help'"
+                                     x-text="f.help"></div>
+                            </div>
+                        </template>
+
+                        <hr>
+
+                        <h6 class="mb-1">Authorise on your own computer</h6>
+                        <!-- Cause and effect. Without the reason, "run it over there"
+                             reads as an arbitrary hoop and gets skipped. -->
+                        <p class="small text-secondary" x-text="whyHeadless()"></p>
+
+                        <ol class="mb-3">
+                            <template x-for="s in authorizeSteps()" :key="s.n">
+                                <li class="mb-2">
+                                    <div class="small" x-text="s.text"></div>
+                                    <template x-if="s.command">
+                                        <div class="d-flex align-items-center gap-2 mt-1">
+                                            <code class="hangar-rawlog flex-grow-1 mb-0"
+                                                  x-text="s.command"></code>
+                                            <button type="button" class="btn btn-sm btn-outline-secondary"
+                                                    @click="copyCommand()"
+                                                    :aria-label="'Copy the command: ' + s.command">Copy</button>
+                                        </div>
+                                    </template>
+                                </li>
+                            </template>
+                        </ol>
+                        <div x-show="copied" class="text-success small mb-2" role="status">
+                            Copied to the clipboard.
+                        </div>
+
+                        <!-- The paste box disappears once a token has been accepted:
+                             it is emptied the moment it parses, and re-showing an
+                             empty box next to "authorised" reads as a failure. -->
+                        <template x-if="!hasToken">
+                            <div class="mb-2">
+                                <label class="form-label" for="hangar-rclone-paste">
+                                    Paste the result here
+                                </label>
+                                <textarea id="hangar-rclone-paste" class="form-control hangar-mono"
+                                          rows="5" spellcheck="false" autocomplete="off"
+                                          x-model="paste"
+                                          placeholder="Paste the following into your remote machine ---&gt;&#10;…&#10;&lt;---End paste"
+                                          aria-describedby="hangar-rclone-paste-help"></textarea>
+                                <div id="hangar-rclone-paste-help" class="form-text">
+                                    The marker lines can stay in. Hangar keeps the token only long
+                                    enough to hand it to rclone, and never shows it again.
+                                </div>
+                                <button type="button" class="btn btn-sm btn-outline-primary mt-2"
+                                        @click="acceptPaste()">Use this token</button>
+                            </div>
+                        </template>
+
+                        <template x-if="hasToken">
+                            <div class="alert alert-success py-2 px-3 mb-0" role="status">
+                                <strong>Authorisation accepted.</strong>
+                                <div class="small">
+                                    The token is held only until the remote is created, and is not
+                                    displayed again.
+                                </div>
+                                <button type="button" class="btn btn-sm btn-outline-secondary mt-2"
+                                        @click="clearToken()">Paste a different one</button>
+                            </div>
+                        </template>
+                    </div>
+                </template>
+
+                <!-- STEP 3 — name it --------------------------------------- -->
+                <template x-if="at('name')">
+                    <div>
+                        <label class="form-label" for="hangar-rclone-name">Remote name</label>
+                        <input id="hangar-rclone-name" class="form-control hangar-mono"
+                               x-model="name" autocomplete="off" spellcheck="false"
+                               placeholder="gdrive" required
+                               aria-describedby="hangar-rclone-name-help">
+                        <div id="hangar-rclone-name-help" class="form-text">
+                            How this destination is referred to from now on. It becomes the first part
+                            of the repository address — <span class="hangar-mono">name:path/to/backups</span>.
+                            Letters, digits and <span class="hangar-mono">_ - . + @</span>; no colons,
+                            slashes or spaces.
+                        </div>
+                    </div>
+                </template>
+
+                <!-- Done ---------------------------------------------------- -->
+                <template x-if="at('done')">
+                    <div class="alert alert-success mb-0" role="status">
+                        <strong>Destination added.</strong>
+                        <div class="small mt-1" x-text="successMessage()"></div>
+                    </div>
+                </template>
+
+                <!-- Validation summary. role="alert" so a refused Continue is
+                     announced: the button stays put and nothing else moves. -->
+                <div x-show="problems.length" role="alert" class="alert alert-danger mt-3 mb-0">
+                    <strong>Fix the following:</strong>
+                    <ul class="mb-0 mt-1">
+                        <template x-for="p in problems" :key="p"><li x-text="p"></li></template>
+                    </ul>
+                </div>
+
+                <!-- A failure from rclone itself, redacted before it is shown. -->
+                <div x-show="alert" :class="alertClass(alert) + ' mt-3 mb-0'" role="alert">
+                    <strong x-show="alert && alert.context" x-text="alert && alert.context"></strong>
+                    <div x-text="alert && alert.message"></div>
+                    <pre x-show="alert && alert.detail" class="hangar-rawlog mt-2 mb-0"
+                         x-text="alert && alert.detail"></pre>
+                </div>
+
+            </div>
+
+            <div class="modal-footer">
+                <button type="button" class="btn btn-outline-secondary" x-show="!at('provider') && !at('done')"
+                        @click="back()">Back</button>
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal"
+                        x-show="!at('done')" @click="close()">Cancel</button>
+                <button type="button" class="btn btn-primary"
+                        x-show="at('details') || at('authorize')"
+                        @click="next()">Continue</button>
+                <button type="button" class="btn btn-primary"
+                        x-show="at('name')" :disabled="!canCreate()"
+                        @click="submit()"
+                        x-text="busy ? 'Creating…' : 'Create destination'"></button>
+                <button type="button" class="btn btn-primary" data-bs-dismiss="modal"
+                        x-show="at('done')" @click="close()">Done</button>
+            </div>
+
+        </div>
+    </div>
+</div>

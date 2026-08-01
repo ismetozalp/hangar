@@ -167,7 +167,7 @@ async function main() {
 
             await check('every modal partial was injected', async () => {
                 const ids = ['hangar-confirm', 'hangar-password', 'hangar-update',
-                    'hangar-repo-edit', 'hangar-job-edit', 'hangar-restore',
+                    'hangar-repo-edit', 'hangar-rclone-remote', 'hangar-job-edit', 'hangar-restore',
                     'hangar-provision', 'hangar-recovery'];
                 const found = await page.evaluate((wanted) =>
                     wanted.filter((id) => !!document.getElementById(id)), ids);

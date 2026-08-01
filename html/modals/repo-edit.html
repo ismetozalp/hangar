@@ -72,31 +72,46 @@
                                 <span x-show="!f.required" class="text-secondary small">(optional)</span>
                             </label>
 
-                            <!-- rclone remotes are read from this host's rclone config;
-                                 hangar never creates them. A free-text box is offered when
-                                 rclone is absent or has no remotes, so the form is still
-                                 completable on a host that will be configured later. -->
-                            <template x-if="f.type === 'select' && remotes.length">
-                                <select class="form-select" :id="'hangar-repo-f-' + f.name"
-                                        x-model="form[f.name]" :required="f.required">
-                                    <option value="">Choose a remote…</option>
-                                    <template x-for="r in remotes" :key="r">
-                                        <option :value="r" x-text="r"></option>
+                            <!-- rclone remotes are read from this host's rclone config.
+                                 A free-text box is offered when rclone is absent or has
+                                 no remotes, so the form is still completable on a host
+                                 that will be configured later — and the button beside it
+                                 opens the wizard that creates one without leaving hangar. -->
+                            <div class="d-flex align-items-start gap-2">
+                                <div class="flex-grow-1">
+                                    <template x-if="f.type === 'select' && remotes.length">
+                                        <select class="form-select" :id="'hangar-repo-f-' + f.name"
+                                                x-model="form[f.name]" :required="f.required">
+                                            <option value="">Choose a remote…</option>
+                                            <template x-for="r in remotes" :key="r">
+                                                <option :value="r" x-text="r"></option>
+                                            </template>
+                                        </select>
                                     </template>
-                                </select>
-                            </template>
 
-                            <template x-if="f.type !== 'select' || !remotes.length">
-                                <input class="form-control"
-                                       :id="'hangar-repo-f-' + f.name"
-                                       :type="f.secret ? 'password' : 'text'"
-                                       :placeholder="f.placeholder"
-                                       :required="f.required"
-                                       :autocomplete="f.secret ? 'new-password' : 'off'"
-                                       spellcheck="false"
-                                       x-model="form[f.name]"
-                                       :aria-describedby="f.help ? 'hangar-repo-h-' + f.name : null">
-                            </template>
+                                    <template x-if="f.type !== 'select' || !remotes.length">
+                                        <input class="form-control"
+                                               :id="'hangar-repo-f-' + f.name"
+                                               :type="f.secret ? 'password' : 'text'"
+                                               :placeholder="f.placeholder"
+                                               :required="f.required"
+                                               :autocomplete="f.secret ? 'new-password' : 'off'"
+                                               spellcheck="false"
+                                               x-model="form[f.name]"
+                                               :aria-describedby="f.help ? 'hangar-repo-h-' + f.name : null">
+                                    </template>
+                                </div>
+
+                                <!-- Only the rclone remote can be created from here;
+                                     every other field is a plain value. -->
+                                <template x-if="f.name === 'remote'">
+                                    <button type="button" class="btn btn-outline-primary text-nowrap"
+                                            @click="openRcloneWizard()"
+                                            aria-label="Add a cloud destination — create a new rclone remote">
+                                        Add a cloud destination
+                                    </button>
+                                </template>
+                            </div>
 
                             <div x-show="f.help" class="form-text" :id="'hangar-repo-h-' + f.name"
                                  x-text="f.help"></div>

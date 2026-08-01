@@ -5,6 +5,7 @@
     var PARTIALS = [
         'html/modals/confirm.html',
         'html/modals/repo-edit.html',
+        'html/modals/rclone-remote.html',
         'html/modals/job-edit.html',
         'html/modals/restore.html',
         'html/modals/provision.html',

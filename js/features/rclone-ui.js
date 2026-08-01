@@ -1,0 +1,844 @@
+// features/rclone-ui.js — the "add a cloud destination" wizard.
+//
+// core/rclone.js knows how to CREATE an rclone remote. This file is the only
+// thing that asks a human the questions, and it exists because the alternative
+// was a documentation sentence telling the user to leave hangar, find a shell,
+// and run `rclone config` — a text-mode wizard that asks thirty questions in an
+// order nobody can predict.
+//
+// Three things shape the design.
+//
+// 1. The provider table is core/rclone.js's PROVIDERS, and NOTHING here repeats
+//    it. Not the field list, not which field is a secret, not which providers
+//    are OAuth. A provider added there appears here with its fields, its help
+//    and its password masking already correct — because the one flag that keeps
+//    a value out of argv (`type: 'password'`) is read, never re-declared.
+//
+// 2. The two setup experiences genuinely differ, so the user sees that BEFORE
+//    choosing. Picking Dropbox commits you to running a command on your own
+//    laptop; picking WebDAV does not. Presenting sixteen logos in one flat grid
+//    would hide the only distinction that changes what the next five minutes
+//    look like.
+//
+// 3. The token is never rendered back. It is held in a closure variable inside
+//    the component factory rather than on the component object, so no template
+//    expression can reach it even by accident, and it is dropped the moment the
+//    remote exists. The pasted block is cleared from the textarea as soon as it
+//    parses, for the same reason: a secret on screen is a secret in a
+//    screenshot, in a screen share, and in the browser's form restore.
+//
+// Pure: the grouping, the step machine, the form descriptors, name suggestion
+// and every validation message. The component below is the only impure part,
+// and it touches cockpit only through HangarRclone and HangarProvision.
+'use strict';
+(function (root) {
+    // Browser: index.html has already put the core modules on the global. Node:
+    // require them, so the pure functions below are testable with no DOM.
+    const req = (typeof require !== 'undefined' && typeof module !== 'undefined' && module.exports)
+        ? require : null;
+
+    const Errors = root.HangarErrors || (req ? req('../core/errors.js') : null);
+    const Rclone = root.HangarRclone || (req ? req('../core/rclone.js') : null);
+    const Secrets = root.HangarSecrets || (req ? req('../core/secrets.js') : null);
+    const Prov = root.HangarProvision || (req ? req('../core/provision.js') : null);
+
+    // ------------------------------------------------------------------ pure
+
+    // The module's coercion boundary, so it has to be total: String() throws on a
+    // null-prototype object, and every function below assumes it got a string.
+    function str(v) {
+        if (v === null || v === undefined) return '';
+        try { return String(v); } catch (e) { return ''; }
+    }
+
+    function trimmed(v) {
+        return str(v).trim();
+    }
+
+    // Own-property only. A provider field called "constructor" would otherwise
+    // resolve to Object.prototype's and put a function body in a config value.
+    function own(table, key) {
+        return (table && typeof table === 'object' &&
+            Object.prototype.hasOwnProperty.call(table, key)) ? table[key] : undefined;
+    }
+
+    // Events. The wizard is opened by an event and reports back with one, exactly
+    // like the shared confirm/password dialogs — so the repository editor never
+    // reaches into this component's scope, and vice versa.
+    const EVENT_OPEN = 'hangar:rclone-remote';
+    const EVENT_CREATED = 'hangar:rclone-remote-created';
+    const EVENT_PROVISION = 'hangar:provision';
+
+    // What hangar asks its own provisioner to install when rclone is absent. The
+    // wizard never names a package manager — that is provision.js's job across
+    // six distro families.
+    const PROVISION_TOOLS = ['rclone'];
+
+    const MODAL_ID = 'hangar-rclone-remote';
+
+    // --- provider grouping -------------------------------------------------
+    //
+    // Grouped by AUTH, not by popularity: the group is a promise about what the
+    // next screen will ask for. "You will sign in in a browser, on your own
+    // machine" versus "you will type a password here" is the single fact that
+    // decides whether a user can finish right now.
+
+    const GROUPS = [
+        {
+            id: 'oauth',
+            label: 'Sign in with your account',
+            hint: 'You approve hangar once in a browser. The browser is on your own computer and ' +
+                'not on this server, so there is one command to run there — hangar shows it, and ' +
+                'you paste the result back.'
+        },
+        {
+            id: 'credentials',
+            label: 'Sign in with a key, a username or a password',
+            hint: 'Everything is typed here. Nothing has to be run on your own computer.'
+        }
+    ];
+
+    // Total: this is called while rendering, and a card that cannot be built is a
+    // card that is not shown — never a render that dies and takes the whole
+    // wizard's markup with it.
+    function providerCard(p) {
+        if (!p || typeof p !== 'object') return null;
+        try {
+            return {
+                id: p.id,
+                label: p.label,
+                type: p.type,
+                auth: p.auth,
+                oauth: p.auth === Rclone.AUTH.OAUTH,
+                summary: Rclone.describeProvider(p.id)
+            };
+        } catch (e) {
+            return null;
+        }
+    }
+
+    // Every group carries its providers in table order. A group with no providers
+    // is dropped rather than rendered empty — an empty heading reads as a bug.
+    function providerGroups() {
+        const all = Rclone.providers();
+        return GROUPS.map(function (g) {
+            return {
+                id: g.id,
+                label: g.label,
+                hint: g.hint,
+                providers: all.filter(function (p) { return p && p.auth === g.id; })
+                    .map(providerCard).filter(function (c) { return c !== null; })
+            };
+        }).filter(function (g) { return g.providers.length > 0; });
+    }
+
+    function groupIdFor(providerId) {
+        const p = Rclone.providerFor(providerId);
+        if (!p) return '';
+        return p.auth === Rclone.AUTH.OAUTH ? 'oauth' : 'credentials';
+    }
+
+    // --- the step machine --------------------------------------------------
+    //
+    // 'done' is deliberately outside the numbered steps: it is the outcome, not a
+    // thing the user has to do, and counting it would make the progress read
+    // "step 3 of 4" while the remote already exists.
+
+    const STEP_LABEL = {
+        provider: 'Choose a destination',
+        details: 'Enter the credentials',
+        authorize: 'Authorise on your own computer',
+        name: 'Name the remote',
+        done: 'Ready'
+    };
+
+    function stepLabel(step) {
+        return own(STEP_LABEL, str(step)) || '';
+    }
+
+    // Which middle step a provider gets is the ONLY branch in the wizard, and it
+    // is derived from the table rather than from a list of provider ids here.
+    function stepsFor(providerId) {
+        if (!Rclone.providerFor(providerId)) return ['provider'];
+        return ['provider', Rclone.isOAuth(providerId) ? 'authorize' : 'details', 'name'];
+    }
+
+    function stepIndex(providerId, step) {
+        return stepsFor(providerId).indexOf(str(step));
+    }
+
+    function nextStep(providerId, step) {
+        const steps = stepsFor(providerId);
+        const i = steps.indexOf(str(step));
+        if (i < 0 || i >= steps.length - 1) return null;
+        return steps[i + 1];
+    }
+
+    function prevStep(providerId, step) {
+        const steps = stepsFor(providerId);
+        const i = steps.indexOf(str(step));
+        if (i <= 0) return null;
+        return steps[i - 1];
+    }
+
+    // --- form descriptors --------------------------------------------------
+
+    // A render-ready copy of the provider's fields. The PROVIDERS table is deeply
+    // frozen, so these have to be new objects — and building them here is also
+    // where `type: 'password'` becomes `inputType: 'password'`, in one place,
+    // rather than as a conditional repeated in the markup.
+    function formFieldsFor(providerId) {
+        const p = Rclone.providerFor(providerId);
+        if (!p) return [];
+        return p.fields.map(function (f) {
+            const secret = Rclone.isSecretField(f);
+            return {
+                key: f.key,
+                label: f.label,
+                required: !!f.required,
+                placeholder: str(f.placeholder),
+                help: str(f.help),
+                secret: secret,
+                // 'select' keeps its own control; everything else is an <input>
+                // whose type is the masking decision, taken from the table.
+                control: f.type === 'select' ? 'select' : 'input',
+                inputType: secret ? 'password' : 'text',
+                // A browser that autofills a saved password into a field that
+                // creates a NEW remote would silently store the wrong credential.
+                autocomplete: secret ? 'new-password' : 'off',
+                options: Array.isArray(f.options)
+                    ? f.options.map(function (o) { return { value: o.value, label: o.label }; })
+                    : [],
+                domId: 'hangar-rclone-f-' + f.key
+            };
+        });
+    }
+
+    // Flat, all-strings: Alpine's x-model wants a stable key set, and a missing
+    // key silently becomes `undefined` in the markup.
+    function blankValues(providerId) {
+        const out = {};
+        formFieldsFor(providerId).forEach(function (f) { out[f.key] = ''; });
+        return out;
+    }
+
+    // Which keys must be wiped once the remote exists. Derived, so a new secret
+    // field is forgotten correctly by declaring it in the table, not by
+    // remembering to add it to a list here.
+    function secretKeys(providerId) {
+        return formFieldsFor(providerId).filter(function (f) { return f.secret; })
+            .map(function (f) { return f.key; });
+    }
+
+    // Called on the success path, after the remote already exists. A frozen or
+    // otherwise unwritable values object must not turn "your remote is ready"
+    // into an error alert, so the wipe of each key is independent and total —
+    // one key that refuses to clear does not stop the others.
+    function clearSecrets(providerId, values) {
+        const v = (values && typeof values === 'object') ? values : {};
+        secretKeys(providerId).forEach(function (k) {
+            try {
+                if (Object.prototype.hasOwnProperty.call(v, k)) v[k] = '';
+            } catch (e) { /* a sealed or read-only key: keep wiping the rest */ }
+        });
+        return v;
+    }
+
+    function fieldProblems(providerId, values) {
+        return Rclone.validateFields(providerId, values);
+    }
+
+    // --- naming ------------------------------------------------------------
+
+    // A duplicate name is not a validation nicety: `rclone config create` on an
+    // existing name overwrites that remote's configuration, which would break a
+    // repository that is already backing up somewhere.
+    function nameProblems(name, existing) {
+        // Trimmed first: the wizard creates the remote under the trimmed name, so
+        // validating the untrimmed one would reject a paste artefact the user
+        // cannot see and that hangar was going to discard anyway.
+        const wanted = trimmed(name);
+        const problems = Rclone.validateRemoteName(wanted);
+        const taken = (Array.isArray(existing) ? existing : []).map(trimmed);
+        if (wanted !== '' && taken.indexOf(wanted) >= 0)
+            problems.push('A remote called ' + wanted + ' already exists on this host. ' +
+                'Choose another name — creating it again would overwrite the existing one.');
+        return problems;
+    }
+
+    // The provider id is already a legal remote name and is what the user just
+    // clicked, so it is the least surprising default. Suffixed rather than
+    // rejected when taken, so the common "a second Drive account" case is one
+    // keystroke instead of an error message.
+    function suggestName(providerId, existing) {
+        const p = Rclone.providerFor(providerId);
+        if (!p) return '';
+        const taken = (Array.isArray(existing) ? existing : []).map(trimmed);
+        if (taken.indexOf(p.id) < 0) return p.id;
+        for (let i = 2; i < 100; i++) {
+            const candidate = p.id + '-' + i;
+            if (taken.indexOf(candidate) < 0) return candidate;
+        }
+        return '';
+    }
+
+    // --- the headless OAuth story -----------------------------------------
+
+    function authorizeCommandFor(providerId) {
+        try {
+            return Rclone.authorizeCommand(providerId);
+        } catch (e) {
+            // Unknown provider. The caller renders nothing rather than a command
+            // that would fail when pasted.
+            return '';
+        }
+    }
+
+    // The one paragraph that decides whether this flow makes sense to the user.
+    // Written as cause and effect, because "run it on your machine" without the
+    // reason reads as an arbitrary hoop and gets skipped.
+    const WHY_HEADLESS =
+        'Signing in opens a consent page in a browser, and when you approve it the service sends ' +
+        'the answer back to 127.0.0.1 — the machine that started the sign-in. Started here, the ' +
+        'answer would go to this server\'s own 127.0.0.1, which your browser cannot reach. So the ' +
+        'command runs on the computer you are sitting at, and you bring the result back.';
+
+    function whyHeadless() {
+        return WHY_HEADLESS;
+    }
+
+    // The three things the user does, in the order they do them. Kept as data so
+    // the markup cannot renumber them and the test can assert the order.
+    function authorizeSteps(providerId) {
+        const cmd = authorizeCommandFor(providerId);
+        if (cmd === '') return [];
+        return [
+            {
+                n: 1,
+                text: 'On your own computer — the one with the browser — run this in a terminal. ' +
+                    'rclone has to be installed there too.',
+                command: cmd
+            },
+            {
+                n: 2,
+                text: 'A link opens in your browser. Sign in and approve access. rclone then prints ' +
+                    'a block of text between "Paste the following into your remote machine --->" ' +
+                    'and "<---End paste".',
+                command: ''
+            },
+            {
+                n: 3,
+                text: 'Copy that whole block and paste it below. The markers can stay in — hangar ' +
+                    'strips them.',
+                command: ''
+            }
+        ];
+    }
+
+    // rclone's own documentation says the built-in client IDs are shared by every
+    // rclone user and rate-limited. Surfaced as its own object rather than
+    // folded into help text, so the UI can give it a heading a user will read
+    // before they choose to skip the field.
+    function clientIdAdvice(providerId) {
+        const p = Rclone.providerFor(providerId);
+        if (!p || p.auth !== Rclone.AUTH.OAUTH) return null;
+        return {
+            provider: p.id,
+            // Drive is the one where this is the difference between a backup that
+            // finishes overnight and one that does not.
+            severity: p.id === 'drive' ? 'warning' : 'info',
+            title: p.id === 'drive'
+                ? 'Google Drive is slow without your own client ID'
+                : 'You can use your own app registration',
+            text: p.notes
+        };
+    }
+
+    function providerNote(providerId) {
+        const p = Rclone.providerFor(providerId);
+        return p ? str(p.notes) : '';
+    }
+
+    // --- the pasted token --------------------------------------------------
+
+    function extractToken(paste) {
+        return Rclone.parseAuthorizeOutput(paste);
+    }
+
+    // Says which of the three ways a paste can be wrong it is, because "invalid
+    // token" sends the user back to re-run a command that worked.
+    function tokenProblems(paste) {
+        if (trimmed(paste) === '')
+            return ['Paste the block that rclone authorize printed on your own computer.'];
+
+        const token = extractToken(paste);
+        if (token === null || trimmed(token) === '')
+            return ['That paste does not contain an authorisation token. Copy everything rclone ' +
+                'printed after "Paste the following into your remote machine --->", including the ' +
+                'marker lines if that is easier.'];
+
+        if (!Rclone.looksLikeToken(token))
+            return ['That does not look like an rclone authorisation token — it may have been cut ' +
+                'short by the terminal. Run the command again and copy the whole block.'];
+
+        return [];
+    }
+
+    // --- messages ----------------------------------------------------------
+
+    function successMessage(name, providerId) {
+        const p = Rclone.providerFor(providerId);
+        const label = p ? p.label : 'The destination';
+        return label + ' is set up as the remote "' + trimmed(name) + '". ' +
+            'It is now selectable as the remote of an rclone repository.';
+    }
+
+    function createdDetail(name, providerId) {
+        const p = Rclone.providerFor(providerId);
+        return { name: trimmed(name), provider: p ? p.id : '', type: p ? p.type : '' };
+    }
+
+    const MISSING_RCLONE = {
+        title: 'rclone is not installed on this host',
+        text: 'rclone is what actually talks to the cloud service — restic runs it for every ' +
+            'backup to this destination. Hangar can install it for you.',
+        actionLabel: 'Install rclone'
+    };
+
+    function missingRcloneMessage() {
+        return { title: MISSING_RCLONE.title, text: MISSING_RCLONE.text, actionLabel: MISSING_RCLONE.actionLabel };
+    }
+
+    function scrub(text) {
+        const s = str(text);
+        if (s === '' || !Secrets || typeof Secrets.redact !== 'function') return s;
+        return str(Secrets.redact(s));
+    }
+
+    // A typed error becomes an alert. BOTH halves are redacted before they are
+    // shown: rclone reports failures as prose on stderr and classifyRcloneError
+    // puts that prose in `message`, so the credential rclone was given comes back
+    // in the message as often as in the detail — `Failed to create file system
+    // for "nc:": ... https://alice:hunter2@cloud/dav` is one connection error
+    // away. An alert is a screenshot waiting to happen.
+    function toAlert(e, context) {
+        if (!e) return null;
+        // Total: this runs inside the catch that is already handling a failure,
+        // and an alert builder that throws replaces a message the user could act
+        // on with a dead dialog and an unhandled rejection.
+        try {
+            const fatal = Errors.isFatal(e);
+            const raw = (Errors.isHangarError(e) && e.detail && typeof e.detail === 'object')
+                ? str(e.detail.stderr) : '';
+            return {
+                level: fatal ? 'danger' : 'warning',
+                kind: Errors.isHangarError(e) ? e.kind : Errors.KIND.UNKNOWN,
+                context: str(context),
+                message: scrub(e.message) || 'Something went wrong.',
+                detail: raw === '' ? '' : scrub(raw).slice(-2000)
+            };
+        } catch (inner) {
+            // Nothing about `e` can be quoted — reading it is what just failed.
+            return {
+                level: 'danger',
+                kind: Errors.KIND.UNKNOWN,
+                context: str(context),
+                message: 'Something went wrong.',
+                detail: ''
+            };
+        }
+    }
+
+    // ------------------------------------------------------------------- DOM
+
+    // Every DOM touch is guarded: under node there is no document, and the
+    // component must stay constructible without one.
+    function showModal(id) {
+        const el = root.document && root.document.getElementById(id);
+        if (!el || !root.bootstrap) return null;
+        const m = root.bootstrap.Modal.getOrCreateInstance(el);
+        m.show();
+        return m;
+    }
+
+    function hideModal(id) {
+        const el = root.document && root.document.getElementById(id);
+        if (!el || !root.bootstrap) return;
+        root.bootstrap.Modal.getOrCreateInstance(el).hide();
+    }
+
+    // Bootstrap closes a modal on Escape and on a backdrop click without any of
+    // our buttons being pressed, so close() is NOT the only way out — and a
+    // password or a token would otherwise sit in component state for as long as
+    // the page is open. Every dismissal ends in 'hidden.bs.modal', so that is
+    // what the wipe hangs off.
+    function onModalHidden(id, fn) {
+        const el = root.document && typeof root.document.getElementById === 'function'
+            ? root.document.getElementById(id) : null;
+        if (!el || typeof el.addEventListener !== 'function') return false;
+        el.addEventListener('hidden.bs.modal', fn);
+        return true;
+    }
+
+    function dispatch(name, detail) {
+        if (typeof root.dispatchEvent !== 'function' || typeof root.CustomEvent !== 'function')
+            return false;
+        root.dispatchEvent(new root.CustomEvent(name, { detail: detail }));
+        return true;
+    }
+
+    // ------------------------------------------------------------- component
+
+    function hangarRcloneUi() {
+        // Deliberately a closure variable and NOT a property of the returned
+        // object: nothing a template can name reaches it, so the token cannot be
+        // rendered, logged by a debug dump of the component, or restored by the
+        // browser. It is cleared the moment the remote exists.
+        let token = '';
+
+        return {
+            step: 'provider',
+            providerId: '',
+            values: {},
+            paste: '',
+            // Only ever a boolean. The token itself lives in the closure above.
+            hasToken: false,
+            name: '',
+            existing: [],
+            problems: [],
+            alert: null,
+            busy: false,
+            created: '',
+            copied: false,
+            // Assume present until told otherwise: a wizard that flashes "rclone
+            // is missing" before the probe answers is worse than one that waits.
+            rclone: { checked: false, present: true },
+
+            init() {
+                // Registered before the guard below, and separately from it: the
+                // wipe must survive a window with no event plumbing, because a
+                // dialog closed by Escape is the commonest way this wizard is
+                // abandoned halfway through typing a password.
+                onModalHidden(MODAL_ID, () => { this.forget(); });
+                if (typeof root.addEventListener !== 'function') return false;
+                root.addEventListener(EVENT_OPEN, (ev) => { this.open((ev && ev.detail) || {}); });
+                // The provisioner announces success globally; re-probe rather than
+                // assume, since the user may also have installed rclone in a shell.
+                root.addEventListener('hangar:provisioned', () => { this.checkRclone(); });
+                return true;
+            },
+
+            // `detail.existing` is the remote list the caller already has, used to
+            // reject a duplicate name before rclone silently overwrites a remote.
+            async open(detail) {
+                const o = (detail && typeof detail === 'object') ? detail : {};
+                this.reset();
+                this.existing = Array.isArray(o.existing) ? o.existing.map(trimmed) : [];
+                showModal(MODAL_ID);
+                await this.checkRclone();
+            },
+
+            reset() {
+                token = '';
+                this.step = 'provider';
+                this.providerId = '';
+                this.values = {};
+                this.paste = '';
+                this.hasToken = false;
+                this.name = '';
+                this.problems = [];
+                this.alert = null;
+                this.busy = false;
+                this.created = '';
+                this.copied = false;
+            },
+
+            // Never rejects: "I could not tell" must not leave the wizard stuck on
+            // a spinner, and an absent rclone is an ordinary state to report.
+            async checkRclone() {
+                try {
+                    const r = await Prov.probe('rclone');
+                    this.rclone = { checked: true, present: !!(r && r.present) };
+                } catch (e) {
+                    // A probe that throws is not evidence of absence, and blocking
+                    // the wizard on it would be a guess. createRemote will produce
+                    // a real, typed error if rclone truly is not there.
+                    this.rclone = { checked: true, present: true };
+                }
+                return this.rclone;
+            },
+
+            // hangar installs its own prerequisites; it never tells the user to run
+            // a package manager. provision-ui.js owns the whole flow.
+            installRclone() {
+                return dispatch(EVENT_PROVISION, PROVISION_TOOLS.slice());
+            },
+
+            missing() {
+                return this.rclone.checked && !this.rclone.present;
+            },
+
+            missingMessage() {
+                return missingRcloneMessage();
+            },
+
+            // --- navigation ------------------------------------------------
+
+            groups() {
+                return providerGroups();
+            },
+
+            steps() {
+                return stepsFor(this.providerId);
+            },
+
+            stepNumber() {
+                // 'done' is the outcome, not a fourth thing to do — so it reads as
+                // the last step completed rather than "step 0 of 3".
+                if (this.step === 'done') return this.stepCount();
+                const i = stepIndex(this.providerId, this.step);
+                return i < 0 ? 1 : i + 1;
+            },
+
+            stepCount() {
+                return this.steps().length;
+            },
+
+            stepTitle() {
+                return stepLabel(this.step);
+            },
+
+            at(step) {
+                return this.step === str(step);
+            },
+
+            provider() {
+                return Rclone.providerFor(this.providerId);
+            },
+
+            providerLabel() {
+                const p = this.provider();
+                return p ? p.label : '';
+            },
+
+            fields() {
+                return formFieldsFor(this.providerId);
+            },
+
+            // Choosing a provider resets the answers rather than carrying them
+            // across: two backends that both have a key called `user` do not mean
+            // the same thing by it, and a silently reused password is a support
+            // call nobody can reproduce.
+            choose(id) {
+                const p = Rclone.providerFor(id);
+                if (!p) {
+                    this.problems = ['Choose a destination to continue.'];
+                    return false;
+                }
+                token = '';
+                this.providerId = p.id;
+                this.values = blankValues(p.id);
+                this.paste = '';
+                this.hasToken = false;
+                this.name = suggestName(p.id, this.existing);
+                this.problems = [];
+                this.alert = null;
+                this.step = nextStep(p.id, 'provider') || 'name';
+                return true;
+            },
+
+            back() {
+                const prev = prevStep(this.providerId, this.step);
+                if (!prev) return false;
+                this.problems = [];
+                this.alert = null;
+                this.step = prev;
+                return true;
+            },
+
+            // Advances only when this step is actually answered. Each branch sets
+            // `problems`, which is the announced summary in the markup — a silent
+            // refusal to advance reads as a broken button.
+            next() {
+                this.problems = [];
+
+                if (this.step === 'provider') {
+                    if (!this.provider()) {
+                        this.problems = ['Choose a destination to continue.'];
+                        return false;
+                    }
+                    this.step = nextStep(this.providerId, 'provider') || 'name';
+                    return true;
+                }
+
+                if (this.step === 'details' || this.step === 'authorize') {
+                    const problems = fieldProblems(this.providerId, this.values);
+                    if (problems.length) {
+                        this.problems = problems;
+                        return false;
+                    }
+                    // The token is the whole point of the OAuth step; without it
+                    // the remote would be created unauthenticated and fail at the
+                    // first backup, hours later, in a unit nobody is watching.
+                    if (this.step === 'authorize' && !this.hasToken && !this.acceptPaste())
+                        return false;
+                    this.step = 'name';
+                    return true;
+                }
+
+                return false;
+            },
+
+            // --- the pasted authorisation ---------------------------------
+
+            authorizeCommand() {
+                return authorizeCommandFor(this.providerId);
+            },
+
+            authorizeSteps() {
+                return authorizeSteps(this.providerId);
+            },
+
+            whyHeadless() {
+                return whyHeadless();
+            },
+
+            advice() {
+                return clientIdAdvice(this.providerId);
+            },
+
+            note() {
+                return providerNote(this.providerId);
+            },
+
+            // Accepting a paste immediately empties the textarea. The token is
+            // held in the closure; the UI only ever learns that there IS one.
+            acceptPaste() {
+                const problems = tokenProblems(this.paste);
+                if (problems.length) {
+                    this.problems = problems;
+                    this.hasToken = false;
+                    return false;
+                }
+                token = str(extractToken(this.paste));
+                this.paste = '';
+                this.hasToken = true;
+                this.problems = [];
+                return true;
+            },
+
+            // "Paste a different one" — forgets the token without revealing it.
+            clearToken() {
+                token = '';
+                this.hasToken = false;
+                this.paste = '';
+                this.problems = [];
+                return true;
+            },
+
+            async copyCommand() {
+                this.copied = false;
+                const text = this.authorizeCommand();
+                if (text === '') return false;
+                try {
+                    if (root.navigator && root.navigator.clipboard &&
+                        typeof root.navigator.clipboard.writeText === 'function') {
+                        await root.navigator.clipboard.writeText(text);
+                        this.copied = true;
+                        return true;
+                    }
+                } catch (e) {
+                    // The command is on screen to select by hand; a clipboard the
+                    // browser refuses is not a failure of the wizard.
+                }
+                return false;
+            },
+
+            // --- creation --------------------------------------------------
+
+            nameProblems() {
+                return nameProblems(this.name, this.existing);
+            },
+
+            canCreate() {
+                if (this.busy || this.missing()) return false;
+                if (!this.provider()) return false;
+                if (Rclone.isOAuth(this.providerId) && !this.hasToken) return false;
+                return trimmed(this.name) !== '';
+            },
+
+            async submit() {
+                if (this.busy) return false;
+                this.problems = this.nameProblems();
+                if (this.problems.length) return false;
+
+                this.alert = null;
+                this.busy = true;
+                const name = trimmed(this.name);
+                try {
+                    const result = await Rclone.createRemote(name, this.providerId, this.values, token);
+                    this.created = str(result && result.name) || name;
+                    // Forget every secret before anything else can go wrong: the
+                    // remote exists now, and this component has no further use for
+                    // any of them.
+                    this.forget();
+                    this.step = 'done';
+                    // Tell the repository editor, so the user lands back on the
+                    // form they left with the new remote already selected.
+                    dispatch(EVENT_CREATED, createdDetail(this.created, this.providerId));
+                    return true;
+                } catch (e) {
+                    this.alert = toAlert(e, 'Add a cloud destination');
+                    return false;
+                } finally {
+                    this.busy = false;
+                }
+            },
+
+            // Values are cleared in place so Alpine keeps the same key set — a
+            // replaced object would leave x-model bound to a detached one.
+            forget() {
+                token = '';
+                this.hasToken = false;
+                this.paste = '';
+                clearSecrets(this.providerId, this.values);
+                return true;
+            },
+
+            successMessage() {
+                return successMessage(this.created, this.providerId);
+            },
+
+            // --- display ---------------------------------------------------
+
+            alertClass(alert) {
+                return alert ? 'alert alert-' + alert.level : 'alert alert-secondary';
+            },
+
+            close() {
+                // Nothing sensitive may outlive the dialog, whether it was
+                // finished or abandoned halfway through.
+                this.forget();
+                hideModal(MODAL_ID);
+                return true;
+            }
+        };
+    }
+
+    root.hangarRcloneUi = hangarRcloneUi;
+
+    const HangarRcloneUi = {
+        EVENT_OPEN, EVENT_CREATED, EVENT_PROVISION, PROVISION_TOOLS, MODAL_ID,
+        GROUPS, STEP_LABEL, WHY_HEADLESS,
+        providerGroups, groupIdFor, providerCard,
+        stepLabel, stepsFor, stepIndex, nextStep, prevStep,
+        formFieldsFor, blankValues, secretKeys, clearSecrets, fieldProblems,
+        nameProblems, suggestName,
+        authorizeCommandFor, whyHeadless, authorizeSteps, clientIdAdvice, providerNote,
+        extractToken, tokenProblems,
+        successMessage, createdDetail, missingRcloneMessage, toAlert,
+        hangarRcloneUi
+    };
+    root.HangarRcloneUi = HangarRcloneUi;
+    if (typeof module !== 'undefined' && module.exports) module.exports = HangarRcloneUi;
+})(typeof window !== 'undefined' ? window : globalThis);

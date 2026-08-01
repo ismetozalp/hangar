@@ -58,7 +58,7 @@
         bucket: { label: 'Bucket', type: 'text', placeholder: 'hangar' },
         container: { label: 'Container', type: 'text', placeholder: 'hangar' },
         remote: { label: 'Remote', type: 'select', placeholder: 'remote',
-            help: 'Taken from this host\'s rclone configuration — hangar does not create remotes.' },
+            help: 'Taken from this host\'s rclone configuration. Use "Add a cloud destination" to create a new one.' },
         prefix: { label: 'Path inside the destination', type: 'text', placeholder: 'hosts/db01',
             help: 'Optional. Lets several hosts share one bucket.' },
         accessKeyId: { label: 'Access key ID', type: 'text' },
@@ -873,6 +873,12 @@
             init() {
                 if (typeof root.addEventListener !== 'function') return;
                 root.addEventListener('hangar:repo-edit', (ev) => { this.receive(ev.detail || {}); });
+                // The rclone wizard (features/rclone-ui.js) reports a new remote
+                // globally. Listening here is what lets the user land back on this
+                // form with the destination they just made already selected.
+                root.addEventListener('hangar:rclone-remote-created', (ev) => {
+                    this.remoteCreated((ev && ev.detail) || {});
+                });
             },
 
             receive(o) {
@@ -922,6 +928,32 @@
                     this.remotes = [];
                     this.remotesLoaded = false;
                 }
+            },
+
+            // Hands off to features/rclone-ui.js. The current remote list travels
+            // with the request so the wizard can refuse a name that would silently
+            // overwrite an existing remote.
+            openRcloneWizard() {
+                if (typeof root.dispatchEvent !== 'function' || typeof CustomEvent !== 'function')
+                    return false;
+                root.dispatchEvent(new CustomEvent('hangar:rclone-remote',
+                    { detail: { existing: this.remotes.slice() } }));
+                return true;
+            },
+
+            // A remote was created elsewhere. Re-read the list from rclone rather
+            // than trusting the event: the host is the source of truth, and the
+            // user may have added others in a terminal meanwhile. The new name is
+            // appended anyway if the re-read missed it, so the dropdown can never
+            // end up unable to offer what was just made.
+            async remoteCreated(detail) {
+                const name = trimmed(detail && detail.name);
+                this.remotesLoaded = false;
+                await this.loadRemotes();
+                if (name === '') return '';
+                if (this.remotes.indexOf(name) < 0) this.remotes = this.remotes.concat([name]);
+                if (this.kind === 'rclone') this.form.remote = name;
+                return name;
             },
 
             // The id is the filename, the systemd instance name and the key path, so

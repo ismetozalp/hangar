@@ -97,8 +97,13 @@
 
     // ---- redaction --------------------------------------------------------
 
+    // Bare `pass` is in here because it is not a hypothetical: it is the literal
+    // config key rclone uses for the password of a WebDAV, SFTP, FTP, SMB or MEGA
+    // remote, so `pass = hunter2` is what rclone's own stderr says when one of
+    // those fails. Matching a substring also masks `bypass=` and `passed=`, which
+    // is the direction to be wrong in.
     const SECRET_NAME_RE =
-        /(passw(?:or)?d|passphrase|secret|token|credential|(?:^|[^a-z])keys?(?:[^a-z]|$)|api[_-]?keys?)/i;
+        /(pass(?:word|wd|phrase)?|secret|token|credential|(?:^|[^a-z])keys?(?:[^a-z]|$)|api[_-]?keys?)/i;
     // A location is not a secret, and blanking it destroys the one thing that
     // makes a failed run diagnosable.
     const LOCATION_NAME_RE = /(file|path|dir|directory|url)$/i;

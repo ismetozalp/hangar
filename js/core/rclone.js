@@ -52,12 +52,26 @@
         return str(v).trim() === '';
     }
 
+    // Total property read. Every caller below is on the path that decides whether
+    // a value is a secret, so a throwing getter or a Proxy trap must produce
+    // "no value" rather than an untyped exception that skips the decision.
+    function prop(o, k) {
+        if (o === null || o === undefined) return undefined;
+        try { return o[k]; } catch (e) { return undefined; }
+    }
+
     // Table and form lookups must be own-property only, or a field called
     // "constructor" resolves to Object.prototype's and hangar writes a function
     // body into rclone's config file.
     function own(table, key) {
-        return (table && typeof table === 'object' &&
-            Object.prototype.hasOwnProperty.call(table, key)) ? table[key] : undefined;
+        if (!table || typeof table !== 'object') return undefined;
+        try {
+            if (!Object.prototype.hasOwnProperty.call(table, key)) return undefined;
+        } catch (e) {
+            // A Proxy may throw from getOwnPropertyDescriptor. Absent, then.
+            return undefined;
+        }
+        return prop(table, key);
     }
 
     const AUTH = { OAUTH: 'oauth', CREDENTIALS: 'credentials', NONE: 'none' };
@@ -433,7 +447,7 @@
     }
 
     function isSecretField(f) {
-        return !!f && f.type === 'password';
+        return prop(f, 'type') === 'password';
     }
 
     function fieldFor(providerId, key) {
@@ -502,6 +516,18 @@
     // and again in mergeConfigSection.
     const INJECTION = /[\r\n\0]/;
 
+    // A URL is not a secret, so a URL field's value goes into argv — where it is
+    // world-readable in `ps`. But `https://alice:hunter2@cloud/dav` IS a
+    // password, and typing one into the Server URL box is the obvious thing to
+    // do if you have ever used curl. So a value that carries userinfo with a
+    // password is refused, and the user is pointed at the username and password
+    // fields, which every provider that has a URL field also has — and which are
+    // delivered off argv.
+    //
+    // Anchored, and the password colon is required: `https://host:9000`,
+    // `alice@example.com` and `[2001:db8::1]` must all still pass.
+    const URL_USERINFO = /^(?:[A-Za-z][A-Za-z0-9+.-]*:\/\/)?[^\s:/@]+:[^\s/@]*@/;
+
     function validateFields(providerId, values) {
         const p = providerFor(providerId);
         if (!p) return ['Unknown destination: ' + (str(providerId) || '(empty)') + '.'];
@@ -519,6 +545,13 @@
 
             if (INJECTION.test(v))
                 problems.push(f.label + ' must not contain line breaks or NUL bytes.');
+
+            // Only the non-secret fields: those are the ones that reach argv. A
+            // password field may legitimately contain "a:b@c".
+            if (!isSecretField(f) && URL_USERINFO.test(v.trim()))
+                problems.push(f.label + ' must not contain a username and password. ' +
+                    'Use this destination\'s own username and password fields — anything typed here ' +
+                    'becomes part of a command line, which every user on this host can read.');
 
             if (f.type === 'select' && Array.isArray(f.options) && !blank(v)) {
                 const allowed = f.options.map(function (o) { return o.value; });
@@ -635,6 +668,10 @@
 
     const START_MARKER = /paste\s+the\s+following\s+into\s+your\s+remote\s+machine/i;
     const END_MARKER = /^<?-*\s*end\s+paste\s*-*>?$/i;
+    // The same end marker where the terminal wrapped it onto the token's line
+    // instead of its own. Without this the marker text is concatenated into the
+    // token and the remote is created with a credential that cannot work.
+    const END_MARKER_INLINE = /<-+\s*end\s+paste\s*-*>?\s*$/i;
 
     // The opaque (non-JSON) form: one long run of token characters. ':' and '?'
     // are excluded so the authorisation URL rclone prints above the token is never
@@ -673,7 +710,8 @@
             if (START_MARKER.test(lines[i])) {
                 start = i;
                 // Some terminals wrap the marker and the token onto one line.
-                tail = lines[i].replace(/^.*?paste\s+the\s+following\s+into\s+your\s+remote\s+machine\s*-*>?/i, '').trim();
+                tail = lines[i].replace(/^.*?paste\s+the\s+following\s+into\s+your\s+remote\s+machine\s*-*>?/i, '')
+                    .replace(END_MARKER_INLINE, '').trim();
                 break;
             }
         }
@@ -684,7 +722,16 @@
             for (let i = start + 1; i < lines.length; i++) {
                 const line = lines[i].trim();
                 if (END_MARKER.test(line)) break;
+                // A second start marker means the user pasted two `rclone
+                // authorize` runs. Fusing them would produce one long string that
+                // is not either token — so the first block ends here.
+                if (START_MARKER.test(line)) break;
                 if (line === '') continue;
+                if (END_MARKER_INLINE.test(line)) {
+                    const head = line.replace(END_MARKER_INLINE, '').trim();
+                    if (head !== '') body.push(head);
+                    break;
+                }
                 body.push(line);
             }
             // Joined with no separator: a terminal that hard-wrapped a long token
@@ -733,9 +780,26 @@
         if (section === '' || /[\r\n\0[\]]/.test(section))
             fail('Invalid rclone remote name for a config section.', section);
 
-        const list = (Array.isArray(pairs) ? pairs : []).map(function (p) {
-            return { key: str(p && p.key).trim(), value: str(p && p.value) };
+        const given = (Array.isArray(pairs) ? pairs : []).map(function (p) {
+            return { key: str(prop(p, 'key')).trim(), value: str(prop(p, 'value')) };
         }).filter(function (p) { return p.key !== ''; });
+
+        // Last wins, exactly as the rewrite path below already does when the key
+        // is already in the file. Without collapsing here the two paths disagree:
+        // an existing key is replaced once with the last value, but a key that is
+        // NOT yet in the file is appended once per duplicate — two `token =`
+        // lines, of which rclone reads the first. That is a credential file where
+        // the value hangar was asked to write is not the value that takes effect.
+        const list = [];
+        // Null-prototype, and so is `written` below: an rclone config key is
+        // [A-Za-z0-9_]+, and so is `__proto__`. On a plain object `seen.__proto__`
+        // reads Object.prototype — truthy — so the key would be treated as
+        // already written and silently dropped from the file.
+        const at = Object.create(null);
+        given.forEach(function (p) {
+            if (Object.prototype.hasOwnProperty.call(at, p.key)) list[at[p.key]] = p;
+            else { at[p.key] = list.length; list.push(p); }
+        });
 
         list.forEach(function (p) {
             // Second line of defence. Reached only if a caller skipped validation,
@@ -748,7 +812,7 @@
 
         const lines = str(text).split(/\r?\n/);
         const out = [];
-        const written = {};
+        const written = Object.create(null);
         let inSection = false;
         let seen = false;
         let insertAt = -1;
