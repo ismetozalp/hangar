@@ -24,6 +24,8 @@
         HangarRepos: '../core/repos.js',
         HangarSecrets: '../core/secrets.js',
         HangarSources: '../core/sources.js',
+        HangarSourcesContainer: '../core/sources-container.js',
+        HangarSourcesLibvirt: '../core/sources-libvirt.js',
         HangarRetention: '../core/retention.js',
         HangarSchedule: '../core/schedule.js',
         HangarRestic: '../engine/restic.js',
@@ -78,6 +80,43 @@
     ];
 
     const COUNT_FIELDS = ['last', 'hourly', 'daily', 'weekly', 'monthly', 'yearly'];
+
+    // The only wording this screen owns about the source kinds: what to call them
+    // in the chooser. Every option *inside* a kind's form — runtimes, consistency
+    // modes, connection URIs, quiesce modes — is read from that kind's exported
+    // table, so a mode added in core/ appears here without an edit.
+    const SOURCE_KINDS = [
+        {
+            id: 'filesystem',
+            label: 'Files and directories',
+            description: 'Paths on this host, exactly as they are on disk.'
+        },
+        {
+            id: 'container',
+            label: 'Container volumes',
+            description: 'Named podman or docker volumes, found by asking the runtime ' +
+                'where they live.'
+        },
+        {
+            id: 'libvirt',
+            label: 'Virtual machines',
+            description: 'Libvirt domain disk images, with the domain XML that makes ' +
+                'them restorable as a VM.'
+        }
+    ];
+
+    // Warnings whose subject is whether the backup will RESTORE, rather than
+    // whether it will run. They are pulled out of the kind's problem list and
+    // shown next to the mode picker instead of as grey helper text under a field:
+    // a live copy of a running database is a backup that may not restore, and the
+    // moment of choosing is the last moment anyone can say so.
+    const RISK_CODES = [
+        'live-database',            // container: mode 'none', and a container looks like a DB
+        'quiesce-crash-consistent', // libvirt:   mode 'none'
+        'quiesce-agent-required',   // libvirt:   mode 'agent', which needs a guest agent
+        'no-xml',                   // libvirt:   disks without the XML are not a VM
+        'no-user'                   // container: rootless podman with no owner recorded
+    ];
 
     // Wording for each HangarErrors remediation. `null` (no remediation) shows no
     // button at all — the failure is still reported, just without a one-click fix.
@@ -140,6 +179,92 @@
 
     function plural(n, word) { return n + ' ' + word + (n === 1 ? '' : 's'); }
 
+    function uniq(list) {
+        const out = [];
+        (Array.isArray(list) ? list : []).forEach((v) => { if (out.indexOf(v) < 0) out.push(v); });
+        return out;
+    }
+
+    // ------------------------------------------------------- pure: source kinds
+
+    // Requiring these modules is what registers their kinds into HangarSources —
+    // index.html loads them in the browser, M() loads them under node. Called
+    // before anything asks the registry a question, because an unregistered kind
+    // answers "unknown source kind" instead of validating the form the user is
+    // looking at.
+    function ensureSourceKinds() {
+        M('HangarSourcesContainer');
+        M('HangarSourcesLibvirt');
+        return M('HangarSources');
+    }
+
+    // Only kinds that actually registered are offered. A chooser entry whose
+    // module failed to load would produce a form that can be filled in and then
+    // refuses to save, which is worse than not offering it.
+    function sourceKinds() {
+        const S = ensureSourceKinds();
+        const known = (S && typeof S.kinds === 'function') ? S.kinds() : ['filesystem'];
+        return SOURCE_KINDS.filter((k) => known.indexOf(k.id) >= 0);
+    }
+
+    function sourceKindLabel(id) {
+        const k = SOURCE_KINDS.filter((e) => e.id === str(id))[0];
+        return k ? k.label : str(id);
+    }
+
+    function containerModule() { return M('HangarSourcesContainer'); }
+    function libvirtModule() { return M('HangarSourcesLibvirt'); }
+
+    function runtimeOptions() {
+        const C = containerModule();
+        return C && Array.isArray(C.RUNTIMES) ? C.RUNTIMES.slice() : [];
+    }
+
+    // Worst-to-best, in the table's own order: the ordering is itself the advice.
+    function consistencyOptions() {
+        const C = containerModule();
+        if (!C || !Array.isArray(C.CONSISTENCY_IDS)) return [];
+        return C.CONSISTENCY_IDS.map((id) => C.CONSISTENCY[id]).filter((m) => !!m);
+    }
+
+    function consistencyInfo(id) {
+        return consistencyOptions().filter((m) => m.id === str(id))[0] || null;
+    }
+
+    function uriOptions() {
+        const L = libvirtModule();
+        return L && Array.isArray(L.URIS) ? L.URIS.slice() : [];
+    }
+
+    function quiesceOptions() {
+        const L = libvirtModule();
+        return L && Array.isArray(L.QUIESCE) ? L.QUIESCE.slice() : [];
+    }
+
+    function quiesceInfo(id) {
+        return quiesceOptions().filter((m) => m.id === str(id))[0] || null;
+    }
+
+    function defaultRuntime() {
+        const C = containerModule();
+        return (C && str(C.DEFAULT_RUNTIME)) || '';
+    }
+
+    function defaultConsistency() {
+        const C = containerModule();
+        return (C && str(C.DEFAULT_CONSISTENCY)) || '';
+    }
+
+    function defaultUri() {
+        const L = libvirtModule();
+        return (L && str(L.DEFAULT_URI)) || '';
+    }
+
+    function defaultQuiesce() {
+        const L = libvirtModule();
+        return (L && str(L.DEFAULT_QUIESCE)) || '';
+    }
+
     // ---------------------------------------------------------------- pure: form
 
     function emptyRetentionFields() {
@@ -151,6 +276,36 @@
         return (R && R.DEFAULT_PRESET) || 'rolling';
     }
 
+    // Discovered lists live on the component, not here: they are what the host
+    // answered, not what the user chose, and saving them would freeze a moment in
+    // time into /etc/hangar. The form holds only the choice, plus the free-text
+    // fallback for when discovery cannot answer at all.
+    function emptyContainerFields() {
+        return {
+            runtime: defaultRuntime(),
+            user: '',
+            volumes: [],
+            volumesText: '',
+            containers: [],
+            containersText: '',
+            consistency: defaultConsistency(),
+            command: ''
+        };
+    }
+
+    function emptyLibvirtFields() {
+        return {
+            uri: defaultUri(),
+            domains: [],
+            domainsText: '',
+            quiesce: defaultQuiesce(),
+            // On by default, and the one default in this form that is a data-safety
+            // decision rather than a convenience: a disk image without its domain
+            // XML restores as a file, not as a VM.
+            includeXml: true
+        };
+    }
+
     function emptyForm() {
         return {
             isNew: true,
@@ -158,6 +313,9 @@
             name: '',
             repo: '',
             sourceId: 'main',
+            sourceKind: 'filesystem',
+            container: emptyContainerFields(),
+            libvirt: emptyLibvirtFields(),
             paths: '',
             excludes: '',
             excludeFile: '',
@@ -253,10 +411,39 @@
         return mode ? mode.id : 'custom';
     }
 
-    function formSource(form) {
-        const f = isObj(form) ? form : {};
+    // Ticked names plus typed names, in that order. Additive rather than
+    // either/or: discovery is best effort, and a host where the runtime answers
+    // for only some of the volumes — a second user's store, a runtime that is not
+    // installed — must still be able to name the rest.
+    function nameList(selected, text) {
+        return uniq(splitLines(selected).concat(splitLines(text)));
+    }
+
+    // What the multi-select renders: everything discovery found, plus everything
+    // already selected. A saved volume the runtime no longer reports still has to
+    // appear — ticked, and flagged as not found — because dropping it from the
+    // list would silently drop it from the backup on the next save.
+    function checkboxList(discovered, selected) {
+        const found = splitLines(discovered);
+        return uniq(found.concat(splitLines(selected)))
+            .map((name) => ({ name: name, discovered: found.indexOf(name) >= 0 }));
+    }
+
+    function sourceId(f) { return str(f.sourceId).trim() || 'main'; }
+
+    // excludes and tags mean the same thing to restic whatever the kind is, so
+    // they are one pair of form fields shared by all three source forms.
+    function withSharedFields(source, f) {
+        const excludes = splitLines(f.excludes);
+        if (excludes.length) source.excludes = excludes;
+        const tags = splitTags(f.tags);
+        if (tags.length) source.tags = tags;
+        return source;
+    }
+
+    function filesystemSource(f) {
         const source = {
-            id: str(f.sourceId).trim() || 'main',
+            id: sourceId(f),
             kind: 'filesystem',
             paths: splitLines(f.paths),
             excludes: splitLines(f.excludes),
@@ -267,6 +454,49 @@
         const tags = splitTags(f.tags);
         if (tags.length) source.tags = tags;
         return source;
+    }
+
+    function containerSource(f) {
+        const c = isObj(f.container) ? f.container : {};
+        const consistency = str(c.consistency) || defaultConsistency();
+        const source = {
+            id: sourceId(f),
+            kind: 'container',
+            runtime: str(c.runtime) || defaultRuntime(),
+            user: str(c.user).trim(),
+            volumes: nameList(c.volumes, c.volumesText),
+            consistency: consistency,
+            containers: nameList(c.containers, c.containersText)
+        };
+        // Only the mode that runs it keeps it. A command left behind by a mode the
+        // user moved away from is a command hangar-run would not run and the user
+        // would still believe in.
+        if (consistency === 'command') source.command = str(c.command);
+        return withSharedFields(source, f);
+    }
+
+    function libvirtSource(f) {
+        const v = isObj(f.libvirt) ? f.libvirt : {};
+        const source = {
+            id: sourceId(f),
+            kind: 'libvirt',
+            uri: str(v.uri) || defaultUri(),
+            domains: nameList(v.domains, v.domainsText),
+            quiesce: str(v.quiesce) || defaultQuiesce(),
+            // Written explicitly in both directions: normalize() reads an absent
+            // includeXml as true, so omitting a false would silently turn the XML
+            // back on between saving and running.
+            includeXml: v.includeXml !== false
+        };
+        return withSharedFields(source, f);
+    }
+
+    function formSource(form) {
+        const f = isObj(form) ? form : {};
+        const kind = str(f.sourceKind);
+        if (kind === 'container') return containerSource(f);
+        if (kind === 'libvirt') return libvirtSource(f);
+        return filesystemSource(f);
     }
 
     function isFilesystem(source) {
@@ -292,6 +522,62 @@
             if (s.oneFileSystem) merged.oneFileSystem = true;
         });
         return merged;
+    }
+
+    function objectSources(job) {
+        return (job && Array.isArray(job.sources) ? job.sources : []).filter(isObj);
+    }
+
+    // Which source the editor opens on. Filesystem wins whenever there is one, so
+    // a v1 job edits in v2 exactly as it did in v1 — including the merge of
+    // several filesystem sources into the single form the screen has always shown.
+    function primaryKind(job) {
+        const list = objectSources(job);
+        if (list.some(isFilesystem)) return 'filesystem';
+        const first = list.filter((s) => str(s.kind) === 'container' || str(s.kind) === 'libvirt')[0];
+        return first ? str(first.kind) : 'filesystem';
+    }
+
+    function primarySource(job) {
+        const kind = primaryKind(job);
+        if (kind === 'filesystem') return mergeFilesystemSources(job);
+        return objectSources(job).filter((s) => str(s.kind) === kind)[0] || mergeFilesystemSources(job);
+    }
+
+    // "Back up now" runs restic from the browser against a path list. A container
+    // or VM source has no paths until the runtime or the hypervisor is asked, and
+    // needs its containers paused or its guests frozen around the copy — which is
+    // hangar-run's job, under the systemd unit's try/finally. So those jobs are
+    // handed to the unit instead of being run here with an empty path vector.
+    //
+    // EVERY source, not the primary one. primaryKind() answers "which form does
+    // the editor open", and it answers 'filesystem' whenever there is one — so a
+    // job mixing files with volumes would run here against the file paths alone
+    // and report a success for a snapshot that is missing the volumes.
+    function runsInBrowser(job) {
+        return objectSources(job).every(isFilesystem);
+    }
+
+    function containerFieldsFrom(source) {
+        const s = isObj(source) ? source : {};
+        const c = emptyContainerFields();
+        c.runtime = str(s.runtime) || defaultRuntime();
+        c.user = str(s.user);
+        c.volumes = splitLines(s.volumes);
+        c.containers = splitLines(s.containers);
+        c.consistency = str(s.consistency) || defaultConsistency();
+        c.command = str(s.command);
+        return c;
+    }
+
+    function libvirtFieldsFrom(source) {
+        const s = isObj(source) ? source : {};
+        const v = emptyLibvirtFields();
+        v.uri = str(s.uri) || defaultUri();
+        v.domains = splitLines(s.domains);
+        v.quiesce = str(s.quiesce) || defaultQuiesce();
+        v.includeXml = s.includeXml !== false;
+        return v;
     }
 
     function formStateToJob(form) {
@@ -334,16 +620,31 @@
         f.enabled = j.enabled !== false;
 
         const sources = Array.isArray(j.sources) ? j.sources : [];
-        // Only real objects are carried through: a null or a string in `sources`
-        // would otherwise be written straight back to /etc on the next save.
-        f.otherSources = sources.filter((s) => isObj(s) && !isFilesystem(s));
-        const merged = mergeFilesystemSources(j);
-        f.sourceId = merged.id;
-        f.paths = joinLines(merged.paths);
-        f.excludes = joinLines(merged.excludes);
-        f.excludeFile = joinLines(merged.excludeFile);
-        f.tags = joinTags(merged.tags);
-        f.oneFileSystem = merged.oneFileSystem;
+        f.sourceKind = primaryKind(j);
+
+        if (f.sourceKind === 'filesystem') {
+            // Only real objects are carried through: a null or a string in `sources`
+            // would otherwise be written straight back to /etc on the next save.
+            f.otherSources = sources.filter((s) => isObj(s) && !isFilesystem(s));
+            const merged = mergeFilesystemSources(j);
+            f.sourceId = merged.id;
+            f.paths = joinLines(merged.paths);
+            f.excludes = joinLines(merged.excludes);
+            f.excludeFile = joinLines(merged.excludeFile);
+            f.tags = joinTags(merged.tags);
+            f.oneFileSystem = merged.oneFileSystem;
+        } else {
+            const primary = primarySource(j);
+            // Identity, not kind: a second container source is a source this screen
+            // cannot show, and must survive the edit rather than be merged into the
+            // one being edited — the two may name different runtimes or users.
+            f.otherSources = sources.filter((s) => isObj(s) && s !== primary);
+            f.sourceId = str(primary.id) || 'main';
+            f.excludes = joinLines(splitLines(primary.excludes));
+            f.tags = joinTags(splitTags(primary.tags));
+            if (f.sourceKind === 'container') f.container = containerFieldsFrom(primary);
+            else f.libvirt = libvirtFieldsFrom(primary);
+        }
 
         const R = M('HangarRetention');
         const policy = R ? R.normalize(j.retention) : (j.retention || {});
@@ -387,14 +688,79 @@
     }
 
     // `code` comes from a source kind's validate(), which in v2 may be a third
-    // party's — so it is normalised rather than assumed to be a string.
+    // party's — so it is normalised rather than assumed to be a string. Anything
+    // unrecognised lands on 'source', which is rendered too: an unattributed
+    // problem must still be visible, just not next to the wrong field.
     function fieldForSourceProblem(raw) {
         const code = str(raw);
         if (code === 'no-paths' || code.indexOf('path-') === 0) return 'paths';
         if (code.indexOf('pattern-') === 0) return 'excludes';
         if (code.indexOf('exclude-file') === 0) return 'excludeFile';
         if (code.indexOf('tag-') === 0) return 'tags';
+
+        // container
+        if (code === 'no-volumes' || code.indexOf('volume-') === 0) return 'volumes';
+        if (code === 'no-containers' || code.indexOf('container-') === 0) return 'containers';
+        if (code === 'bad-runtime') return 'runtime';
+        if (code === 'bad-user' || code === 'no-user') return 'user';
+        if (code === 'no-command' || code.indexOf('command-') === 0) return 'command';
+        if (code === 'bad-consistency' || code === 'live-database') return 'consistency';
+
+        // libvirt
+        if (code === 'no-domains' || code.indexOf('domain-') === 0) return 'domains';
+        if (code === 'uri-empty') return 'uri';
+        if (code.indexOf('quiesce-') === 0) return 'quiesce';
+        if (code === 'no-xml') return 'includeXml';
+
         return 'source';
+    }
+
+    // The kind's own problem list for the form as it currently stands. Total: a
+    // kind that throws while validating must not take the editor down with it,
+    // because the editor is where the user would fix whatever upset it.
+    function sourceProblems(form) {
+        const Sources = ensureSourceKinds();
+        if (!Sources) return [];
+        try {
+            const list = Sources.validate(formSource(form));
+            return Array.isArray(list) ? list.filter(isObj) : [];
+        } catch (e) {
+            return [];
+        }
+    }
+
+    function sourceWarnings(form) {
+        return sourceProblems(form).filter((p) => p.severity !== 'error');
+    }
+
+    // The messages are the kind's, verbatim. hangar must not paraphrase a warning
+    // about a backup that may not restore into something more comfortable — and a
+    // second copy of the wording here would drift from the one core/ enforces.
+    //
+    // `key` exists because `code` is not unique: a source naming both a postgres
+    // and a mongo container raises 'live-database' twice, and Alpine's x-for keeps
+    // only the first row of any repeated :key — the user would be warned about one
+    // database and told nothing about the other. The position is stable because the
+    // list is rebuilt from the same validate() call on every render.
+    function riskWarnings(form) {
+        return sourceWarnings(form)
+            .filter((p) => RISK_CODES.indexOf(str(p.code)) >= 0)
+            .map((p, index) => ({
+                key: str(p.code) + '#' + index,
+                code: str(p.code),
+                message: str(p.message)
+            }));
+    }
+
+    // What the configured source actually does, in the kind's own sentence.
+    function sourceDescription(form) {
+        const Sources = ensureSourceKinds();
+        if (!Sources) return '';
+        try {
+            return str(Sources.describe(formSource(form)));
+        } catch (e) {
+            return '';
+        }
     }
 
     // `taken` is the list of ids that already exist; only a *new* job can collide.
@@ -402,7 +768,6 @@
         const f = isObj(form) ? form : {};
         const out = [];
         const Config = M('HangarConfig');
-        const Sources = M('HangarSources');
         const Retention = M('HangarRetention');
         const Schedule = M('HangarSchedule');
 
@@ -425,11 +790,15 @@
         if (!str(f.repo).trim())
             out.push(problem('error', 'repo-required', 'repo', 'Choose the repository this job backs up to.'));
 
-        if (Sources) {
-            Sources.validate(formSource(f)).forEach((p) => {
-                out.push(problem(p.severity, 'source-' + p.code, fieldForSourceProblem(p.code), p.message));
-            });
-        }
+        // Through sourceProblems(), not the registry directly: this function is on
+        // the render path (canSave/invalid/messageFor all call it), and the v2 seam
+        // means the kind doing the validating may be a third party's. A kind that
+        // throws — or that reports a list with a hole in it — must not blank the
+        // editor the user would have fixed it from.
+        sourceProblems(f).forEach((p) => {
+            out.push(problem(p.severity, 'source-' + str(p.code),
+                fieldForSourceProblem(p.code), str(p.message)));
+        });
 
         // The guard that matters: `restic forget --prune` with a policy that keeps
         // nothing destroys every snapshot in the group, and that is unrecoverable.
@@ -859,6 +1228,29 @@
         }
     }
 
+    // core/sources-container.js exports listVolumes() but no listContainers() —
+    // only the argv builder and the parser, which is all this needs. Built the
+    // same way that module builds its own: argv from the pure builder, one guarded
+    // spawn, the pure parser on the way out. (parseVolumeNames is the shared
+    // "one name per line" parser; `ps --format '{{.Names}}'` emits exactly that.)
+    function listContainerNames(runtime, user) {
+        const C = M('HangarSourcesContainer');
+        if (!C) return Promise.resolve([]);
+        let argv;
+        try {
+            argv = C.containerListArgv(runtime, user);
+        } catch (e) {
+            return Promise.reject(e);
+        }
+        if (!hasCockpit()) return Promise.resolve([]);
+        try {
+            return Promise.resolve(cockpit.spawn(argv, { superuser: 'require', err: 'message' }))
+                .then(C.parseVolumeNames);
+        } catch (e) {
+            return Promise.reject(e);
+        }
+    }
+
     // ------------------------------------------------------------- the list UI
 
     function hangarJobsUi() {
@@ -1016,10 +1408,10 @@
             },
 
             describeSources(row) {
-                const Sources = M('HangarSources');
+                const Sources = ensureSourceKinds();
                 if (!Sources) return '';
                 try {
-                    return Sources.describe(mergeFilesystemSources(row && row.job));
+                    return Sources.describe(primarySource(row && row.job));
                 } catch (e) {
                     return '';
                 }
@@ -1203,11 +1595,36 @@
                 return this.startBackup(row && row.job);
             },
 
+            // Hands a container or VM job to its systemd unit. Nothing else can do
+            // it correctly: the volume mount points are only knowable by asking the
+            // runtime as the owning user, and the pause/freeze around the copy has
+            // to be unwound in a try/finally that survives this page being closed.
+            async startViaUnit(job) {
+                const Schedule = M('HangarSchedule');
+                const j = isObj(job) ? job : {};
+                this.failure = null;
+                this.partial = null;
+                this.working = true;
+                this.run = { jobId: j.id, percent: null, label: 'Handed to systemd…' };
+                try {
+                    if (!Schedule) throw err('GENERIC', 'A required module is not loaded.');
+                    await Schedule.runNow(j.id);
+                } catch (e) {
+                    this.failure = this.failureFor(j, null, e, 'backup');
+                } finally {
+                    this.run = null;
+                    this.working = false;
+                }
+                await this.reload();
+            },
+
             async startBackup(job) {
                 const Restic = M('HangarRestic');
                 const Repos = M('HangarRepos');
                 const Secrets = M('HangarSecrets');
                 const j = isObj(job) ? job : {};
+
+                if (!runsInBrowser(j)) return this.startViaUnit(j);
 
                 const repo = this.repos.filter((r) => r && r.id === j.repo)[0];
                 if (!repo || repo.unreadable) {
@@ -1374,6 +1791,14 @@
             problems: [],
             submitted: false,
             modes: SCHEDULE_MODES,
+            // What the host answered, kept out of the form so it is never saved.
+            discovered: { volumes: [], containers: [], domains: [] },
+            // Per-list: 'idle' | 'busy' | 'ok' | 'empty' | 'failed', plus why.
+            discovery: { volumes: null, containers: null, domains: null },
+            // The manual fallback. Switched on by a failed or empty discovery, and
+            // by the user, but never switched off automatically — a name someone
+            // typed must not vanish because a later probe succeeded.
+            manual: { volumes: false, containers: false, domains: false },
             _resolve: null,
 
             init() {
@@ -1388,9 +1813,167 @@
                     this.taken = Array.isArray(detail.taken) ? detail.taken : [];
                     this.submitted = false;
                     this.problems = [];
+                    this.discovered = { volumes: [], containers: [], domains: [] };
+                    this.discovery = { volumes: null, containers: null, domains: null };
+                    this.manual = { volumes: false, containers: false, domains: false };
                     this._resolve = detail.resolve || null;
                     showModal(MODAL_ID);
+                    this.discover();
                 });
+            },
+
+            // ---- source kind ---------------------------------------------
+
+            kinds() { return sourceKinds(); },
+            kindLabel(id) { return sourceKindLabel(id); },
+
+            kindDescription() {
+                const k = SOURCE_KINDS.filter((e) => e.id === str(this.form.sourceKind))[0];
+                return k ? k.description : '';
+            },
+
+            onKindChange() {
+                this.discover();
+                this.revalidate();
+            },
+
+            isKind(id) { return str(this.form.sourceKind) === id; },
+
+            // ---- the option tables, read from the kinds themselves --------
+
+            runtimes() { return runtimeOptions(); },
+            consistencies() { return consistencyOptions(); },
+            uris() { return uriOptions(); },
+            quiesces() { return quiesceOptions(); },
+
+            // The selected mode's own description, shown beside the picker rather
+            // than behind a tooltip: the difference between these modes is the
+            // difference between a backup that restores and one that does not.
+            consistencyInfo() {
+                return consistencyInfo((this.form.container || {}).consistency);
+            },
+
+            quiesceInfo() {
+                return quiesceInfo((this.form.libvirt || {}).quiesce);
+            },
+
+            consistencyText() {
+                const m = this.consistencyInfo();
+                return m ? m.description : '';
+            },
+
+            quiesceText() {
+                const m = this.quiesceInfo();
+                return m ? m.description : '';
+            },
+
+            // 'high' | 'medium' | 'low' — only the container table carries a risk
+            // rating, so libvirt falls back to the warning list to colour itself.
+            consistencyRisk() {
+                const m = this.consistencyInfo();
+                return m && m.risk ? str(m.risk) : '';
+            },
+
+            // ---- the warnings that decide whether a backup restores --------
+
+            warnings() { return riskWarnings(this.form); },
+            hasWarnings() { return this.warnings().length > 0; },
+            sourceText() { return sourceDescription(this.form); },
+
+            // ---- discovery -------------------------------------------------
+
+            volumeChoices() {
+                return checkboxList(this.discovered.volumes, (this.form.container || {}).volumes);
+            },
+
+            containerChoices() {
+                return checkboxList(this.discovered.containers, (this.form.container || {}).containers);
+            },
+
+            domainChoices() {
+                return checkboxList(this.discovered.domains, (this.form.libvirt || {}).domains);
+            },
+
+            discoveryState(which) {
+                const d = this.discovery[which];
+                return d ? str(d.state) : 'idle';
+            },
+
+            discoveryMessage(which) {
+                const d = this.discovery[which];
+                return d ? str(d.message) : '';
+            },
+
+            // One place decides what a discovery result means, so an empty answer
+            // and a failed one both end up offering the manual list.
+            _settle(which, names, error) {
+                const list = Array.isArray(names) ? names.filter((n) => typeof n === 'string') : [];
+                this.discovered[which] = list;
+                if (error) {
+                    this.discovery[which] = {
+                        state: 'failed',
+                        message: str(error.message) || 'The host did not answer.'
+                    };
+                    this.manual[which] = true;
+                    return;
+                }
+                this.discovery[which] = { state: list.length ? 'ok' : 'empty', message: '' };
+                if (!list.length) this.manual[which] = true;
+            },
+
+            _probe(which, run) {
+                this.discovery[which] = { state: 'busy', message: '' };
+                let promise;
+                try {
+                    promise = run();
+                } catch (e) {
+                    this._settle(which, [], e);
+                    return Promise.resolve();
+                }
+                return Promise.resolve(promise).then(
+                    (names) => { this._settle(which, names, null); },
+                    (e) => { this._settle(which, [], e || {}); }
+                );
+            },
+
+            discover() {
+                if (this.isKind('container')) return this.discoverContainerNames();
+                if (this.isKind('libvirt')) return this.discoverDomains();
+                return Promise.resolve();
+            },
+
+            discoverContainerNames() {
+                const C = M('HangarSourcesContainer');
+                const c = this.form.container || {};
+                if (!C) return Promise.resolve();
+                return Promise.all([
+                    this._probe('volumes', () => C.listVolumes(c.runtime, c.user)),
+                    this._probe('containers', () => listContainerNames(c.runtime, c.user))
+                ]);
+            },
+
+            discoverDomains() {
+                const L = M('HangarSourcesLibvirt');
+                if (!L) return Promise.resolve();
+                return this._probe('domains',
+                    () => L.listDomains((this.form.libvirt || {}).uri));
+            },
+
+            // The runtime, the owning user and the connection URI all change which
+            // store is being read, so each of them re-asks rather than leaving a
+            // list from the previous one on screen.
+            onRuntimeChange() {
+                this.discoverContainerNames();
+                this.revalidate();
+            },
+
+            onUriChange() {
+                this.discoverDomains();
+                this.revalidate();
+            },
+
+            useManual(which) {
+                this.manual[which] = true;
             },
 
             // Custom is always offered: with no retention module loaded it is the
@@ -1497,9 +2080,17 @@
 
     const HangarJobsUi = {
         SCHEDULE_MODES, COUNT_FIELDS, REMEDIATION_LABELS, SCREEN,
+        SOURCE_KINDS, RISK_CODES,
         // pure
-        emptyForm, presetFields, formRetention, presetNameFor, keepsNothing,
+        emptyForm, emptyContainerFields, emptyLibvirtFields,
+        presetFields, formRetention, presetNameFor, keepsNothing,
         formCalendar, scheduleModeFor, formSource, mergeFilesystemSources,
+        primaryKind, primarySource, runsInBrowser,
+        nameList, checkboxList, fieldForSourceProblem,
+        sourceKinds, sourceKindLabel, ensureSourceKinds,
+        runtimeOptions, consistencyOptions, consistencyInfo,
+        uriOptions, quiesceOptions, quiesceInfo,
+        sourceProblems, sourceWarnings, riskWarnings, sourceDescription,
         formStateToJob, jobToFormState,
         validateForm, hasErrors, problemsFor, failureTitle, FAILURE_TITLES,
         formatBytes, progressPercent, progressLabel, unreadableFiles, MAX_UNREADABLE,

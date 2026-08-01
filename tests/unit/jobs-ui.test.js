@@ -1835,3 +1835,1320 @@ test('every field that can show an error also reports its validity', () => {
 test('the submit-blocked message announces itself', () => {
     assert.match(editHtml, /role="alert"[\s\S]{0,120}Fix the highlighted fields/);
 });
+
+// ========================================================================
+// v2 — container and libvirt source kinds in the editor
+//
+// The editor grew a source-kind chooser and a form per kind. What is tested
+// here is the same thing that is tested above: the pure functions that decide,
+// not the Alpine bindings that display. The one exception is discovery, which
+// is impure by nature — those tests assert what happens when the host does not
+// answer, because on this development host it frequently does not.
+// ========================================================================
+
+const Container = require('../../js/core/sources-container.js');
+const Libvirt = require('../../js/core/sources-libvirt.js');
+const Sources = require('../../js/core/sources.js');
+
+const {
+    sourceKinds, sourceKindLabel, runtimeOptions, consistencyOptions, consistencyInfo,
+    uriOptions, quiesceOptions, quiesceInfo, nameList, checkboxList,
+    fieldForSourceProblem, sourceWarnings, riskWarnings, sourceDescription,
+    primaryKind, primarySource, runsInBrowser, emptyContainerFields, emptyLibvirtFields
+} = Jobs;
+
+function containerForm(over) {
+    const f = emptyForm();
+    f.id = 'vols';
+    f.name = 'Container volumes';
+    f.repo = 'nas';
+    f.sourceKind = 'container';
+    Object.assign(f.container, { user: 'appuser', volumes: ['pgdata'] }, (over || {}).container || {});
+    return Object.assign(f, over && over.form ? over.form : {});
+}
+
+function libvirtForm(over) {
+    const f = emptyForm();
+    f.id = 'vms';
+    f.name = 'Virtual machines';
+    f.repo = 'nas';
+    f.sourceKind = 'libvirt';
+    Object.assign(f.libvirt, { domains: ['web01'] }, (over || {}).libvirt || {});
+    return f;
+}
+
+function messages(list) { return list.map((p) => p.message); }
+
+// --- the chooser is driven by the registry, not by a second list ---------
+
+test('the chooser offers exactly the kinds that registered themselves', () => {
+    const offered = sourceKinds().map((k) => k.id);
+    assert.deepEqual(offered.slice().sort(), Sources.kinds());
+    // Order is the chooser's, not the registry's alphabetical order: files first
+    // because it is what most jobs are.
+    assert.deepEqual(offered, ['filesystem', 'container', 'libvirt']);
+});
+
+test('every offered kind has a label and a description', () => {
+    sourceKinds().forEach((k) => {
+        assert.equal(typeof k.label, 'string');
+        assert.ok(k.label.length > 0, k.id + ' has no label');
+        assert.ok(k.description.length > 0, k.id + ' has no description');
+    });
+});
+
+test('an unknown kind id labels as itself rather than as "undefined"', () => {
+    assert.equal(sourceKindLabel('container'), 'Container volumes');
+    [null, undefined, '', 42, {}, '__proto__', 'constructor'].forEach((bad) => {
+        assert.equal(typeof sourceKindLabel(bad), 'string');
+    });
+});
+
+// --- the option tables come from the kinds, never from a copy ------------
+
+test('the runtime picker is the container module RUNTIMES table', () => {
+    assert.deepEqual(runtimeOptions(), Container.RUNTIMES);
+    // A copy, so a component cannot mutate the module's table by reference.
+    assert.notEqual(runtimeOptions(), Container.RUNTIMES);
+});
+
+test('the consistency picker is the container CONSISTENCY table, worst first', () => {
+    const ids = consistencyOptions().map((m) => m.id);
+    assert.deepEqual(ids, Container.CONSISTENCY_IDS);
+    assert.equal(ids[0], 'none', 'the ordering of the table is the advice');
+    consistencyOptions().forEach((m) => {
+        assert.equal(m, Container.CONSISTENCY[m.id], 'a mode was rewritten instead of read');
+        assert.ok(m.description.length > 0);
+        assert.ok(['high', 'medium', 'low'].indexOf(m.risk) >= 0);
+    });
+});
+
+test('the connection picker is the libvirt URIS table', () => {
+    assert.deepEqual(uriOptions().map((u) => u.id), Libvirt.URIS.map((u) => u.id));
+});
+
+test('the quiesce picker is the libvirt QUIESCE table', () => {
+    assert.deepEqual(quiesceOptions(), Libvirt.QUIESCE);
+    quiesceOptions().forEach((m) => assert.ok(m.description.length > 0));
+});
+
+test('an unknown mode id yields no mode rather than a made-up one', () => {
+    assert.equal(consistencyInfo('stop').id, 'stop');
+    assert.equal(quiesceInfo('agent').id, 'agent');
+    [null, undefined, '', 'nonsense', 42, {}, '__proto__', 'constructor', 'toString'].forEach((bad) => {
+        assert.equal(consistencyInfo(bad), null, String(bad));
+        assert.equal(quiesceInfo(bad), null, String(bad));
+    });
+});
+
+// --- form defaults -------------------------------------------------------
+
+test('a new form starts on the filesystem kind, so v1 behaviour is the default', () => {
+    assert.equal(emptyForm().sourceKind, 'filesystem');
+});
+
+test('the container form defaults to the module defaults', () => {
+    const c = emptyContainerFields();
+    assert.equal(c.runtime, Container.DEFAULT_RUNTIME);
+    assert.equal(c.consistency, Container.DEFAULT_CONSISTENCY);
+    assert.deepEqual(c.volumes, []);
+    assert.deepEqual(c.containers, []);
+});
+
+test('the libvirt form defaults to the module defaults, with the XML on', () => {
+    const v = emptyLibvirtFields();
+    assert.equal(v.uri, Libvirt.DEFAULT_URI);
+    assert.equal(v.quiesce, Libvirt.DEFAULT_QUIESCE);
+    // The one default that is a data-safety decision: a disk image without its
+    // domain XML is not a VM you can start.
+    assert.equal(v.includeXml, true);
+});
+
+// --- formSource dispatches on the chosen kind ----------------------------
+
+test('formSource builds a container source when the container kind is chosen', () => {
+    const s = formSource(containerForm());
+    assert.equal(s.kind, 'container');
+    assert.equal(s.runtime, 'podman');
+    assert.equal(s.user, 'appuser');
+    assert.deepEqual(s.volumes, ['pgdata']);
+    assert.equal('paths' in s, false, 'a container source must not carry filesystem paths');
+});
+
+test('formSource builds a libvirt source when the libvirt kind is chosen', () => {
+    const s = formSource(libvirtForm());
+    assert.equal(s.kind, 'libvirt');
+    assert.equal(s.uri, 'qemu:///system');
+    assert.deepEqual(s.domains, ['web01']);
+    assert.equal(s.includeXml, true);
+});
+
+test('an unknown or hostile sourceKind falls back to filesystem', () => {
+    [null, undefined, '', 'nonsense', 42, {}, [], '__proto__', 'constructor'].forEach((bad) => {
+        const f = emptyForm();
+        f.sourceKind = bad;
+        f.paths = '/etc';
+        assert.equal(formSource(f).kind, 'filesystem', String(bad));
+    });
+});
+
+test('formSource survives a form whose per-kind section is missing entirely', () => {
+    [null, undefined, 42, 'nonsense', []].forEach((bad) => {
+        const c = emptyForm();
+        c.sourceKind = 'container';
+        c.container = bad;
+        assert.equal(formSource(c).kind, 'container');
+        const v = emptyForm();
+        v.sourceKind = 'libvirt';
+        v.libvirt = bad;
+        assert.equal(formSource(v).kind, 'libvirt');
+    });
+});
+
+test('the dump command is written only by the mode that runs it', () => {
+    const f = containerForm({ container: { consistency: 'stop', containers: ['app'], command: 'pg_dump app' } });
+    assert.equal('command' in formSource(f), false,
+        'a command left behind by another mode would never run, and the user would still believe in it');
+
+    f.container.consistency = 'command';
+    assert.equal(formSource(f).command, 'pg_dump app');
+});
+
+test('includeXml=false is written explicitly, not omitted', () => {
+    // normalize() reads an absent includeXml as true, so an omitted false would
+    // silently turn the XML back on between saving and running.
+    const s = formSource(libvirtForm({ libvirt: { includeXml: false } }));
+    assert.equal(s.includeXml, false);
+    assert.equal(Libvirt.normalize(s).includeXml, false);
+});
+
+// --- ticked names plus typed names --------------------------------------
+
+test('nameList unions what was ticked with what was typed', () => {
+    assert.deepEqual(nameList(['a', 'b'], 'c\nd'), ['a', 'b', 'c', 'd']);
+});
+
+test('nameList de-duplicates across the two, keeping the ticked order', () => {
+    assert.deepEqual(nameList(['b', 'a'], 'a\nc\nb'), ['b', 'a', 'c']);
+});
+
+test('nameList trims, and drops blank lines rather than making empty names', () => {
+    assert.deepEqual(nameList([], '  pgdata  \n\n\n uploads \n'), ['pgdata', 'uploads']);
+    assert.deepEqual(nameList([], ''), []);
+    assert.deepEqual(nameList([], '   \n  '), []);
+});
+
+test('nameList accepts a string where a list was expected', () => {
+    assert.deepEqual(nameList('a\nb', 'c'), ['a', 'b', 'c']);
+});
+
+test('nameList survives every garbage shape', () => {
+    [null, undefined, 42, {}, [null, 3, 'ok'], true].forEach((bad) => {
+        assert.doesNotThrow(() => nameList(bad, bad));
+        assert.ok(Array.isArray(nameList(bad, bad)));
+    });
+    assert.deepEqual(nameList([null, 3, 'ok'], null), ['ok']);
+});
+
+// --- the multi-select list ----------------------------------------------
+
+test('a selected volume the runtime no longer reports still appears, flagged', () => {
+    // Dropping it from the list would drop it from the backup on the next save,
+    // with nothing on screen to say so.
+    const list = checkboxList(['pgdata', 'uploads'], ['pgdata', 'gone']);
+    assert.deepEqual(list.map((e) => e.name), ['pgdata', 'uploads', 'gone']);
+    assert.deepEqual(list.map((e) => e.discovered), [true, true, false]);
+});
+
+test('the choice list de-duplicates and survives garbage', () => {
+    assert.deepEqual(checkboxList(['a', 'a'], ['a']), [{ name: 'a', discovered: true }]);
+    [null, undefined, 42, {}, 'a\nb'].forEach((bad) => {
+        assert.doesNotThrow(() => checkboxList(bad, bad));
+    });
+    assert.deepEqual(checkboxList([], []), []);
+});
+
+// --- THE WARNINGS: the reason this screen exists ------------------------
+
+test('a live copy of a running database is warned about, in the kind\'s own words', () => {
+    const f = containerForm({ container: { consistency: 'none', containers: ['app-postgres-1'] } });
+    const warnings = riskWarnings(f);
+    const live = warnings.filter((w) => w.code === 'live-database')[0];
+    assert.ok(live, 'no warning was raised for a live copy of a postgres container');
+
+    // Verbatim from the kind. A second copy of this wording here would drift
+    // from the one core/ enforces, and this is not wording to get wrong.
+    const fromKind = Sources.validate(formSource(f))
+        .filter((p) => p.code === 'live-database')[0];
+    assert.equal(live.message, fromKind.message);
+    assert.match(live.message, /may not restore|will not restore/);
+});
+
+test('every database hint the container kind knows is warned about', () => {
+    Container.DATABASE_HINTS.forEach((hint) => {
+        const f = containerForm({ container: { consistency: 'none', containers: ['prod-' + hint + '-1'] } });
+        assert.ok(riskWarnings(f).some((w) => w.code === 'live-database'),
+            'a container named after ' + hint + ' was not flagged');
+    });
+});
+
+test('choosing a safe consistency mode clears the database warning', () => {
+    ['stop', 'command'].forEach((mode) => {
+        const f = containerForm({
+            container: { consistency: mode, containers: ['app-postgres-1'], command: 'pg_dumpall > /backup/all.sql' }
+        });
+        assert.deepEqual(riskWarnings(f).filter((w) => w.code === 'live-database'), []);
+    });
+});
+
+test('a podman source with no owning user is warned about', () => {
+    // The single most likely reason a rootless container backup comes back empty.
+    const f = containerForm({ container: { user: '' } });
+    assert.ok(riskWarnings(f).some((w) => w.code === 'no-user'));
+    assert.deepEqual(riskWarnings(containerForm()).filter((w) => w.code === 'no-user'), []);
+});
+
+test('each libvirt quiesce mode raises exactly the warning it deserves', () => {
+    const codes = (mode) => riskWarnings(libvirtForm({ libvirt: { quiesce: mode } })).map((w) => w.code);
+    assert.deepEqual(codes('none'), ['quiesce-crash-consistent']);
+    assert.deepEqual(codes('agent'), ['quiesce-agent-required']);
+    assert.deepEqual(codes('shutdown'), []);
+});
+
+test('turning the domain XML off is warned about', () => {
+    const codes = riskWarnings(libvirtForm({ libvirt: { quiesce: 'shutdown', includeXml: false } }))
+        .map((w) => w.code);
+    assert.deepEqual(codes, ['no-xml']);
+});
+
+test('every risk code this screen promotes is a code a kind actually emits', () => {
+    // A code in RISK_CODES that no kind emits is a warning that silently never
+    // shows; the opposite is a warning shown as grey helper text.
+    const emitted = Object.keys(Container.PROBLEM).map((k) => Container.PROBLEM[k])
+        .concat(Object.keys(Libvirt.PROBLEM).map((k) => Libvirt.PROBLEM[k]));
+    Jobs.RISK_CODES.forEach((code) => {
+        assert.ok(emitted.indexOf(code) >= 0, code + ' is promoted but no kind emits it');
+    });
+});
+
+test('warnings are warnings: none of them blocks saving', () => {
+    const forms = [
+        containerForm({ container: { user: '', consistency: 'none', containers: ['mongo'] } }),
+        libvirtForm({ libvirt: { quiesce: 'none', includeXml: false } })
+    ];
+    forms.forEach((f) => {
+        const problems = validateForm(f, []);
+        assert.ok(problems.some((p) => p.severity === 'warning'), 'the warning was lost');
+        assert.equal(hasErrors(problems), false, 'a warning blocked the save');
+        assert.ok(riskWarnings(f).length > 0);
+    });
+});
+
+test('riskWarnings and sourceWarnings never throw, for any form', () => {
+    [null, undefined, 42, 'nonsense', [], {}, { sourceKind: 'container' },
+        { sourceKind: 'libvirt', libvirt: null }, { sourceKind: '__proto__' }].forEach((bad) => {
+        assert.doesNotThrow(() => riskWarnings(bad), String(bad));
+        assert.doesNotThrow(() => sourceWarnings(bad), String(bad));
+        assert.ok(Array.isArray(riskWarnings(bad)));
+    });
+});
+
+test('sourceDescription reports the kind\'s own sentence, and never throws', () => {
+    assert.match(sourceDescription(containerForm()), /podman volume/);
+    assert.match(sourceDescription(libvirtForm()), /web01/);
+    assert.match(sourceDescription(emptyForm()), /no paths/);
+    [null, undefined, 42, [], { sourceKind: 'container', container: null }].forEach((bad) => {
+        assert.doesNotThrow(() => sourceDescription(bad));
+        assert.equal(typeof sourceDescription(bad), 'string');
+    });
+});
+
+// --- problems land next to the field that causes them -------------------
+
+test('every new problem code is routed to its own field, not to the catch-all', () => {
+    const routes = {
+        'no-volumes': 'volumes', 'volume-unsafe': 'volumes', 'volume-duplicate': 'volumes',
+        'no-containers': 'containers', 'container-empty': 'containers',
+        'bad-runtime': 'runtime',
+        'bad-user': 'user', 'no-user': 'user',
+        'no-command': 'command', 'command-nul': 'command',
+        'bad-consistency': 'consistency', 'live-database': 'consistency',
+        'no-domains': 'domains', 'domain-unsafe': 'domains',
+        'uri-empty': 'uri',
+        'quiesce-unknown': 'quiesce', 'quiesce-crash-consistent': 'quiesce',
+        'no-xml': 'includeXml',
+        // v1 routing is untouched.
+        'no-paths': 'paths', 'path-traversal': 'paths',
+        'pattern-empty': 'excludes', 'tag-comma': 'tags', 'exclude-file-relative': 'excludeFile'
+    };
+    Object.keys(routes).forEach((code) => {
+        assert.equal(fieldForSourceProblem(code), routes[code], code);
+    });
+});
+
+test('an unrecognised code still lands somewhere that is rendered', () => {
+    [null, undefined, 42, {}, 'who-knows', '__proto__'].forEach((bad) => {
+        assert.equal(fieldForSourceProblem(bad), 'source', String(bad));
+    });
+});
+
+test('a container source with no volumes is an error on the volumes field', () => {
+    const f = containerForm({ container: { volumes: [] } });
+    const problems = validateForm(f, []);
+    assert.ok(hasErrors(problems));
+    assert.ok(problemsFor(problems, 'volumes').some((p) => p.severity === 'error'));
+});
+
+test('the dump-command mode without a command is an error on the command field', () => {
+    const f = containerForm({ container: { consistency: 'command', containers: ['app'], command: '' } });
+    const problems = validateForm(f, []);
+    assert.ok(problemsFor(problems, 'command').some((p) => p.severity === 'error'));
+});
+
+test('pausing or stopping with no container named is an error on the container field', () => {
+    ['pause', 'stop'].forEach((mode) => {
+        const f = containerForm({ container: { consistency: mode, containers: [] } });
+        assert.ok(problemsFor(validateForm(f, []), 'containers').some((p) => p.severity === 'error'), mode);
+    });
+});
+
+test('a libvirt source with no domain is an error on the domains field', () => {
+    const f = libvirtForm({ libvirt: { domains: [] } });
+    assert.ok(problemsFor(validateForm(f, []), 'domains').some((p) => p.severity === 'error'));
+});
+
+test('a name the runtime would refuse is reported against the field it was typed in', () => {
+    const f = containerForm({ container: { volumes: [], volumesText: '-rf' } });
+    assert.ok(problemsFor(validateForm(f, []), 'volumes').some((p) => p.severity === 'error'));
+});
+
+test('a fully configured container job saves cleanly', () => {
+    const f = containerForm({
+        container: { consistency: 'stop', containers: ['app-postgres-1'], user: 'appuser' }
+    });
+    assert.equal(hasErrors(validateForm(f, [])), false, JSON.stringify(validateForm(f, [])));
+});
+
+// --- job <-> form round trips -------------------------------------------
+
+test('a container job round-trips through the form unchanged', () => {
+    const job = {
+        id: 'vols', name: 'Volumes', repo: 'nas', enabled: true,
+        sources: [{
+            id: 'main', kind: 'container', runtime: 'docker', user: 'appuser',
+            volumes: ['pgdata', 'uploads'], consistency: 'stop',
+            containers: ['app', 'app-postgres-1'], excludes: ['*.sock'], tags: ['nightly']
+        }],
+        retention: { hourly: 24, daily: 30, weekly: 52, monthly: 12 },
+        schedule: { calendar: 'daily' }
+    };
+    const back = formStateToJob(jobToFormState(job));
+    assert.deepEqual(back.sources, job.sources);
+});
+
+test('a libvirt job round-trips through the form unchanged', () => {
+    const job = {
+        id: 'vms', name: 'VMs', repo: 'nas', enabled: true,
+        sources: [{
+            id: 'main', kind: 'libvirt', uri: 'qemu:///session',
+            domains: ['db01', 'web01'], quiesce: 'agent', includeXml: false,
+            excludes: ['*.iso'], tags: ['vm']
+        }],
+        retention: { daily: 7 },
+        schedule: { calendar: 'daily' }
+    };
+    const back = formStateToJob(jobToFormState(job));
+    assert.deepEqual(back.sources, job.sources);
+});
+
+test('a container-only job opens on the container form, not an empty file form', () => {
+    const f = jobToFormState({
+        id: 'vols', repo: 'nas',
+        sources: [{ id: 'main', kind: 'container', volumes: ['pgdata'], consistency: 'pause', containers: ['db'] }]
+    });
+    assert.equal(f.sourceKind, 'container');
+    assert.deepEqual(f.container.volumes, ['pgdata']);
+    assert.equal(f.container.consistency, 'pause');
+    assert.equal(f.paths, '', 'a container job must not present itself as a file job');
+    assert.deepEqual(f.otherSources, []);
+});
+
+test('a libvirt-only job opens on the libvirt form with its XML setting intact', () => {
+    const f = jobToFormState({
+        id: 'vms', repo: 'nas',
+        sources: [{ id: 'main', kind: 'libvirt', domains: ['web01'], includeXml: false, quiesce: 'shutdown' }]
+    });
+    assert.equal(f.sourceKind, 'libvirt');
+    assert.equal(f.libvirt.includeXml, false);
+    assert.equal(f.libvirt.quiesce, 'shutdown');
+    assert.deepEqual(f.libvirt.domains, ['web01']);
+});
+
+test('a filesystem source still wins the editor when a job has both', () => {
+    // A v1 job that gained a container source must keep editing as it did in v1.
+    const job = sampleJob();
+    job.sources.push({ id: 'vols', kind: 'container', volumes: ['pgdata'] });
+    const f = jobToFormState(job);
+    assert.equal(f.sourceKind, 'filesystem');
+    assert.equal(f.paths, '/etc\n/home');
+    assert.deepEqual(formStateToJob(f).sources[1], { id: 'vols', kind: 'container', volumes: ['pgdata'] });
+});
+
+test('a second source of the edited kind survives the edit untouched', () => {
+    // Two container sources may name different runtimes or different users, so
+    // merging them the way filesystem sources are merged would be wrong.
+    const second = { id: 'other', kind: 'container', runtime: 'docker', user: 'root', volumes: ['cache'] };
+    const job = {
+        id: 'vols', repo: 'nas',
+        sources: [{ id: 'main', kind: 'container', volumes: ['pgdata'] }, second]
+    };
+    const back = formStateToJob(jobToFormState(job));
+    assert.equal(back.sources.length, 2);
+    assert.deepEqual(back.sources[1], second);
+});
+
+test('primaryKind and primarySource agree, and never throw', () => {
+    assert.equal(primaryKind(sampleJob()), 'filesystem');
+    assert.equal(primaryKind({ sources: [{ kind: 'libvirt', domains: ['a'] }] }), 'libvirt');
+    assert.equal(primaryKind({ sources: [{ kind: 'container', volumes: ['a'] }] }), 'container');
+    // Nothing renderable falls back to the filesystem form, which is empty and
+    // harmless rather than an editor that refuses to open.
+    [null, undefined, 42, {}, { sources: null }, { sources: [null, 'x', 7] },
+        { sources: [{ kind: 'martian' }] }].forEach((bad) => {
+        assert.equal(primaryKind(bad), 'filesystem', JSON.stringify(bad));
+        assert.doesNotThrow(() => primarySource(bad));
+    });
+});
+
+test('a job the browser cannot back up correctly is handed to its unit instead', () => {
+    // Running restic here for a container job would back up an empty path vector
+    // and report success. The unit resolves the mount points and unwinds the
+    // pause in a try/finally that survives this page being closed.
+    assert.equal(runsInBrowser(sampleJob()), true);
+    assert.equal(runsInBrowser({ sources: [{ kind: 'container', volumes: ['a'] }] }), false);
+    assert.equal(runsInBrowser({ sources: [{ kind: 'libvirt', domains: ['a'] }] }), false);
+    assert.equal(runsInBrowser({}), true);
+});
+
+test('startBackup delegates a container job to systemd and never runs restic', async () => {
+    const calls = [];
+    const job = {
+        id: 'vols', name: 'Volumes', repo: 'nas', enabled: true,
+        sources: [{ id: 'main', kind: 'container', volumes: ['pgdata'] }],
+        retention: { daily: 7 }, schedule: { calendar: 'daily' }
+    };
+    const ops = [];
+    const world = baseWorld({
+        jobs: { vols: job },
+        repos: { nas: sampleRepo() },
+        run: async (op) => { ops.push(op); return { status: 'ok', errors: [] }; },
+        schedule: { runNow: async (id) => { calls.push(id); } }
+    });
+    await withStubs(world, async () => {
+        const c = Jobs.hangarJobsUi();
+        await c.reload();
+        await c.startBackup(job);
+        assert.deepEqual(calls, ['vols']);
+        assert.deepEqual(ops, [], 'restic was run against a source it cannot resolve');
+        assert.equal(c.failure, null);
+        assert.equal(c.run, null);
+        assert.equal(c.working, false);
+    });
+});
+
+test('a unit that refuses to start is reported, not swallowed', async () => {
+    const job = {
+        id: 'vms', repo: 'nas',
+        sources: [{ id: 'main', kind: 'libvirt', domains: ['web01'] }],
+        retention: { daily: 7 }, schedule: { calendar: 'daily' }
+    };
+    const world = baseWorld({
+        jobs: { vms: job },
+        repos: { nas: sampleRepo() },
+        schedule: { runNow: async () => { throw hangarError('GENERIC', 'Unit not found.'); } }
+    });
+    await withStubs(world, async () => {
+        const c = Jobs.hangarJobsUi();
+        await c.reload();
+        await c.startBackup(job);
+        assert.ok(c.failure);
+        assert.match(c.failure.message, /Unit not found/);
+        assert.equal(c.working, false);
+    });
+});
+
+test('the job list describes a container job as a container job', () => {
+    const c = Jobs.hangarJobsUi();
+    const text = c.describeSources({
+        id: 'vols',
+        job: { id: 'vols', sources: [{ id: 'main', kind: 'container', volumes: ['pgdata'], user: 'appuser' }] }
+    });
+    assert.match(text, /podman volume/);
+    assert.doesNotMatch(text, /no paths/);
+});
+
+// --- the editor component -----------------------------------------------
+
+test('the editor constructs and answers every new question with no DOM', () => {
+    const e = Jobs.hangarJobEdit();
+    assert.doesNotThrow(() => e.kinds());
+    assert.doesNotThrow(() => e.kindDescription());
+    assert.doesNotThrow(() => e.runtimes());
+    assert.doesNotThrow(() => e.consistencies());
+    assert.doesNotThrow(() => e.uris());
+    assert.doesNotThrow(() => e.quiesces());
+    assert.doesNotThrow(() => e.warnings());
+    assert.doesNotThrow(() => e.sourceText());
+    assert.doesNotThrow(() => e.volumeChoices());
+    assert.doesNotThrow(() => e.containerChoices());
+    assert.doesNotThrow(() => e.domainChoices());
+    assert.equal(e.discoveryState('volumes'), 'idle');
+    assert.equal(e.discoveryMessage('domains'), '');
+});
+
+test('the editor surfaces the mode description at the moment of choosing', () => {
+    const e = Jobs.hangarJobEdit();
+    e.form = containerForm({ container: { consistency: 'none' } });
+    assert.equal(e.consistencyText(), Container.CONSISTENCY.none.description);
+    assert.equal(e.consistencyRisk(), 'high');
+    e.form.container.consistency = 'stop';
+    assert.equal(e.consistencyRisk(), 'low');
+
+    e.form = libvirtForm({ libvirt: { quiesce: 'agent' } });
+    assert.equal(e.quiesceText(), Libvirt.QUIESCE.filter((m) => m.id === 'agent')[0].description);
+});
+
+test('the editor shows the warning list the kind produced, unedited', () => {
+    const e = Jobs.hangarJobEdit();
+    e.form = containerForm({ container: { consistency: 'none', containers: ['mongo-1'], user: 'appuser' } });
+    assert.equal(e.hasWarnings(), true);
+    assert.deepEqual(e.warnings(), riskWarnings(e.form));
+    assert.deepEqual(messages(e.warnings()),
+        messages(Sources.validate(formSource(e.form)).filter((p) => p.code === 'live-database')));
+});
+
+test('discovery that fails offers the manual list and says why', async () => {
+    // qemu:///system times out on this host, so this is the normal case, not the
+    // exotic one: a failed probe must never leave the user with no way to type
+    // the name in.
+    const e = Jobs.hangarJobEdit();
+    e.form = libvirtForm();
+    await withStubs({
+        HangarSourcesLibvirt: Object.assign({}, Libvirt, {
+            listDomains: async () => { throw hangarError('NETWORK', 'The hypervisor did not answer.'); }
+        })
+    }, async () => {
+        await e.discoverDomains();
+    });
+    assert.equal(e.discoveryState('domains'), 'failed');
+    assert.match(e.discoveryMessage('domains'), /did not answer/);
+    assert.equal(e.manual.domains, true);
+    assert.deepEqual(e.discovered.domains, []);
+});
+
+test('discovery that answers nothing also offers the manual list', async () => {
+    const e = Jobs.hangarJobEdit();
+    e.form = libvirtForm();
+    await withStubs({
+        HangarSourcesLibvirt: Object.assign({}, Libvirt, { listDomains: async () => [] })
+    }, async () => {
+        await e.discoverDomains();
+    });
+    assert.equal(e.discoveryState('domains'), 'empty');
+    assert.equal(e.manual.domains, true);
+});
+
+test('discovery that answers fills the choice list and keeps the selection', async () => {
+    const e = Jobs.hangarJobEdit();
+    e.form = libvirtForm({ libvirt: { domains: ['retired'] } });
+    await withStubs({
+        HangarSourcesLibvirt: Object.assign({}, Libvirt, { listDomains: async () => ['web01', 'db01'] })
+    }, async () => {
+        await e.discoverDomains();
+    });
+    assert.equal(e.discoveryState('domains'), 'ok');
+    assert.equal(e.manual.domains, false);
+    assert.deepEqual(e.domainChoices(),
+        [{ name: 'web01', discovered: true }, { name: 'db01', discovered: true },
+            { name: 'retired', discovered: false }]);
+});
+
+test('a manual list the user asked for is never taken away again', async () => {
+    const e = Jobs.hangarJobEdit();
+    e.form = libvirtForm();
+    e.useManual('domains');
+    await withStubs({
+        HangarSourcesLibvirt: Object.assign({}, Libvirt, { listDomains: async () => ['web01'] })
+    }, async () => {
+        await e.discoverDomains();
+    });
+    assert.equal(e.manual.domains, true, 'a name the user was typing would have vanished');
+});
+
+test('container discovery probes volumes and containers independently', async () => {
+    // One list failing must not take the other down with it: on a host where
+    // `volume ls` works and `ps` does not, the volumes are still selectable.
+    const e = Jobs.hangarJobEdit();
+    e.form = containerForm();
+    await withStubs({
+        HangarSourcesContainer: Object.assign({}, Container, {
+            listVolumes: async () => ['pgdata', 'uploads'],
+            containerListArgv: () => { throw hangarError('GENERIC', 'no runtime'); }
+        })
+    }, async () => {
+        await e.discoverContainerNames();
+    });
+    assert.equal(e.discoveryState('volumes'), 'ok');
+    assert.deepEqual(e.discovered.volumes, ['pgdata', 'uploads']);
+    assert.equal(e.discoveryState('containers'), 'failed');
+    assert.equal(e.manual.containers, true);
+    assert.equal(e.manual.volumes, false);
+});
+
+test('a discovery helper that throws synchronously is caught like a rejection', async () => {
+    const e = Jobs.hangarJobEdit();
+    e.form = containerForm();
+    await withStubs({
+        HangarSourcesContainer: Object.assign({}, Container, {
+            listVolumes: () => { throw hangarError('GENERIC', 'bad runtime'); },
+            containerListArgv: () => { throw hangarError('GENERIC', 'bad runtime'); }
+        })
+    }, async () => {
+        await e.discoverContainerNames();
+    });
+    assert.equal(e.discoveryState('volumes'), 'failed');
+    assert.match(e.discoveryMessage('volumes'), /bad runtime/);
+});
+
+test('a rejection with no message still says something', async () => {
+    const e = Jobs.hangarJobEdit();
+    e.form = libvirtForm();
+    await withStubs({
+        HangarSourcesLibvirt: Object.assign({}, Libvirt, {
+            // eslint-disable-next-line prefer-promise-reject-errors
+            listDomains: () => Promise.reject(null)
+        })
+    }, async () => {
+        await e.discoverDomains();
+    });
+    assert.equal(e.discoveryState('domains'), 'failed');
+    assert.ok(e.discoveryMessage('domains').length > 0);
+});
+
+test('discovery only asks the host about the kind actually being edited', async () => {
+    const asked = [];
+    const e = Jobs.hangarJobEdit();
+    e.form = emptyForm();
+    await withStubs({
+        HangarSourcesContainer: Object.assign({}, Container, {
+            listVolumes: async () => { asked.push('volumes'); return []; }
+        }),
+        HangarSourcesLibvirt: Object.assign({}, Libvirt, {
+            listDomains: async () => { asked.push('domains'); return []; }
+        })
+    }, async () => {
+        await e.discover();
+        e.form.sourceKind = 'libvirt';
+        await e.discover();
+    });
+    assert.deepEqual(asked, ['domains']);
+});
+
+test('switching kind re-probes and revalidates without a DOM', async () => {
+    const e = Jobs.hangarJobEdit();
+    e.form = emptyForm();
+    e.form.sourceKind = 'libvirt';
+    await withStubs({
+        HangarSourcesLibvirt: Object.assign({}, Libvirt, { listDomains: async () => ['web01'] })
+    }, async () => {
+        assert.doesNotThrow(() => e.onKindChange());
+        assert.doesNotThrow(() => e.onUriChange());
+        assert.doesNotThrow(() => e.onRuntimeChange());
+        // Let the probes settle so the assertions below are not racing them.
+        await e.discoverDomains();
+    });
+    assert.deepEqual(e.discovered.domains, ['web01']);
+    assert.ok(Array.isArray(e.problems));
+});
+
+// --- the markup ----------------------------------------------------------
+
+test('the editor offers the source-kind chooser, driven by the registry', () => {
+    assert.match(editHtml, /x-model="form\.sourceKind"/);
+    assert.match(editHtml, /x-for="k in kinds\(\)"/);
+    ['isKind(\'filesystem\')', 'isKind(\'container\')', 'isKind(\'libvirt\')'].forEach((probe) => {
+        assert.ok(editHtml.includes(probe), 'no block for ' + probe);
+    });
+});
+
+test('the editor renders every option list from its kind\'s table', () => {
+    ['x-for="rt in runtimes()"', 'x-for="m in consistencies()"',
+        'x-for="u in uris()"', 'x-for="m in quiesces()"'].forEach((probe) => {
+        assert.ok(editHtml.includes(probe), 'missing ' + probe);
+    });
+    // No option is spelled out in the markup: a mode added to core/ must appear
+    // here without an edit, and one removed must disappear.
+    Container.RUNTIMES.concat(Container.CONSISTENCY_IDS)
+        .concat(Libvirt.QUIESCE.map((m) => m.id))
+        .concat(Libvirt.URIS.map((u) => u.id))
+        .forEach((id) => {
+            assert.ok(!editHtml.includes('<option value="' + id + '"'),
+                'the markup hardcodes the option "' + id + '"');
+        });
+});
+
+test('the warnings block renders what validate() returned, not its own prose', () => {
+    assert.match(editHtml, /x-for="w in warnings\(\)"/);
+    assert.match(editHtml, /x-text="w\.message"/);
+    assert.match(editHtml, /warnings, not errors/);
+    // The consistency and quiesce descriptions are the kinds' too.
+    assert.match(editHtml, /x-text="consistencyText\(\)"/);
+    assert.match(editHtml, /x-text="quiesceText\(\)"/);
+});
+
+test('the manual fallback exists for all three discovered lists', () => {
+    ['form.container.volumesText', 'form.container.containersText', 'form.libvirt.domainsText']
+        .forEach((model) => assert.ok(editHtml.includes(model), 'no manual entry for ' + model));
+    ['useManual(\'volumes\')', 'useManual(\'containers\')', 'useManual(\'domains\')']
+        .forEach((call) => assert.ok(editHtml.includes(call), 'no way to reach ' + call));
+});
+
+test('the domain XML toggle is present and defaults on', () => {
+    assert.match(editHtml, /id="hangar-job-include-xml"/);
+    assert.match(editHtml, /x-model="form\.libvirt\.includeXml"/);
+    assert.equal(emptyLibvirtFields().includeXml, true);
+});
+
+test('a checkbox in a discovered list is labelled by the same id it declares', () => {
+    // The a11y sweep above matches static ids; these are bound, and a typo would
+    // leave a checkbox nobody using a screen reader can name.
+    const bound = [...editHtml.matchAll(/:id="([^"]+)"/g)].map((m) => m[1]);
+    const boundFor = [...editHtml.matchAll(/:for="([^"]+)"/g)].map((m) => m[1]);
+    assert.ok(bound.length >= 3);
+    bound.forEach((id) => assert.ok(boundFor.indexOf(id) >= 0, 'nothing labels ' + id));
+});
+
+// ========================================================================
+// v2 — adversarial hardening
+//
+// Three questions, in the order they matter:
+//
+//   1. Can anything the user types reach a command line as more than one
+//      argument? Volume, container and domain names and the dump command all
+//      end up in argv, and this screen is where they are typed.
+//   2. Does a warning about a backup that may not restore actually reach the
+//      user, or is it quietly dropped between validate() and the DOM?
+//   3. Can any pure function on the render path throw? Alpine calls them on
+//      every re-render, so one untyped exception blanks the editor — including
+//      the message that would have explained it.
+// ========================================================================
+
+// Everything a shell would treat as more than one word, plus the two that
+// truncate rather than split (NUL, newline) and the one that turns a name into
+// a flag (a leading dash). A name that survives any of these as a single argv
+// element is safe; a name that is refused is safe too. A name that becomes two
+// elements is the bug this list exists to find.
+const HOSTILE_NAMES = [
+    'a b', 'a\tb', 'a;rm -rf /', 'a|b', 'a&b', 'a>b', 'a<b',
+    '$(id)', '`id`', '${HOME}', 'a\nb', 'a\rb', 'a\u0000b',
+    '-rf', '--all', '--latest', '-v', '../../etc/passwd', 'a/b',
+    'a\'b', 'a"b', 'a\\b', 'a*b', 'a?b', 'a[b]b', 'a!b', 'a~b',
+    'ünïcødé', '\u{1f4a5}', '\u202e', ' leading', 'trailing ', ''
+];
+
+// A vector is only safe if every element is a string: cockpit.spawn stringifies
+// whatever it is given, so a null would reach execve as the literal "null" and
+// land wherever a name was meant to be.
+function assertArgv(argv, where) {
+    assert.ok(Array.isArray(argv), where + ' is not an argument vector');
+    argv.forEach((a, i) => {
+        assert.equal(typeof a, 'string', where + '[' + i + '] is not a string');
+    });
+}
+
+// --- shell safety: names typed here reach argv as one element, or not at all --
+
+// The form trims what was typed and drops what trims to nothing — but it must
+// never turn one name into two, whatever is in it. Everything downstream is
+// checked against what the form actually produced, not against the raw input.
+function oneName(list, name) {
+    assert.ok(list.length <= 1,
+        'the form split ' + JSON.stringify(name) + ' into ' + JSON.stringify(list));
+    return list.length ? list[0] : null;
+}
+
+test('no volume name can add an argument to a runtime command line', () => {
+    HOSTILE_NAMES.forEach((raw) => {
+        const source = formSource(containerForm({ container: { volumes: [raw] } }));
+        const name = oneName(source.volumes, raw);
+        if (name === null) return;
+
+        let argv = null;
+        try {
+            argv = Container.volumeInspectArgv(source.runtime, source.user, name);
+        } catch (e) {
+            // The only acceptable alternative to carrying it safely.
+            assert.ok(Errors.isHangarError(e), JSON.stringify(raw) + ' threw untyped');
+            assert.equal(e.kind, 'GENERIC');
+            return;
+        }
+        assertArgv(argv, 'volumeInspectArgv(' + JSON.stringify(raw) + ')');
+        // One element, in the position the builder put it — never split, never
+        // an extra flag, never absorbed into a neighbour.
+        assert.equal(argv.filter((a) => a === name).length, 1);
+        assert.equal(argv[argv.length - 1], name);
+        assert.deepEqual(argv.slice(0, -1), ['runuser', '-u', 'appuser', '--',
+            'podman', 'volume', 'inspect']);
+    });
+});
+
+test('no container name can add an argument to a pause, stop or exec', () => {
+    ['pause', 'stop', 'command'].forEach((mode) => {
+        HOSTILE_NAMES.forEach((raw) => {
+            const source = formSource(containerForm({
+                container: { consistency: mode, containers: [raw], command: 'pg_dumpall > /b/all.sql' }
+            }));
+            const name = oneName(source.containers, raw);
+            if (name === null) return;
+            let steps;
+            try {
+                steps = Container.preCommands(source).concat(Container.postCommands(source));
+            } catch (e) {
+                assert.ok(Errors.isHangarError(e),
+                    mode + ' + ' + JSON.stringify(raw) + ' threw untyped');
+                return;
+            }
+            steps.forEach((argv) => {
+                assertArgv(argv, mode + ' step');
+                // `podman stop --all` stops every container on the host and
+                // `exec --latest` runs in whichever one started last: a name that
+                // became its own flag is the whole failure mode.
+                assert.equal(argv.filter((a) => a === name).length, 1, 'name lost or duplicated');
+                assert.ok(argv.indexOf('--all') < 0 && argv.indexOf('--latest') < 0,
+                    JSON.stringify(raw) + ' became a flag');
+            });
+        });
+    });
+});
+
+test('no domain name can add an argument to a virsh command line', () => {
+    ['agent', 'shutdown'].forEach((quiesce) => {
+        HOSTILE_NAMES.forEach((raw) => {
+            const source = formSource(libvirtForm({ libvirt: { quiesce: quiesce, domains: [raw] } }));
+            const name = oneName(source.domains, raw);
+            if (name === null) return;
+            let steps;
+            try {
+                steps = Libvirt.preCommands(source).concat(Libvirt.postCommands(source));
+            } catch (e) {
+                assert.ok(Errors.isHangarError(e), JSON.stringify(raw) + ' threw untyped');
+                return;
+            }
+            steps.forEach((argv) => {
+                assertArgv(argv, 'virsh step');
+                assert.equal(argv.filter((a) => a === name).length, 1);
+                assert.equal(argv[argv.length - 1], name, 'the domain is not the last argument');
+                assert.ok(argv.indexOf('--all') < 0, JSON.stringify(raw) + ' became --all');
+            });
+        });
+    });
+});
+
+test('a virsh command is never broadened by an argument it could not build', () => {
+    // virshArgv drops a non-string tail element rather than stringifying it. That
+    // is only safe because no subcommand hangar uses has a domain-less form that
+    // acts on everything — unlike `podman stop --all`. Pin it, because a future
+    // subcommand with an --all-by-default shape would silently become one.
+    [Libvirt.shutdownArgv, Libvirt.startArgv, Libvirt.freezeArgv, Libvirt.thawArgv,
+        Libvirt.dumpXmlArgv].forEach((build) => {
+        [null, undefined, 42, {}, []].forEach((bad) => {
+            const argv = build('qemu:///system', bad);
+            assertArgv(argv, 'virsh argv');
+            assert.deepEqual(argv.slice(0, 3), ['virsh', '-c', 'qemu:///system']);
+            assert.equal(argv.length, 4, 'a dropped domain left a command with extra arguments');
+        });
+    });
+});
+
+test('a hostile connection URI stays one argument and never becomes a flag', () => {
+    ['qemu:///system; rm -rf /', 'qemu+ssh://h/s $(id)', 'a\nb', 'a|b', '--version'].forEach((uri) => {
+        const argv = Libvirt.listDomainsArgv(uri);
+        assertArgv(argv, 'listDomainsArgv');
+        assert.deepEqual(argv, ['virsh', '-c', uri, 'list', '--all', '--name']);
+        // -c consumes the next element whatever it looks like, so even "--version"
+        // is read as this option's value rather than as a second option.
+        assert.equal(argv[2], uri);
+    });
+});
+
+test('the dump command travels as one argv element, however it is written', () => {
+    ['pg_dump db | gzip > /b/db.gz', 'a; rm -rf /', '$(id)', 'echo "x"; echo \'y\'',
+        'a\nb', 'sh -c "nested"'].forEach((command) => {
+        const source = formSource(containerForm({
+            container: { consistency: 'command', containers: ['db'], command: command }
+        }));
+        const pre = Container.preCommands(source);
+        assert.equal(pre.length, 1);
+        assertArgv(pre[0], 'exec step');
+        // `sh -c <script>` — the shell is deliberate, and the script is one word.
+        assert.deepEqual(pre[0], ['runuser', '-u', 'appuser', '--',
+            'podman', 'exec', 'db', 'sh', '-c', command]);
+    });
+});
+
+test('a hostile owning user is refused with a typed error, never wrapped', () => {
+    ['a b', 'a;id', '$(id)', 'a\nb', '-u', 'root;rm', 'a/b', '../root'].forEach((user) => {
+        assert.throws(() => Container.volumeListArgv('podman', user),
+            (e) => Errors.isHangarError(e) && e.kind === 'GENERIC', JSON.stringify(user));
+        assert.throws(() => Container.containerListArgv('podman', user),
+            (e) => Errors.isHangarError(e), JSON.stringify(user));
+    });
+});
+
+test('a hostile user typed into the editor fails discovery instead of running', async () => {
+    // The editor asks the host as soon as the field changes, so this is the first
+    // place a bad user name could reach a command line.
+    const e = Jobs.hangarJobEdit();
+    e.form = containerForm({ container: { user: 'root; rm -rf /' } });
+    await e.discoverContainerNames();
+    assert.equal(e.discoveryState('volumes'), 'failed');
+    assert.equal(e.discoveryState('containers'), 'failed');
+    assert.match(e.discoveryMessage('volumes'), /not a valid user name/);
+    // And it is a problem the user can see next to the field they typed it in.
+    assert.ok(validateForm(e.form, []).some((p) => p.field === 'user' && p.severity === 'error'));
+});
+
+test('every name the form accepts is a name the runtime would also accept', () => {
+    // The two rules have to agree: a name the editor saves but the runtime would
+    // reject is a job that validates in the UI and dies in the unit at 02:00.
+    HOSTILE_NAMES.concat(['ok-name', 'ok_name.1', 'A0']).forEach((name) => {
+        const problems = Container.validate({ id: 'x', volumes: [name], user: 'appuser' });
+        const refused = problems.some((p) => p.severity === 'error' &&
+            (p.code === 'volume-unsafe' || p.code === 'volume-empty' || p.code === 'no-volumes'));
+        assert.equal(refused, !Container.isSafeName(name),
+            JSON.stringify(name) + ': validate() and isSafeName() disagree');
+    });
+});
+
+test('a NUL byte in a name or a dump command is reported, never truncated', () => {
+    // execve stops at the first NUL, so the argument the runtime receives is not
+    // the one the journal printed. Silence here is the dangerous outcome.
+    const cases = [
+        ['volumes', containerForm({ container: { volumes: ['pg\u0000data'] } }), 'volumes'],
+        ['containers', containerForm({
+            container: { consistency: 'stop', containers: ['db\u0000x'] }
+        }), 'containers'],
+        ['domains', libvirtForm({ libvirt: { domains: ['web' + '\u0000' + '01'] } }), 'domains']
+    ];
+    cases.forEach((c) => {
+        const hit = validateForm(c[1], []).filter((p) => p.field === c[2] && p.severity === 'error');
+        assert.ok(hit.length, c[0] + ': a NUL byte was accepted');
+    });
+    // The dump command too — the one free-text field that reaches argv.
+    const cmd = validateForm(containerForm({
+        container: { consistency: 'command', containers: ['db'], command: 'pg_dump\u0000; rm -rf /' }
+    }), []);
+    assert.ok(cmd.some((p) => p.field === 'command' && p.severity === 'error'),
+        'a NUL byte in the dump command was accepted');
+});
+
+// --- the warnings that decide whether a backup restores reach the user -------
+
+test('two database containers raise two warnings, and both can be rendered', () => {
+    // The bug this pins: warnings were keyed by their code, and Alpine's x-for
+    // keeps only the first row of any repeated key — so a user with a postgres
+    // AND a mongo container was warned about one and told nothing about the other.
+    const f = containerForm({
+        container: { consistency: 'none', containers: ['app-postgres-1', 'mongo_primary'] }
+    });
+    const warnings = riskWarnings(f).filter((w) => w.code === 'live-database');
+    assert.equal(warnings.length, 2);
+    assert.match(warnings[0].message, /app-postgres-1/);
+    assert.match(warnings[1].message, /mongo_primary/);
+
+    const keys = riskWarnings(f).map((w) => w.key);
+    assert.equal(new Set(keys).size, keys.length, 'two warnings share an x-for key');
+    keys.forEach((k) => assert.equal(typeof k, 'string'));
+});
+
+test('the warnings list is keyed by something unique, in the markup as well', () => {
+    assert.match(editHtml, /x-for="w in warnings\(\)" :key="w\.key"/);
+});
+
+test('a live copy of a database warns whatever else is wrong with the form', () => {
+    // A warning suppressed because some unrelated field is also invalid is a
+    // warning the user never sees: they fix the error, save, and are never told.
+    const broken = containerForm({
+        container: { consistency: 'none', containers: ['postgres'], volumes: [] }
+    });
+    broken.id = '';
+    broken.repo = '';
+    assert.ok(riskWarnings(broken).some((w) => w.code === 'live-database'));
+    const problems = validateForm(broken, []);
+    assert.ok(hasErrors(problems), 'the broken form somehow validated');
+    assert.ok(problems.some((p) => p.code === 'source-live-database' && p.severity === 'warning'),
+        'the database warning was lost among the errors');
+});
+
+test('the default consistency mode is the one that warns, not a silent one', () => {
+    // A user who never opens the picker gets 'none'. If that mode stopped warning,
+    // the most common configuration would be the least safe one, silently.
+    const f = containerForm({ container: { containers: ['prod-mysql'] } });
+    assert.equal(formSource(f).consistency, 'none');
+    assert.ok(riskWarnings(f).some((w) => w.code === 'live-database'));
+});
+
+test('a warning survives the whole trip from validate() to what the editor renders', () => {
+    const e = Jobs.hangarJobEdit();
+    e.form = containerForm({ container: { consistency: 'none', containers: ['redis-cache', 'kafka-1'] } });
+    assert.equal(e.hasWarnings(), true);
+    const rendered = e.warnings();
+    assert.equal(rendered.length, 2);
+    // Verbatim: the wording belongs to the kind, and this screen must not soften it.
+    const fromKind = Sources.validate(formSource(e.form))
+        .filter((p) => p.code === 'live-database').map((p) => p.message);
+    assert.deepEqual(rendered.map((w) => w.message), fromKind);
+    // Warnings never block the save. Being unable to save would push the user
+    // back to a mode that produces no warning rather than to a safer one.
+    assert.equal(e.canSave(), true);
+});
+
+test('every libvirt quiesce mode is renderable and none is silently keyless', () => {
+    ['none', 'agent', 'shutdown'].forEach((quiesce) => {
+        [true, false].forEach((includeXml) => {
+            const w = riskWarnings(libvirtForm({
+                libvirt: { quiesce: quiesce, includeXml: includeXml }
+            }));
+            const keys = w.map((x) => x.key);
+            assert.equal(new Set(keys).size, keys.length, quiesce + '/' + includeXml);
+            w.forEach((x) => {
+                assert.ok(x.message.length > 0, 'an empty warning renders as a blank bullet');
+                assert.ok(Jobs.RISK_CODES.indexOf(x.code) >= 0);
+            });
+        });
+    });
+});
+
+// --- a mixed job is not backed up by halves ---------------------------------
+
+test('a job mixing files with volumes is handed to its unit, not run by halves', () => {
+    // primaryKind() answers "which form does the editor open", and it says
+    // 'filesystem' whenever there is one. Reusing that to decide where the run
+    // happens meant a mixed job ran in the browser against the file paths alone —
+    // a snapshot with none of the volumes in it, reported as a success.
+    const mixed = {
+        id: 'both', repo: 'nas',
+        sources: [
+            { id: 'files', kind: 'filesystem', paths: ['/etc'] },
+            { id: 'vols', kind: 'container', volumes: ['pgdata'] }
+        ]
+    };
+    assert.equal(runsInBrowser(mixed), false);
+    assert.equal(primaryKind(mixed), 'filesystem', 'the editor should still open on the file form');
+
+    // And the reverse ordering, in case the answer depended on which came first.
+    assert.equal(runsInBrowser({ sources: [mixed.sources[1], mixed.sources[0]] }), false);
+    assert.equal(runsInBrowser({
+        sources: [{ kind: 'filesystem', paths: ['/etc'] }, { kind: 'libvirt', domains: ['web01'] }]
+    }), false);
+
+    // Unchanged for everything that was already right.
+    assert.equal(runsInBrowser(sampleJob()), true);
+    assert.equal(runsInBrowser({}), true);
+    assert.equal(runsInBrowser({ sources: [{ paths: ['/etc'] }] }), true, 'kind-less means filesystem');
+});
+
+test('a mixed job really does reach systemd rather than restic', async () => {
+    const ops = [];
+    const units = [];
+    const job = {
+        id: 'both', name: 'Both', repo: 'nas', enabled: true,
+        sources: [
+            { id: 'files', kind: 'filesystem', paths: ['/etc'] },
+            { id: 'vols', kind: 'container', volumes: ['pgdata'], user: 'appuser' }
+        ],
+        retention: { daily: 7 }, schedule: { calendar: 'daily' }
+    };
+    const world = baseWorld({
+        jobs: { both: job },
+        repos: { nas: sampleRepo() },
+        run: async (op) => { ops.push(op); return { status: 'ok', errors: [] }; },
+        schedule: { runNow: async (id) => { units.push(id); } }
+    });
+    await withStubs(world, async () => {
+        const c = Jobs.hangarJobsUi();
+        await c.reload();
+        await c.startBackup(job);
+        assert.deepEqual(units, ['both']);
+        assert.deepEqual(ops, [], 'restic ran against half the job');
+        assert.equal(c.failure, null);
+    });
+});
+
+// --- nothing on the render path throws --------------------------------------
+
+// Values chosen for what they break rather than for looking odd: a Symbol and a
+// throwing toString() defeat implicit concatenation, a null-prototype object has
+// no toString at all, and the four property names answer truthily on any plain
+// object used as a lookup table.
+const HOSTILE_VALUES = [
+    undefined, null, '', 0, NaN, Infinity, -1, true, false, [], {}, [[]], [null],
+    Object.create(null), Symbol('s'), () => {}, new Date(NaN),
+    { toString() { throw new Error('boom'); } },
+    '__proto__', 'constructor', 'prototype', 'toString',
+    ' ', 'a\nb', 'a\u0000b', '../../etc/passwd', '$(id)', '\u{1f4a5}', '\u202e'
+];
+
+test('no pure function on the render path throws, for any value at all', () => {
+    const under = [
+        ['formSource', (v) => formSource(v)],
+        ['formStateToJob', (v) => formStateToJob(v)],
+        ['jobToFormState', (v) => jobToFormState(v)],
+        ['validateForm', (v) => validateForm(v, v)],
+        ['riskWarnings', (v) => riskWarnings(v)],
+        ['sourceWarnings', (v) => sourceWarnings(v)],
+        ['sourceDescription', (v) => sourceDescription(v)],
+        ['primaryKind', (v) => primaryKind(v)],
+        ['primarySource', (v) => primarySource(v)],
+        ['runsInBrowser', (v) => runsInBrowser(v)],
+        ['nameList', (v) => nameList(v, v)],
+        ['checkboxList', (v) => checkboxList(v, v)],
+        ['mergeFilesystemSources', (v) => mergeFilesystemSources(v)],
+        ['fieldForSourceProblem', (v) => fieldForSourceProblem(v)],
+        ['consistencyInfo', (v) => consistencyInfo(v)],
+        ['quiesceInfo', (v) => quiesceInfo(v)],
+        ['sourceKindLabel', (v) => sourceKindLabel(v)],
+        ['lastResultLabel', (v) => lastResultLabel(v)],
+        ['remediationLabel', (v) => remediationLabel(v)],
+        ['formatBytes', (v) => formatBytes(v)],
+        ['progressPercent', (v) => progressPercent(v)],
+        ['progressLabel', (v) => progressLabel(v)],
+        ['unreadableFiles', (v) => unreadableFiles(v)],
+        ['hasErrors', (v) => hasErrors(v)],
+        ['problemsFor', (v) => problemsFor(v, v)]
+    ];
+    under.forEach((entry) => {
+        HOSTILE_VALUES.forEach((v) => {
+            assert.doesNotThrow(() => entry[1](v), entry[0] + ' threw on a ' + typeof v);
+        });
+    });
+});
+
+test('a hostile value in every per-kind field is survivable', () => {
+    const exercise = (kind, field) => {
+        HOSTILE_VALUES.forEach((v) => {
+            const f = emptyForm();
+            f.sourceKind = kind;
+            f[kind][field] = v;
+            const where = kind + '.' + field;
+            assert.doesNotThrow(() => validateForm(f, []), where);
+            assert.doesNotThrow(() => riskWarnings(f), where);
+            assert.doesNotThrow(() => sourceDescription(f), where);
+            assert.doesNotThrow(() => formStateToJob(f), where);
+        });
+    };
+    ['runtime', 'user', 'volumes', 'volumesText', 'containers', 'containersText',
+        'consistency', 'command'].forEach((field) => exercise('container', field));
+    ['uri', 'domains', 'domainsText', 'quiesce', 'includeXml']
+        .forEach((field) => exercise('libvirt', field));
+});
+
+test('validateForm survives a source kind whose validate() misbehaves', () => {
+    // The v2 seam means the kind doing the validating may be a third party's, and
+    // validateForm is called on every re-render by canSave/invalid/messageFor.
+    // A kind that throws must cost its own messages, not the whole editor.
+    const S = Jobs.ensureSourceKinds();
+    const saved = S.KINDS.container;
+    try {
+        S.KINDS.container = Object.assign({}, saved, {
+            validate: () => { throw new Error('a third party exploded'); }
+        });
+        const f = containerForm();
+        assert.doesNotThrow(() => validateForm(f, []));
+        assert.doesNotThrow(() => riskWarnings(f));
+        assert.doesNotThrow(() => Jobs.hangarJobEdit().canSave());
+
+        // And one that answers with holes and non-objects instead of problems.
+        S.KINDS.container = Object.assign({}, saved, {
+            validate: () => [null, undefined, 'not a problem', 42,
+                { severity: 'error', code: 'real', message: 'a real one' }]
+        });
+        const problems = validateForm(f, []);
+        assert.ok(problems.some((p) => p.code === 'source-real'));
+        problems.forEach((p) => {
+            assert.equal(typeof p.code, 'string');
+            assert.equal(typeof p.field, 'string');
+            assert.equal(typeof p.message, 'string');
+        });
+    } finally {
+        S.KINDS.container = saved;
+    }
+});
+
+test('a form that cannot be saved is never a form that cannot be shown', () => {
+    // Every hostile form above still has to render: the editor is the only place
+    // the user could fix it from.
+    const forms = [
+        containerForm({ container: { volumes: ['a b'], containers: ['-rf'], consistency: 'stop' } }),
+        containerForm({ container: { consistency: 'nonsense' } }),
+        containerForm({ container: { runtime: 'kubernetes' } }),
+        libvirtForm({ libvirt: { domains: ['a;b'], quiesce: 'freeze-everything' } }),
+        libvirtForm({ libvirt: { uri: '' } })
+    ];
+    forms.forEach((f) => {
+        const e = Jobs.hangarJobEdit();
+        e.form = f;
+        assert.doesNotThrow(() => e.revalidate());
+        assert.doesNotThrow(() => e.warnings());
+        assert.doesNotThrow(() => e.sourceText());
+        assert.doesNotThrow(() => e.consistencyText());
+        assert.doesNotThrow(() => e.quiesceText());
+        assert.doesNotThrow(() => e.volumeChoices());
+        assert.doesNotThrow(() => e.domainChoices());
+        ['volumes', 'containers', 'domains', 'consistency', 'quiesce', 'user', 'runtime', 'uri', 'command']
+            .forEach((field) => {
+                assert.doesNotThrow(() => e.messageFor(field), field);
+                assert.doesNotThrow(() => e.invalid(field), field);
+            });
+    });
+});
+
+test('a job file holding garbage opens the editor rather than blanking it', () => {
+    // /etc/hangar is root-editable by hand, so a source can hold anything at all.
+    const jobs = [
+        { id: 'j', sources: [{ kind: 'container', volumes: 'not-a-list' }] },
+        { id: 'j', sources: [{ kind: 'container', volumes: [null, 7, {}] }] },
+        { id: 'j', sources: [{ kind: 'libvirt', domains: { nope: true } }] },
+        { id: 'j', sources: [{ kind: 'libvirt', quiesce: [], includeXml: 'yes' }] },
+        { id: 'j', sources: [{ kind: 'container' }, { kind: 'container' }] },
+        { id: 'j', sources: { kind: 'container' } }
+    ];
+    jobs.forEach((job) => {
+        let form;
+        assert.doesNotThrow(() => { form = jobToFormState(job); }, JSON.stringify(job));
+        assert.doesNotThrow(() => validateForm(form, []));
+        assert.doesNotThrow(() => riskWarnings(form));
+        // A round trip must not invent sources or lose the ones it could not show.
+        const back = formStateToJob(form);
+        assert.ok(Array.isArray(back.sources));
+        back.sources.forEach((s) => assert.equal(typeof s, 'object'));
+    });
+});
+
+test('a second unshowable source survives an edit rather than being dropped', () => {
+    // Dropping it would silently stop backing something up, which is the failure
+    // this whole screen exists to prevent.
+    const job = {
+        id: 'j', repo: 'nas',
+        sources: [
+            { id: 'a', kind: 'container', volumes: ['one'], user: 'appuser' },
+            { id: 'b', kind: 'container', volumes: ['two'], user: 'other' },
+            { id: 'c', kind: 'libvirt', domains: ['web01'] }
+        ],
+        retention: { daily: 7 }, schedule: { calendar: 'daily' }
+    };
+    const back = formStateToJob(jobToFormState(job));
+    assert.equal(back.sources.length, 3);
+    assert.deepEqual(back.sources.slice(1), [job.sources[1], job.sources[2]]);
+    assert.equal(back.sources[0].user, 'appuser');
+});

@@ -23,12 +23,25 @@
 
 import json
 import os
+import re
+import signal
 import subprocess
 import sys
 import time
 
 CONF_DIR = os.environ.get("HANGAR_CONF_DIR", "/etc/hangar")
 STATE_DIR = os.environ.get("HANGAR_STATE_DIR", "/var/lib/hangar/state")
+
+# Where dumped libvirt domain XML is staged before restic picks it up. Under
+# /var/lib rather than /etc because it is regenerated on every run and is not
+# configuration. Mirrors XML_DIR in js/core/sources-libvirt.js.
+LIBVIRT_XML_DIR = os.environ.get("HANGAR_LIBVIRT_XML_DIR", "/var/lib/hangar/libvirt")
+
+# Deadline for the short helper commands (volume inspect, virsh). libvirtd wedges
+# rather than refusing — qemu:///system times out outright on some hosts — and a
+# backup unit that hangs forever is invisible to the operator in a way a failed
+# one is not. 20s mirrors TIMEOUT_MS in js/core/sources-libvirt.js.
+CMD_TIMEOUT = float(os.environ.get("HANGAR_CMD_TIMEOUT", "20"))
 
 # restic exit codes we care about (see docs/CONVENTIONS.md).
 EXIT_READ_ERRORS = 3
@@ -47,6 +60,63 @@ KIND_BY_CODE = {
     EXIT_WRONG_PASSWORD: "WRONG_PASSWORD",
     EXIT_CANCELLED: "CANCELLED",
 }
+
+# ---- source-kind vocabulary -------------------------------------------------
+#
+# These mirror js/core/sources-container.js and js/core/sources-libvirt.js. The
+# JavaScript decides what a source *means*; this helper only has to agree with
+# it, and tests/integration/hangar-run-sources.test.js is what keeps the two
+# copies from drifting.
+
+CONTAINER_RUNTIMES = ("podman", "docker")
+DEFAULT_RUNTIME = "podman"
+CONTAINER_MODES = ("none", "pause", "stop", "command")
+DEFAULT_CONSISTENCY = "none"
+
+# Both runtimes enforce this for volume and container names, so the allowlist is
+# the runtime's own rule rather than us being strict. It also happens to exclude
+# every shell metacharacter, whitespace and NUL, and forbids the leading dash
+# that argv would read as a flag.
+#
+# \Z and not $: in Python '$' also matches just before a TRAILING NEWLINE, so
+# "assets\n" would pass a '$'-anchored allowlist. JavaScript's '$' does not, so
+# the same name is rejected by the editor and accepted here — the two halves must
+# not disagree about what a legal name is, least of all in the permissive
+# direction.
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
+
+# Deliberately permissive about case and length within reason: distros disagree
+# (useradd's NAME_REGEX, trailing '$' machine accounts). The job is to keep a
+# shell metacharacter or a leading dash out of argv, not to re-implement getpwnam.
+USER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9._-]{0,31}\Z")
+
+# execve truncates an argument at the first NUL rather than refusing it, so an
+# argument carrying one is not the argument the journal says we passed.
+NUL = "\x00"
+
+# Substring hints, not exact names: real containers are called "app-postgres-1",
+# "mongo_primary", "prod.redis". A false positive costs one journal line; a false
+# negative costs an unrestorable database backup. Mirrors DATABASE_HINTS in
+# js/core/sources-container.js, and the integration test pins the two together.
+DATABASE_HINTS = ("mongo", "postgres", "mysql", "mariadb", "redis",
+                  "elastic", "kafka", "cassandra", "clickhouse")
+
+LIBVIRT_QUIESCE = ("none", "agent", "shutdown")
+DEFAULT_URI = "qemu:///system"
+
+# Job and repository ids name files under CONF_DIR. Same rule as ID_RE in
+# js/core/sources.js, and \Z for the same reason NAME_RE uses it.
+ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+
+# Same rejection set as UNSAFE_DOMAIN_RE in js/core/sources-libvirt.js. A domain
+# name also becomes a file name under LIBVIRT_XML_DIR, hence '/' as well.
+UNSAFE_DOMAIN_RE = re.compile(r"[;&|<>`$(){}\[\]*?!~\"'\\/\x00-\x1f\x7f]")
+
+# What a disk source has to look like before it can be handed to restic: an
+# absolute path, or a scheme for a network disk (rbd:, nbd:, nvme:). Anything
+# else is virsh diagnostics on stdout, and treating it as a path is how "error:
+# failed to get domain" becomes a positional argument.
+DISK_SOURCE_RE = re.compile(r"^(?:/|[A-Za-z][A-Za-z0-9+.-]*:)")
 
 
 def log(level, msg, **fields):
@@ -148,29 +218,527 @@ def backend_env(repo):
     return env
 
 
-def source_args(sources):
-    paths, flags = [], []
-    for src in sources:
-        if src.get("kind", "filesystem") != "filesystem":
-            # v1 ships filesystem only; VM and Podman sources land in v2 as new kinds.
-            die(1, "unsupported source kind", kind=src.get("kind"))
-        paths.extend(src.get("paths") or [])
-        for pat in src.get("excludes") or []:
-            flags.extend(["--exclude", pat])
-        if src.get("excludeFile"):
-            flags.extend(["--exclude-file", src["excludeFile"]])
-        if src.get("oneFileSystem"):
-            flags.append("--one-file-system")
-        for tag in src.get("tags") or []:
-            flags.extend(["--tag", tag])
-    if not paths:
-        die(1, "job has no paths to back up")
-    return paths, flags
+# ---- small helpers shared by the source kinds -------------------------------
+
+
+def dedupe(items):
+    seen, out = set(), []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+def str_list(value, field, sid):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        # Not iterated: `for x in "abc"` yields characters, so a bare string here
+        # would silently become one --exclude per letter.
+        die(1, "field must be a list of strings", source=sid, field=field)
+    if not isinstance(value, list) or any(not isinstance(v, str) for v in value):
+        die(1, "field must be a list of strings", source=sid, field=field)
+    for v in value:
+        if NUL in v:
+            die(1, "field contains a NUL byte", source=sid, field=field)
+    return [v for v in value if v != ""]
+
+
+def one_or_many(value):
+    """A field the config may spell as one string or as a list of them."""
+    return [value] if isinstance(value, str) else value
+
+
+def restic_flags(src, sid):
+    """The --exclude/--tag pairs every source kind shares.
+
+    Routed through str_list rather than `for x in src.get(...) or []` because a
+    non-string entry cannot be handed to execve at all — it raises inside
+    subprocess, from a systemd timer, with no useful record of which field.
+    """
+    flags = []
+    for pat in str_list(src.get("excludes"), "excludes", sid):
+        flags.extend(["--exclude", pat])
+    for tag in str_list(src.get("tags"), "tags", sid):
+        flags.extend(["--tag", tag])
+    return flags
+
+
+def check_argv(argv, what, **fields):
+    """The invariant every command in the plan has to satisfy.
+
+    Names, paths and the dump command all reach a command line, and each one must
+    travel as exactly one argv element. Nothing here can quote or escape its way
+    out of a mistake, so this refuses instead: a non-string element would raise
+    inside subprocess, and a NUL would make execve pass a silently shorter
+    argument than the one we logged.
+    """
+    for index, arg in enumerate(argv):
+        if not isinstance(arg, str):
+            die(1, "command holds an argument that is not a string",
+                where=what, index=index, **fields)
+        if NUL in arg:
+            die(1, "command holds an argument containing a NUL byte",
+                where=what, index=index, **fields)
+    return argv
+
+
+def warn(out, sid, code, message, **fields):
+    """Record a consistency warning in the plan and put it in the journal.
+
+    These warnings are the only thing standing between a user and a backup that
+    will not restore. The editor shows them at the moment of choosing; the
+    journal has to repeat them at the moment of running, because a job is
+    configured once and then runs unattended for years. Codes are spelled exactly
+    as js/core/sources-*.js spells them, so an operator comparing the journal
+    with the UI is not made to translate.
+    """
+    entry = {"source": sid, "code": code, "message": message}
+    entry.update(fields)
+    out.append(entry)
+    log("warning", message, source=sid, code=code, **fields)
+    return entry
+
+
+def canonical_path(p):
+    """Collapse slash runs and drop the trailing slash.
+
+    Mirrors HangarSources.canonicalPath: without it "/vol/" and "/vol" are two
+    paths, and restic would store the same tree twice.
+    """
+    if not isinstance(p, str) or p == "":
+        return ""
+    collapsed = re.sub(r"/{2,}", "/", p)
+    return collapsed.rstrip("/") if len(collapsed) > 1 else collapsed
+
+
+def last_line(text):
+    lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
+    return lines[-1] if lines else ""
+
+
+def step(sid, argv, capture=None):
+    """One pre- or post-backup command.
+
+    `capture` names a file that the command's stdout is written to — that is how
+    `virsh dumpxml` becomes a file restic can back up without a shell redirect.
+    """
+    return {"source": sid, "argv": list(argv), "capture": capture}
+
+
+def run_capture(argv, env=None):
+    """Run a short helper command and return (exit code, stdout, stderr).
+
+    Every failure mode is turned into a value rather than an exception so the
+    caller can say which volume or domain it was asking about — "could not
+    inspect" with no name is useless in a journal.
+    """
+    try:
+        res = subprocess.run(argv, env=env, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True, timeout=CMD_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return 124, "", "no answer within %gs" % CMD_TIMEOUT
+    except FileNotFoundError:
+        return 127, "", "%s: command not found" % argv[0]
+    except OSError as e:
+        return 126, "", str(e)
+    except (ValueError, TypeError) as e:
+        # An argument subprocess refuses to marshal — an embedded NUL, or a
+        # non-string that slipped past check_argv. A value, not a traceback:
+        # the caller names the volume or domain it was asking about.
+        return 126, "", str(e)
+    return res.returncode, res.stdout or "", res.stderr or ""
+
+
+# ---- filesystem sources -----------------------------------------------------
+
+
+def filesystem_source(src, sid):
+    paths = str_list(src.get("paths"), "paths", sid)
+    flags = []
+    for pat in str_list(src.get("excludes"), "excludes", sid):
+        flags.extend(["--exclude", pat])
+    # The editor stores excludeFile as a LIST — core/sources.js normalises it to
+    # one — while a hand-written job may still spell it as a single string.
+    # Splicing the list itself into argv is not a path, it is a TypeError raised
+    # from a timer at 3am.
+    for f in str_list(one_or_many(src.get("excludeFile")), "excludeFile", sid):
+        flags.extend(["--exclude-file", f])
+    if src.get("oneFileSystem"):
+        flags.append("--one-file-system")
+    for tag in str_list(src.get("tags"), "tags", sid):
+        flags.extend(["--tag", tag])
+    return {
+        "id": sid, "kind": "filesystem",
+        "paths": paths, "flags": flags, "pre": [], "post": [], "warnings": [],
+    }
+
+
+# ---- container sources ------------------------------------------------------
+
+
+def as_user(user, argv):
+    """Wrap a runtime command so it runs as the user who owns that runtime.
+
+    Rootless podman keeps its volumes in the *user's* store. hangar-run is root
+    under a systemd unit, and root's podman is a DIFFERENT store which would
+    answer about nothing — the failure mode is a backup that reports success and
+    contains no data. runuser (not sudo, not su) because it is in util-linux on
+    every target distro, needs no password when already root, and '--' stops
+    option parsing dead.
+    """
+    if user in (None, "", "root"):
+        return list(argv)
+    if not isinstance(user, str) or not USER_RE.match(user):
+        die(1, "not a valid user name", user=str(user))
+    return ["runuser", "-u", user, "--"] + list(argv)
+
+
+def database_hint(name):
+    """The first hint this container name matches, or "". Table order is advice."""
+    lower = name.lower()
+    for hint in DATABASE_HINTS:
+        if hint in lower:
+            return hint
+    return ""
+
+
+def check_names(names, noun, sid):
+    for name in names:
+        if not NAME_RE.match(name):
+            die(1, "unsafe %s name" % noun, source=sid, name=name)
+    return names
+
+
+def parse_volume_inspect(text):
+    """Objects out of `<rt> volume inspect` output.
+
+    `--format json` is not portable — podman emits an array, docker's --format
+    is a Go template that emits one object per line — so only the bare inspect
+    is ever called. It answers with an array on both, but a docker user reaching
+    for `--format '{{json .}}'` produces the line-per-object shape, so tolerate
+    both rather than fail on a difference that costs three lines to absorb.
+    """
+    values = []
+    try:
+        values.append(json.loads(text))
+    except (json.JSONDecodeError, TypeError):
+        for line in (text or "").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                values.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+    out = []
+
+    def push(v):
+        if isinstance(v, list):
+            for item in v:
+                push(item)
+        elif isinstance(v, dict):
+            out.append(v)
+
+    for v in values:
+        push(v)
+    return out
+
+
+def mountpoint_of(entries, wanted):
+    """Mount point of the named volume, or "".
+
+    Matched by name, never "the first entry": an inspect that answered about
+    something else must not be silently backed up in place of what was asked for.
+    """
+    for entry in entries:
+        name = entry.get("Name") or entry.get("name")
+        if name != wanted:
+            continue
+        mp = entry.get("Mountpoint") or entry.get("mountpoint") or entry.get("MountPoint")
+        mp = canonical_path(mp) if isinstance(mp, str) else ""
+        # JSON can carry a NUL that no path the kernel accepts ever could, and
+        # execve truncates at one. Dropping it here surfaces as "volume has no
+        # mount point", which names the volume the operator has to look at.
+        if mp.startswith("/") and NUL not in mp:
+            return mp
+    return ""
+
+
+def resolve_volume_paths(runtime, user, volumes, sid):
+    """Ask the runtime where each volume's bytes actually live.
+
+    Never derived from a hardcoded directory: rootless podman, rootful podman and
+    docker all store volumes somewhere different, and only the runtime knows
+    which. One inspect per volume rather than one batched call, because a batch
+    fails whole and "which volume is gone" is exactly what has to be reported.
+    """
+    paths = []
+    for name in volumes:
+        argv = as_user(user, [runtime, "volume", "inspect", name])
+        code, out, err = run_capture(argv)
+        if code != 0:
+            die(1, "could not inspect container volume", source=sid, volume=name,
+                runtime=runtime, user=user or "root", exit_code=code,
+                error=last_line(err))
+        mp = mountpoint_of(parse_volume_inspect(out), name)
+        if not mp:
+            die(1, "volume has no mount point in the runtime's inspect output",
+                source=sid, volume=name, runtime=runtime, user=user or "root")
+        paths.append(mp)
+    return sorted(dedupe(paths))
+
+
+def container_source(src, sid):
+    runtime = src.get("runtime") or DEFAULT_RUNTIME
+    if runtime not in CONTAINER_RUNTIMES:
+        die(1, "unknown container runtime", source=sid, runtime=str(runtime),
+            known=list(CONTAINER_RUNTIMES))
+
+    user = src.get("user") or ""
+    if user and (not isinstance(user, str) or not USER_RE.match(user)):
+        die(1, "not a valid user name", source=sid, user=str(user))
+
+    # Volumes are a set, so sorting them keeps the restic path vector — and with
+    # it `forget --group-by host,paths` — independent of click order.
+    volumes = check_names(sorted(dedupe(str_list(src.get("volumes"), "volumes", sid))),
+                          "volume", sid)
+    if not volumes:
+        die(1, "container source lists no volumes", source=sid)
+
+    # Containers keep author order: that is dependency order (app before its
+    # database), and sorting would silently reorder a shutdown.
+    containers = check_names(dedupe(str_list(src.get("containers"), "containers", sid)),
+                             "container", sid)
+
+    mode = src.get("consistency") or DEFAULT_CONSISTENCY
+    if mode not in CONTAINER_MODES:
+        die(1, "unknown consistency mode", source=sid, consistency=str(mode),
+            known=list(CONTAINER_MODES))
+    command = src.get("command") or ""
+    # The command is the one field that legitimately carries shell syntax — it
+    # runs under `sh -c` inside the container, so pipes and redirection are the
+    # point. It still has to be a string, and a NUL still cannot survive execve.
+    if not isinstance(command, str):
+        die(1, "the dump command must be a shell command string", source=sid)
+    if NUL in command:
+        die(1, "the dump command contains a NUL byte", source=sid)
+    if mode == "command" and not command:
+        die(1, "consistency mode 'command' needs a command to run", source=sid)
+    if mode != "none" and not containers:
+        die(1, "consistency mode needs at least one container to act on",
+            source=sid, consistency=mode)
+
+    warnings = []
+    if runtime == "podman" and not user:
+        # The single most likely reason a container backup comes back empty: this
+        # process is root, and rootless volumes live in their owner's own store.
+        warn(warnings, sid, "no-user",
+             "no user is recorded for this podman source, so root's container "
+             "store is used; rootless volumes will not be found there",
+             runtime=runtime)
+    if mode == "none":
+        for name in containers:
+            hint = database_hint(name)
+            if hint:
+                warn(warnings, sid, "live-database",
+                     "container %r looks like a database and its files are being "
+                     "copied while it runs — the backup may not restore" % name,
+                     container=name, match=hint, consistency=mode)
+
+    paths = resolve_volume_paths(runtime, user, volumes, sid)
+
+    flags = restic_flags(src, sid)
+
+    def rt(rest):
+        return step(sid, as_user(user, [runtime] + rest))
+
+    pre, post = [], []
+    if mode == "pause":
+        pre = [rt(["pause", c]) for c in containers]
+        post = [rt(["unpause", c]) for c in reversed(containers)]
+    elif mode == "stop":
+        pre = [rt(["stop", c]) for c in containers]
+        post = [rt(["start", c]) for c in reversed(containers)]
+    elif mode == "command":
+        # `sh -c` because the useful dump commands are pipelines
+        # ("pg_dump db | gzip > /backup/db.sql.gz"), writing into one of the
+        # volumes being backed up. Nothing is changed outside the container, so
+        # there is nothing to undo afterwards.
+        pre = [rt(["exec", c, "sh", "-c", command]) for c in containers]
+
+    return {
+        "id": sid, "kind": "container", "runtime": runtime, "user": user,
+        "consistency": mode, "volumes": volumes, "containers": containers,
+        "paths": paths, "flags": flags, "pre": pre, "post": post,
+        "warnings": warnings,
+    }
+
+
+# ---- libvirt sources --------------------------------------------------------
+
+
+def virsh_argv(uri, args):
+    return ["virsh", "-c", uri] + list(args)
+
+
+def parse_blklist(text):
+    """Rows of `virsh domblklist --details`.
+
+    Two shapes are dropped here rather than downstream, because both would make
+    `restic backup` fail on a path that does not exist:
+      * source '-'    — an empty drive (a CD-ROM with no medium) has no file;
+      * device cdrom  — an attached ISO is installation media, not VM state, and
+                        is routinely deleted once the guest is installed.
+    Source is the last column and may contain spaces, so the split is bounded at
+    three separators rather than done blindly.
+    """
+    rows = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if line == "" or (re.match(r"^[-\s]+$", line) and "-" in line):
+            continue
+        m = re.match(r"^(\S+)\s+(\S+)\s+(\S+)\s+(\S[\s\S]*)$", line)
+        if not m:
+            continue
+        typ, device, target, source = m.group(1), m.group(2), m.group(3), m.group(4).strip()
+        if (typ.lower(), device.lower(), target.lower()) == ("type", "device", "target"):
+            continue
+        if device.lower() == "cdrom":
+            continue
+        if source == "-" or not DISK_SOURCE_RE.match(source):
+            continue
+        rows.append({"type": typ, "device": device, "target": target, "source": source})
+    return rows
+
+
+def resolve_domain_disks(uri, domain, sid):
+    # LC_ALL=C because domblklist's column titles are translated, and a header
+    # row we fail to recognise would be parsed as a disk called "Ziel".
+    env = dict(os.environ)
+    env["LC_ALL"] = "C"
+    code, out, err = run_capture(virsh_argv(uri, ["domblklist", "--details", domain]), env)
+    if code != 0:
+        # Degrade with a report, never a hang: on hosts where qemu:///system is
+        # wedged this is the only thing standing between the operator and a unit
+        # that never finishes.
+        die(1, "could not list domain disks", source=sid, domain=domain, uri=uri,
+            exit_code=code, error=last_line(err))
+    return [row["source"] for row in parse_blklist(out)]
+
+
+def libvirt_source(src, sid):
+    uri = src.get("uri") or DEFAULT_URI
+    if not isinstance(uri, str) or uri.strip() == "" or NUL in uri:
+        die(1, "libvirt source needs a connection URI", source=sid)
+
+    domains = sorted(dedupe(str_list(src.get("domains"), "domains", sid)))
+    if not domains:
+        die(1, "libvirt source lists no domains", source=sid)
+    for d in domains:
+        # A leading dash would be read as an option by virsh rather than as the
+        # domain it names; the rest of the set would escape LIBVIRT_XML_DIR or
+        # change the meaning of a command line.
+        if d.startswith("-") or UNSAFE_DOMAIN_RE.search(d):
+            die(1, "unsafe domain name", source=sid, domain=d)
+
+    quiesce = src.get("quiesce") or "none"
+    if quiesce not in LIBVIRT_QUIESCE:
+        die(1, "unknown quiesce mode", source=sid, quiesce=str(quiesce),
+            known=list(LIBVIRT_QUIESCE))
+
+    # Absent means true: a disk image without its domain XML is not a restorable
+    # VM, it is a file that happens to contain a filesystem.
+    include_xml = True if src.get("includeXml") is None else bool(src.get("includeXml"))
+
+    warnings = []
+    if quiesce == "none":
+        warn(warnings, sid, "quiesce-crash-consistent",
+             "disks are copied while the VM runs, so the image is crash-consistent "
+             "at best — the restored guest sees it as if the power was cut",
+             quiesce=quiesce)
+    elif quiesce == "agent":
+        # Fails open on purpose: domfsfreeze errors when the agent is absent, and
+        # a run that degrades to a live copy while claiming to be consistent is
+        # the worst of both worlds. The pre-step failure would abort the backup,
+        # but the operator should know the dependency before that happens.
+        warn(warnings, sid, "quiesce-agent-required",
+             "freezing needs qemu-guest-agent running inside the guest; without "
+             "it the freeze fails and the copy is only crash-consistent",
+             quiesce=quiesce)
+    if not include_xml:
+        warn(warnings, sid, "no-xml",
+             "the domain XML is not included, so the disk images restore as files "
+             "rather than as a VM that can be started",
+             includeXml=False)
+
+    disks = []
+    for d in domains:
+        disks.extend(resolve_domain_disks(uri, d, sid))
+    # Two disks can share a backing file (a data disk attached to two domains),
+    # and restic would otherwise store the same tree twice.
+    disks = sorted(dedupe(disks))
+
+    pre, xml_paths = [], []
+    if include_xml:
+        for d in domains:
+            path = os.path.join(LIBVIRT_XML_DIR, d + ".xml")
+            xml_paths.append(path)
+            pre.append(step(sid, virsh_argv(uri, ["dumpxml", d]), capture=path))
+    xml_paths.sort()
+
+    post = []
+    if quiesce == "agent":
+        pre.extend(step(sid, virsh_argv(uri, ["domfsfreeze", d])) for d in domains)
+        post = [step(sid, virsh_argv(uri, ["domfsthaw", d])) for d in reversed(domains)]
+    elif quiesce == "shutdown":
+        pre.extend(step(sid, virsh_argv(uri, ["shutdown", d])) for d in domains)
+        post = [step(sid, virsh_argv(uri, ["start", d])) for d in reversed(domains)]
+
+    flags = restic_flags(src, sid)
+
+    return {
+        "id": sid, "kind": "libvirt", "uri": uri, "quiesce": quiesce,
+        "domains": domains, "includeXml": include_xml, "xml": xml_paths,
+        # Disks before XML: a reader of `journalctl` sees the payload first and
+        # the metadata after it.
+        "paths": disks + xml_paths, "flags": flags, "pre": pre, "post": post,
+        "warnings": warnings,
+    }
+
+
+# ---- dispatch ---------------------------------------------------------------
+
+SOURCE_KINDS = {
+    "filesystem": filesystem_source,
+    "container": container_source,
+    "libvirt": libvirt_source,
+}
+
+
+def build_sources(sources):
+    out = []
+    for index, src in enumerate(sources):
+        if not isinstance(src, dict):
+            die(1, "a backup source must be an object", index=index)
+        kind = src.get("kind", "filesystem")
+        build = SOURCE_KINDS.get(kind) if isinstance(kind, str) else None
+        if build is None:
+            # Silently skipping an unknown kind would produce a backup that looks
+            # successful while containing nothing the user asked for.
+            die(1, "unsupported source kind", kind=str(kind),
+                known=sorted(SOURCE_KINDS))
+        out.append(build(src, src.get("id") or ("source-%d" % index)))
+    return out
 
 
 def retention_args(policy):
     if not policy:
         return []
+    if not isinstance(policy, dict):
+        die(1, "retention policy must be an object", retention=str(policy))
     args = []
     for key, flag in (
         ("last", "--keep-last"),
@@ -185,7 +753,7 @@ def retention_args(policy):
             args.extend([flag, str(val)])
     if policy.get("within"):
         args.extend(["--keep-within", str(policy["within"])])
-    for tag in policy.get("tags") or []:
+    for tag in str_list(policy.get("tags"), "retention.tags", "-"):
         args.extend(["--keep-tag", tag])
     if not args:
         # A policy that keeps nothing would delete every snapshot. Refuse loudly.
@@ -195,19 +763,54 @@ def retention_args(policy):
 
 
 def build_plan(job, repo):
-    url = repo_url(repo)
+    try:
+        url = repo_url(repo)
+    except (KeyError, TypeError, AttributeError) as e:
+        die(1, "repository definition is incomplete",
+            repo=str(repo.get("id")), kind=str(repo.get("kind")), field=str(e))
     pwfile = password_file(repo["id"])
-    paths, flags = source_args(job.get("sources") or [])
+    sources = build_sources(job.get("sources") or [])
+
+    paths, flags, pre, warnings = [], [], [], []
+    for src in sources:
+        paths.extend(src["paths"])
+        flags.extend(src["flags"])
+        pre.extend(src["pre"])
+        warnings.extend(src.get("warnings") or [])
+    # Reverse of pre, across sources as well as within one: unwinding in the
+    # opposite order is the only thing that keeps a partial failure recoverable
+    # by re-running the post half.
+    post = []
+    for src in reversed(sources):
+        post.extend(src["post"])
+
+    if not paths:
+        die(1, "job has no paths to back up")
+
     base = ["restic", "-r", url, "--password-file", pwfile]
 
     backup = base + ["backup", "--json"] + flags + paths
-    for tag in job.get("tags") or []:
+    for tag in str_list(job.get("tags"), "tags", job.get("id")):
         backup.extend(["--tag", tag])
 
-    plan = {"backup": backup, "forget": None, "env": backend_env(repo)}
+    plan = {
+        "backup": backup, "forget": None, "env": backend_env(repo),
+        "sources": sources, "pre": pre, "post": post, "warnings": warnings,
+    }
     ret = retention_args(job.get("retention"))
     if ret:
         plan["forget"] = base + ["forget", "--json", "--prune"] + ret
+
+    # Last gate before anything is executed. Every volume name, container name,
+    # domain name, dump command and discovered path has arrived here through a
+    # different route; this is the one place that holds all of them at once.
+    check_argv(plan["backup"], "backup")
+    if plan["forget"]:
+        check_argv(plan["forget"], "forget")
+    for st in pre + post:
+        check_argv(st["argv"], "step", source=st.get("source"))
+        if st.get("capture") is not None:
+            check_argv([st["capture"]], "capture", source=st.get("source"))
     return plan
 
 
@@ -223,6 +826,110 @@ def run_hook(name, command, env):
         die(4, "hook failed", hook=name, exit_code=res.returncode)
 
 
+def run_step(st, env):
+    """Execute one source step; return (exit code, message).
+
+    Steps are argv vectors, never shell strings — every element came from a
+    validated name or from a path the runtime itself reported.
+    """
+    argv, capture = st["argv"], st.get("capture")
+    log("info", "running source step", source=st.get("source"), argv=argv, capture=capture)
+    try:
+        if capture:
+            os.makedirs(os.path.dirname(capture), mode=0o750, exist_ok=True)
+            with open(capture, "w", encoding="utf-8") as fh:
+                res = subprocess.run(argv, env=env, stdout=fh, stderr=subprocess.PIPE,
+                                     text=True, timeout=CMD_TIMEOUT)
+        else:
+            res = subprocess.run(argv, env=env, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, text=True, timeout=CMD_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return 124, "no answer within %gs" % CMD_TIMEOUT
+    except FileNotFoundError:
+        return 127, "%s: command not found" % argv[0]
+    except OSError as e:
+        return 126, str(e)
+    except (ValueError, TypeError) as e:
+        # An argument subprocess refuses to marshal. Returned as a value so that
+        # a post step which cannot even start is still counted as a failure
+        # rather than aborting the unwind of the steps behind it.
+        return 126, str(e)
+    if res.returncode != 0:
+        return res.returncode, last_line(res.stderr)
+    return 0, ""
+
+
+def run_pre_steps(steps, env):
+    for st in steps:
+        code, message = run_step(st, env)
+        if code != 0:
+            # die() raises SystemExit, so the caller's `finally` still runs every
+            # post step. Continuing instead would back up a database that was
+            # never actually paused while telling the user it was.
+            die(4, "source pre-command failed", source=st.get("source"),
+                argv=st["argv"], exit_code=code, error=message)
+
+
+def run_post_steps(steps, env):
+    """Run every post step, whatever happened, and report how many failed.
+
+    Never aborts on the first failure: the steps still queued are the ones that
+    restart the remaining containers. A container left stopped, or a VM left
+    frozen, because a backup errored is a worse outcome than a failed backup.
+    """
+    failed = 0
+    for st in steps:
+        try:
+            code, message = run_step(st, env)
+        except Exception as e:              # noqa: BLE001 — deliberately total
+            # The steps still queued are the ones that start the remaining
+            # containers and thaw the remaining guests. Whatever one step manages
+            # to raise, it must not take the rest of the unwind down with it.
+            code, message = 1, "%s: %s" % (type(e).__name__, e)
+        if code != 0:
+            failed += 1
+            log("error", "source post-command failed", source=st.get("source"),
+                argv=st["argv"], exit_code=code, error=message)
+    return failed
+
+
+class Interrupted(Exception):
+    """SIGTERM or SIGINT arrived while the backup was running."""
+
+    def __init__(self, signum):
+        super().__init__("interrupted by signal %d" % signum)
+        self.signum = signum
+
+
+def install_signal_handlers():
+    """Turn a termination signal into an exception, so the unwind still happens.
+
+    This is not defensive programming, it is the common case: `systemctl stop`,
+    a unit that overruns TimeoutStartSec, and a host shutdown during a nightly
+    run all deliver SIGTERM. Python's default disposition for SIGTERM kills the
+    process outright — no `finally`, so the containers that were stopped for the
+    copy are never started again and the frozen guests are never thawed. That is
+    precisely the outcome this design calls worse than a failed backup, and it is
+    reachable by an operator typing a perfectly ordinary command.
+
+    One-shot: the handler restores the default disposition before raising, so a
+    second signal from an operator who means it still kills us immediately rather
+    than being swallowed by an unwind that is itself stuck.
+    """
+    def handler(signum, _frame):
+        signal.signal(signum, signal.SIG_DFL)
+        log("warning", "interrupted, unwinding", signal=signum)
+        raise Interrupted(signum)
+
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        try:
+            signal.signal(sig, handler)
+        except (ValueError, OSError):
+            # Not the main thread, or a platform without that signal. Losing one
+            # of them must not stop the helper from running at all.
+            pass
+
+
 def stream_restic(argv, env, label):
     """Run restic, folding its JSON-lines stream into a final summary.
 
@@ -231,38 +938,56 @@ def stream_restic(argv, env, label):
     recognise a progress message.
     """
     log("info", "starting %s" % label)
-    proc = subprocess.Popen(
-        argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, bufsize=1,
-    )
+    try:
+        proc = subprocess.Popen(
+            argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, bufsize=1,
+        )
+    except (OSError, ValueError) as e:
+        # restic not installed is the usual one. A returned code rather than a
+        # raise, so the caller's `finally` stays in charge of the unwind: a VM
+        # frozen for a backup that could not start must still be thawed, and a
+        # traceback out of here would be reported as a crash instead of a
+        # failure with a reason.
+        log("error", "could not start restic", label=label, error=str(e))
+        return 1, None, []
     summary, errors, last_report = None, [], 0.0
 
-    for line in proc.stdout:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            msg = json.loads(line)
-        except json.JSONDecodeError:
-            continue  # non-JSON noise on stdout is not fatal
-        mtype = msg.get("message_type")
-        if mtype == "summary":
-            summary = msg
-        elif mtype == "error":
-            errors.append(msg)
-            log("warning", "restic reported an error",
-                item=msg.get("item"), during=msg.get("during"),
-                error=(msg.get("error") or {}).get("message") or msg.get("message"))
-        elif mtype == "status":
-            # Throttle: restic emits status many times a second and the journal is
-            # not the right place for that volume.
-            now = time.monotonic()
-            if now - last_report >= 10.0:
-                last_report = now
-                log("info", "progress",
-                    percent=round((msg.get("percent_done") or 0) * 100, 1),
-                    files_done=msg.get("files_done"),
-                    bytes_done=msg.get("bytes_done"))
+    try:
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue  # non-JSON noise on stdout is not fatal
+            mtype = msg.get("message_type")
+            if mtype == "summary":
+                summary = msg
+            elif mtype == "error":
+                errors.append(msg)
+                log("warning", "restic reported an error",
+                    item=msg.get("item"), during=msg.get("during"),
+                    error=(msg.get("error") or {}).get("message") or msg.get("message"))
+            elif mtype == "status":
+                # Throttle: restic emits status many times a second and the journal is
+                # not the right place for that volume.
+                now = time.monotonic()
+                if now - last_report >= 10.0:
+                    last_report = now
+                    log("info", "progress",
+                        percent=round((msg.get("percent_done") or 0) * 100, 1),
+                        files_done=msg.get("files_done"),
+                        bytes_done=msg.get("bytes_done"))
+    except BaseException:
+        # We are leaving this function early — a signal, almost always. restic must
+        # not outlive us: the post steps are about to start the containers again,
+        # and a backup still reading their volumes while they restart is worse than
+        # either outcome on its own.
+        proc.kill()
+        proc.wait()
+        raise
 
     stderr_text = proc.stderr.read() or ""
     proc.wait()
@@ -304,11 +1029,23 @@ def main(argv):
     job_id = argv[1]
     print_plan = "--print-plan" in argv[2:]
 
+    # Both ids are interpolated into a path under CONF_DIR. The editor already
+    # enforces this shape, but the job file is the untrusted half of the pair:
+    # a repo of "../../etc/shadow" would otherwise be opened and parsed.
+    if not ID_RE.match(job_id):
+        die(1, "not a usable job id", job=job_id)
+
     job = read_json(os.path.join(CONF_DIR, "jobs", "%s.json" % job_id))
+    if not isinstance(job, dict):
+        die(1, "job file is not an object", job=job_id)
     repo_id = job.get("repo")
     if not repo_id:
         die(1, "job does not name a repository", job=job_id)
+    if not isinstance(repo_id, str) or not ID_RE.match(repo_id):
+        die(1, "not a usable repository id", job=job_id, repo=str(repo_id))
     repo = read_json(os.path.join(CONF_DIR, "repos", "%s.json" % repo_id))
+    if not isinstance(repo, dict):
+        die(1, "repository file is not an object", repo=repo_id)
     repo.setdefault("id", repo_id)
 
     plan = build_plan(job, repo)
@@ -327,14 +1064,40 @@ def main(argv):
     hooks = job.get("hooks") or {}
     run_hook("pre", hooks.get("pre"), env)
 
-    code, summary, errors = stream_restic(plan["backup"], env, "backup")
+    # Installed here rather than at import: --print-plan must stay a pure dry run,
+    # and nothing before this point has changed the state of a container or a VM.
+    install_signal_handlers()
+
+    # try/finally, not sequence: whether the pre steps fail, the backup fails or
+    # restic is killed outright, the containers still have to be started again
+    # and the guests still have to be thawed.
+    post_failures = 0
+    interrupted = None
+    try:
+        run_pre_steps(plan["pre"], env)
+        code, summary, errors = stream_restic(plan["backup"], env, "backup")
+    except Interrupted as e:
+        # Folded into restic's own "cancelled" code rather than a new exit status:
+        # a run stopped by an operator is the same outcome however it was stopped,
+        # and the UI already knows what CANCELLED means.
+        interrupted = e
+        code, summary, errors = EXIT_CANCELLED, None, []
+    finally:
+        post_failures = run_post_steps(plan["post"], env)
+
     kind = KIND_BY_CODE.get(code, "UNKNOWN")
 
     if code not in (0, EXIT_READ_ERRORS):
         write_state(job_id, {
             "job": job_id, "status": "failed", "kind": kind,
             "started": started, "finished": time.time(), "exit_code": code,
+            "post_failures": post_failures,
         })
+        if interrupted is not None:
+            # Said as what it was. "backup failed" for a run an operator stopped
+            # is the kind of wrong report that teaches people to ignore the log.
+            die(2, "backup was interrupted", exit_code=code, kind=kind,
+                signal=interrupted.signum, post_failures=post_failures)
         die(2, "backup failed", exit_code=code, kind=kind)
 
     status = "partial" if code == EXIT_READ_ERRORS else "ok"
@@ -350,6 +1113,7 @@ def main(argv):
         "files_changed": (summary or {}).get("files_changed"),
         "data_added": (summary or {}).get("data_added"),
         "unreadable": len(errors),
+        "post_failures": post_failures,
     }
 
     if plan["forget"]:
@@ -363,6 +1127,12 @@ def main(argv):
 
     write_state(job_id, record)
     run_hook("post", hooks.get("post"), env)
+    if post_failures:
+        # The snapshot is written and recorded, so this is not a backup failure —
+        # but a container that did not come back up must not be reported as a
+        # clean run, or nobody will look until the service is missed.
+        die(4, "source post-command failed", count=post_failures,
+            snapshot=record.get("snapshot"))
     log("info", "backup complete", status=status, snapshot=record.get("snapshot"))
     return 0
 

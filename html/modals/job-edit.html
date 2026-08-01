@@ -67,16 +67,336 @@
                     <hr>
 
                     <!-- What gets backed up ------------------------------------- -->
+                    <!-- The chooser is driven by HangarSources.kinds(), so a kind
+                         whose module failed to load is not offered rather than
+                         being offered and then refusing to save. -->
                     <div class="mb-3">
-                        <label class="form-label" for="hangar-job-paths">Paths to back up</label>
-                        <textarea id="hangar-job-paths" class="form-control hangar-mono" rows="4"
-                                  x-model="form.paths" :aria-invalid="invalid('paths')"
-                                  aria-describedby="hangar-job-paths-help"
-                                  spellcheck="false" placeholder="/home&#10;/etc"></textarea>
-                        <div id="hangar-job-paths-help" class="form-text">
-                            <span x-show="!invalid('paths')">One absolute path per line.</span>
-                            <span class="text-danger" x-show="invalid('paths')" x-text="messageFor('paths')"></span>
+                        <label class="form-label" for="hangar-job-source-kind">What to back up</label>
+                        <select id="hangar-job-source-kind" class="form-select"
+                                x-model="form.sourceKind" @change="onKindChange()"
+                                aria-describedby="hangar-job-source-kind-help">
+                            <template x-for="k in kinds()" :key="k.id">
+                                <option :value="k.id" x-text="k.label"></option>
+                            </template>
+                        </select>
+                        <div id="hangar-job-source-kind-help" class="form-text"
+                             x-text="kindDescription()"></div>
+                    </div>
+
+                    <!-- Files and directories ----------------------------------- -->
+                    <div x-show="isKind('filesystem')">
+                        <div class="mb-3">
+                            <label class="form-label" for="hangar-job-paths">Paths to back up</label>
+                            <textarea id="hangar-job-paths" class="form-control hangar-mono" rows="4"
+                                      x-model="form.paths" :aria-invalid="invalid('paths')"
+                                      aria-describedby="hangar-job-paths-help"
+                                      spellcheck="false" placeholder="/home&#10;/etc"></textarea>
+                            <div id="hangar-job-paths-help" class="form-text">
+                                <span x-show="!invalid('paths')">One absolute path per line.</span>
+                                <span class="text-danger" x-show="invalid('paths')"
+                                      x-text="messageFor('paths')"></span>
+                            </div>
                         </div>
+                    </div>
+
+                    <!-- Container volumes --------------------------------------- -->
+                    <div x-show="isKind('container')">
+
+                        <div class="row g-3 mb-3">
+                            <div class="col-sm-6">
+                                <label class="form-label" for="hangar-job-runtime">Container runtime</label>
+                                <select id="hangar-job-runtime" class="form-select"
+                                        x-model="form.container.runtime" @change="onRuntimeChange()"
+                                        :aria-invalid="invalid('runtime')"
+                                        aria-describedby="hangar-job-runtime-help">
+                                    <template x-for="rt in runtimes()" :key="rt">
+                                        <option :value="rt" x-text="rt"></option>
+                                    </template>
+                                </select>
+                                <div id="hangar-job-runtime-help" class="form-text">
+                                    <span x-show="!invalid('runtime')">
+                                        On a host with podman-docker, <code>docker</code> is a shim
+                                        that calls podman and reads podman's store.
+                                    </span>
+                                    <span class="text-danger" x-show="invalid('runtime')"
+                                          x-text="messageFor('runtime')"></span>
+                                </div>
+                            </div>
+
+                            <div class="col-sm-6">
+                                <label class="form-label" for="hangar-job-user">Owning user</label>
+                                <input id="hangar-job-user" class="form-control hangar-mono"
+                                       x-model="form.container.user" @change="onRuntimeChange()"
+                                       autocomplete="off" spellcheck="false" placeholder="root"
+                                       :aria-invalid="invalid('user')"
+                                       aria-describedby="hangar-job-user-help">
+                                <div id="hangar-job-user-help" class="form-text">
+                                    <span x-show="!invalid('user')">
+                                        Rootless volumes belong to the user who created them. The
+                                        backup runs as root, whose store is a different one.
+                                    </span>
+                                    <span class="text-danger" x-show="invalid('user')"
+                                          x-text="messageFor('user')"></span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Volumes: discovered list, with a typed list when the
+                             runtime cannot be asked. -->
+                        <div class="mb-3">
+                            <div class="form-label">Volumes</div>
+                            <div class="form-text mb-1"
+                                 x-show="discoveryState('volumes') === 'busy'">Asking the runtime…</div>
+                            <div class="form-text text-danger mb-1"
+                                 x-show="discoveryState('volumes') === 'failed'"
+                                 x-text="discoveryMessage('volumes')"></div>
+                            <div class="form-text mb-1" x-show="discoveryState('volumes') === 'empty'">
+                                The runtime reported no volumes. Type their names below if you know them.
+                            </div>
+
+                            <div class="border rounded p-2 mb-2 overflow-auto" x-show="volumeChoices().length">
+                                <template x-for="v in volumeChoices()" :key="v.name">
+                                    <div class="form-check">
+                                        <input class="form-check-input" type="checkbox"
+                                               :id="'hangar-job-volume-' + v.name"
+                                               :value="v.name" x-model="form.container.volumes">
+                                        <label class="form-check-label hangar-mono"
+                                               :for="'hangar-job-volume-' + v.name">
+                                            <span x-text="v.name"></span>
+                                            <span class="badge text-bg-warning ms-1" x-show="!v.discovered"
+                                                  title="Saved in this job, but the runtime did not report it">not found</span>
+                                        </label>
+                                    </div>
+                                </template>
+                            </div>
+
+                            <div x-show="!manual.volumes">
+                                <button type="button" class="btn btn-sm btn-link px-0"
+                                        @click="useManual('volumes')">Type volume names instead</button>
+                            </div>
+
+                            <div x-show="manual.volumes">
+                                <label class="form-label small" for="hangar-job-volumes">
+                                    Volume names, one per line
+                                </label>
+                                <textarea id="hangar-job-volumes" class="form-control hangar-mono" rows="3"
+                                          x-model="form.container.volumesText"
+                                          :aria-invalid="invalid('volumes')"
+                                          aria-describedby="hangar-job-volumes-help"
+                                          spellcheck="false" placeholder="pgdata&#10;uploads"></textarea>
+                                <div id="hangar-job-volumes-help" class="form-text">
+                                    <span x-show="!invalid('volumes')">
+                                        Added to whatever is ticked above.
+                                    </span>
+                                    <span class="text-danger" x-show="invalid('volumes')"
+                                          x-text="messageFor('volumes')"></span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="mb-3">
+                            <div class="form-label">Containers using these volumes</div>
+                            <div class="form-text text-danger mb-1"
+                                 x-show="discoveryState('containers') === 'failed'"
+                                 x-text="discoveryMessage('containers')"></div>
+
+                            <div class="border rounded p-2 mb-2 overflow-auto" x-show="containerChoices().length">
+                                <template x-for="c in containerChoices()" :key="c.name">
+                                    <div class="form-check">
+                                        <input class="form-check-input" type="checkbox"
+                                               :id="'hangar-job-container-' + c.name"
+                                               :value="c.name" x-model="form.container.containers">
+                                        <label class="form-check-label hangar-mono"
+                                               :for="'hangar-job-container-' + c.name">
+                                            <span x-text="c.name"></span>
+                                            <span class="badge text-bg-warning ms-1" x-show="!c.discovered"
+                                                  title="Saved in this job, but the runtime did not report it">not found</span>
+                                        </label>
+                                    </div>
+                                </template>
+                            </div>
+
+                            <div x-show="!manual.containers">
+                                <button type="button" class="btn btn-sm btn-link px-0"
+                                        @click="useManual('containers')">Type container names instead</button>
+                            </div>
+
+                            <div x-show="manual.containers">
+                                <label class="form-label small" for="hangar-job-containers">
+                                    Container names, one per line
+                                </label>
+                                <textarea id="hangar-job-containers" class="form-control hangar-mono" rows="3"
+                                          x-model="form.container.containersText"
+                                          :aria-invalid="invalid('containers')"
+                                          aria-describedby="hangar-job-containers-help"
+                                          spellcheck="false" placeholder="app-postgres-1"></textarea>
+                                <div id="hangar-job-containers-help" class="form-text">
+                                    <span x-show="!invalid('containers')">
+                                        Listed in shutdown order — the app before the database it uses.
+                                        They are started again in reverse.
+                                    </span>
+                                    <span class="text-danger" x-show="invalid('containers')"
+                                          x-text="messageFor('containers')"></span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Consistency. This picker is the one that decides whether
+                             the backup restores, so its explanation is always on
+                             screen rather than behind a tooltip. -->
+                        <div class="mb-3">
+                            <label class="form-label" for="hangar-job-consistency">Consistency</label>
+                            <select id="hangar-job-consistency" class="form-select"
+                                    x-model="form.container.consistency" @change="revalidate()"
+                                    :aria-invalid="invalid('consistency')"
+                                    aria-describedby="hangar-job-consistency-help">
+                                <template x-for="m in consistencies()" :key="m.id">
+                                    <option :value="m.id" x-text="m.label"></option>
+                                </template>
+                            </select>
+                            <div id="hangar-job-consistency-help" class="alert py-2 px-3 mt-2 mb-0"
+                                 :class="consistencyRisk() === 'high' ? 'alert-warning' : 'alert-secondary'">
+                                <div class="small" x-text="consistencyText()"></div>
+                                <div class="small text-danger mt-1" x-show="invalid('consistency')"
+                                     x-text="messageFor('consistency')"></div>
+                            </div>
+                        </div>
+
+                        <div class="mb-3" x-show="form.container.consistency === 'command'">
+                            <label class="form-label" for="hangar-job-command">Dump command</label>
+                            <input id="hangar-job-command" class="form-control hangar-mono"
+                                   x-model="form.container.command" autocomplete="off" spellcheck="false"
+                                   :aria-invalid="invalid('command')"
+                                   aria-describedby="hangar-job-command-help"
+                                   placeholder="pg_dump -U postgres app > /backup/app.sql">
+                            <div id="hangar-job-command-help" class="form-text">
+                                <span x-show="!invalid('command')">
+                                    Run inside each container with <code>sh -c</code>. Write the dump
+                                    into one of the volumes above, or it will not be backed up.
+                                </span>
+                                <span class="text-danger" x-show="invalid('command')"
+                                      x-text="messageFor('command')"></span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Virtual machines ---------------------------------------- -->
+                    <div x-show="isKind('libvirt')">
+
+                        <div class="mb-3">
+                            <label class="form-label" for="hangar-job-uri">Connection</label>
+                            <select id="hangar-job-uri" class="form-select"
+                                    x-model="form.libvirt.uri" @change="onUriChange()"
+                                    :aria-invalid="invalid('uri')"
+                                    aria-describedby="hangar-job-uri-help">
+                                <template x-for="u in uris()" :key="u.id">
+                                    <option :value="u.id" x-text="u.label"></option>
+                                </template>
+                            </select>
+                            <div id="hangar-job-uri-help" class="form-text">
+                                <span class="text-danger" x-show="invalid('uri')"
+                                      x-text="messageFor('uri')"></span>
+                            </div>
+                        </div>
+
+                        <div class="mb-3">
+                            <div class="form-label">Domains</div>
+                            <div class="form-text mb-1"
+                                 x-show="discoveryState('domains') === 'busy'">Asking libvirt…</div>
+                            <div class="form-text text-danger mb-1"
+                                 x-show="discoveryState('domains') === 'failed'"
+                                 x-text="discoveryMessage('domains')"></div>
+                            <div class="form-text mb-1" x-show="discoveryState('domains') === 'empty'">
+                                This connection reported no domains. Type their names below if you know them.
+                            </div>
+
+                            <div class="border rounded p-2 mb-2 overflow-auto" x-show="domainChoices().length">
+                                <template x-for="d in domainChoices()" :key="d.name">
+                                    <div class="form-check">
+                                        <input class="form-check-input" type="checkbox"
+                                               :id="'hangar-job-domain-' + d.name"
+                                               :value="d.name" x-model="form.libvirt.domains">
+                                        <label class="form-check-label hangar-mono"
+                                               :for="'hangar-job-domain-' + d.name">
+                                            <span x-text="d.name"></span>
+                                            <span class="badge text-bg-warning ms-1" x-show="!d.discovered"
+                                                  title="Saved in this job, but libvirt did not report it">not found</span>
+                                        </label>
+                                    </div>
+                                </template>
+                            </div>
+
+                            <div x-show="!manual.domains">
+                                <button type="button" class="btn btn-sm btn-link px-0"
+                                        @click="useManual('domains')">Type domain names instead</button>
+                            </div>
+
+                            <div x-show="manual.domains">
+                                <label class="form-label small" for="hangar-job-domains">
+                                    Domain names, one per line
+                                </label>
+                                <textarea id="hangar-job-domains" class="form-control hangar-mono" rows="3"
+                                          x-model="form.libvirt.domainsText"
+                                          :aria-invalid="invalid('domains')"
+                                          aria-describedby="hangar-job-domains-help"
+                                          spellcheck="false" placeholder="web01&#10;db01"></textarea>
+                                <div id="hangar-job-domains-help" class="form-text">
+                                    <span x-show="!invalid('domains')">
+                                        Added to whatever is ticked above.
+                                    </span>
+                                    <span class="text-danger" x-show="invalid('domains')"
+                                          x-text="messageFor('domains')"></span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="mb-3">
+                            <label class="form-label" for="hangar-job-quiesce">Consistency</label>
+                            <select id="hangar-job-quiesce" class="form-select"
+                                    x-model="form.libvirt.quiesce" @change="revalidate()"
+                                    :aria-invalid="invalid('quiesce')"
+                                    aria-describedby="hangar-job-quiesce-help">
+                                <template x-for="m in quiesces()" :key="m.id">
+                                    <option :value="m.id" x-text="m.label"></option>
+                                </template>
+                            </select>
+                            <div id="hangar-job-quiesce-help" class="alert alert-secondary py-2 px-3 mt-2 mb-0">
+                                <div class="small" x-text="quiesceText()"></div>
+                                <div class="small text-danger mt-1" x-show="invalid('quiesce')"
+                                     x-text="messageFor('quiesce')"></div>
+                            </div>
+                        </div>
+
+                        <div class="form-check mb-3">
+                            <input class="form-check-input" type="checkbox" id="hangar-job-include-xml"
+                                   x-model="form.libvirt.includeXml" @change="revalidate()">
+                            <label class="form-check-label" for="hangar-job-include-xml">
+                                Include the domain XML (recommended)
+                            </label>
+                        </div>
+                    </div>
+
+                    <!-- The warnings that decide whether the backup restores, shown
+                         at the moment of choosing rather than after the first
+                         restore fails. Wording comes from the source kind's own
+                         validate(); this screen does not paraphrase it. -->
+                    <div class="alert alert-warning py-2 px-3 mb-3" role="status" x-show="hasWarnings()">
+                        <strong>Read this before relying on the backup</strong>
+                        <ul class="small mb-1 mt-1">
+                            <!-- Keyed by w.key, not w.code: two database containers
+                                 raise the same code twice and x-for would render
+                                 only the first of them. -->
+                            <template x-for="w in warnings()" :key="w.key">
+                                <li x-text="w.message"></li>
+                            </template>
+                        </ul>
+                        <div class="small">
+                            These are warnings, not errors — the job can still be saved.
+                        </div>
+                    </div>
+
+                    <div class="alert alert-secondary py-2 px-3 mb-3" x-show="sourceText()">
+                        <div class="small" x-text="sourceText()"></div>
                     </div>
 
                     <div class="mb-3">
@@ -93,7 +413,10 @@
                     </div>
 
                     <div class="row g-3 mb-3">
-                        <div class="col-sm-6">
+                        <!-- An exclude file is a restic flag that only means anything
+                             against a path vector the user chose, so it stays with
+                             the filesystem kind. -->
+                        <div class="col-sm-6" x-show="isKind('filesystem')">
                             <label class="form-label" for="hangar-job-exclude-file">Exclude file</label>
                             <input id="hangar-job-exclude-file" class="form-control hangar-mono"
                                    x-model="form.excludeFile" autocomplete="off" spellcheck="false"
@@ -117,12 +440,14 @@
                         </div>
                     </div>
 
-                    <div class="form-check mb-3">
-                        <input class="form-check-input" type="checkbox" id="hangar-job-onefs"
-                               x-model="form.oneFileSystem">
-                        <label class="form-check-label" for="hangar-job-onefs">
-                            Stay on one filesystem (do not follow mount points)
-                        </label>
+                    <div x-show="isKind('filesystem')">
+                        <div class="form-check mb-3">
+                            <input class="form-check-input" type="checkbox" id="hangar-job-onefs"
+                                   x-model="form.oneFileSystem">
+                            <label class="form-check-label" for="hangar-job-onefs">
+                                Stay on one filesystem (do not follow mount points)
+                            </label>
+                        </div>
                     </div>
 
                     <hr>

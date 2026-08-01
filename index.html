@@ -81,6 +81,10 @@
 <script src="js/core/secrets.js"></script>
 <script src="js/core/repos.js"></script>
 <script src="js/core/sources.js"></script>
+<!-- v2 source kinds. These call HangarSources.registerKind() at load, so they must
+     come after sources.js and before anything that enumerates the kinds. -->
+<script src="js/core/sources-container.js"></script>
+<script src="js/core/sources-libvirt.js"></script>
 <script src="js/core/retention.js"></script>
 <script src="js/core/schedule.js"></script>
 <script src="js/core/provision.js"></script>

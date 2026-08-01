@@ -167,9 +167,10 @@ test('a job with no paths is refused', () => {
 });
 
 test('an unsupported source kind is refused rather than silently skipped', () => {
-    // v1 ships filesystem only. Silently ignoring a 'libvirt' source would produce a
-    // backup that looks successful while containing nothing the user asked for.
-    const job = { id: 'vm', repo: 'main', sources: [{ kind: 'libvirt', paths: ['/x'] }] };
+    // Silently ignoring a kind the helper does not implement would produce a backup
+    // that looks successful while containing nothing the user asked for. ('libvirt'
+    // was the example here until v2 implemented it; the invariant is the same.)
+    const job = { id: 'vm', repo: 'main', sources: [{ kind: 'zfs-dataset', paths: ['/x'] }] };
     withConfig([LOCAL_REPO], [job], (dir) => {
         const res = runExpectFailure(dir, 'vm');
         assert.equal(res.code, 1);
@@ -288,4 +289,151 @@ test('the systemd credential is preferred over the on-disk key when present', ()
         fs.rmSync(dir, { recursive: true, force: true });
         fs.rmSync(creds, { recursive: true, force: true });
     }
+});
+
+// --- the unwind survives the run being killed -------------------------------
+//
+// The rest of this file drives --print-plan, which is a dry run. These two
+// spawn the helper for real against stub binaries, because what is being tested
+// is what happens to a container when the process is stopped mid-backup — and
+// that is not visible in a plan.
+//
+// `systemctl stop`, a unit that overruns TimeoutStartSec, and a host shutdown
+// during a nightly run all deliver SIGTERM. Python's default disposition for it
+// kills the process outright, with no `finally` — so the container that was
+// stopped for the copy is never started again. A database left down because a
+// backup was interrupted is the one outcome the design calls worse than a
+// failed backup, and an operator reaches it by typing an ordinary command.
+
+const { spawn } = require('node:child_process');
+
+const KILLABLE_JOB = {
+    id: 'vols', repo: 'main', retention: { daily: 7 },
+    sources: [{
+        id: 'db', kind: 'container', volumes: ['pgdata'],
+        user: 'root', consistency: 'stop', containers: ['postgres']
+    }]
+};
+
+// Answers `volume inspect` the way both runtimes really do (a JSON array) and
+// logs every call, so the unwind can be asserted rather than assumed.
+const PODMAN_STUB = `#!/bin/sh
+echo "podman $*" >> "$HANGAR_TEST_CMD_LOG"
+if [ "$1" = "volume" ] && [ "$2" = "inspect" ]; then
+  printf '[{"Name":"%s","Mountpoint":"/stub/%s/_data"}]\\n' "$3" "$3"
+fi
+exit 0
+`;
+
+// A backup that never finishes on its own. The signal is what ends this run.
+// `exec` matters: without it the shell stays as an extra layer, hangar-run's
+// kill lands on the shell, and the orphaned sleep keeps the inherited stdout
+// pipe open — which would hang the test runner rather than the helper.
+const RESTIC_STUB_HANGS = `#!/bin/sh
+echo "restic $*" >> "$HANGAR_TEST_CMD_LOG"
+exec sleep 60
+`;
+
+// Async on purpose: these two tests await a signalled child, so a synchronous
+// finally would delete the stub directory out from under the run it set up.
+async function withStubHost(job, stubs, fn) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hangar-sig-'));
+    try {
+        fs.mkdirSync(path.join(dir, 'repos'), { recursive: true });
+        fs.mkdirSync(path.join(dir, 'jobs'), { recursive: true });
+        const bin = path.join(dir, 'bin');
+        fs.mkdirSync(bin, { recursive: true });
+        fs.writeFileSync(path.join(dir, 'repos', 'main.json'), JSON.stringify(LOCAL_REPO));
+        fs.writeFileSync(path.join(dir, 'jobs', job.id + '.json'), JSON.stringify(job));
+        for (const [name, body] of Object.entries(stubs)) {
+            fs.writeFileSync(path.join(bin, name), body);
+            fs.chmodSync(path.join(bin, name), 0o755);
+        }
+        const log = path.join(dir, 'commands.log');
+        fs.writeFileSync(log, '');
+        return await fn({
+            dir,
+            env: Object.assign({}, process.env, {
+                HANGAR_CONF_DIR: dir,
+                HANGAR_STATE_DIR: path.join(dir, 'state'),
+                CREDENTIALS_DIRECTORY: '',
+                HANGAR_TEST_CMD_LOG: log,
+                PATH: bin + ':' + process.env.PATH
+            }),
+            commands: () => fs.readFileSync(log, 'utf8').split('\n').filter((l) => l !== ''),
+            state: () => {
+                const p = path.join(dir, 'state', job.id + '.json');
+                return fs.existsSync(p) ? JSON.parse(fs.readFileSync(p, 'utf8')) : null;
+            }
+        });
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+}
+
+// Starts the helper, waits until the log shows restic is running, then delivers
+// `sig` and resolves with the exit status. Polling the log rather than sleeping
+// a fixed time: the point is to arrive while the backup is in flight.
+function runAndSignal(host, sig) {
+    return new Promise((resolve, reject) => {
+        const child = spawn('python3', [HELPER, 'vols'],
+            { env: host.env, stdio: ['ignore', 'pipe', 'pipe'] });
+        let stderr = '';
+        child.stderr.on('data', (d) => { stderr += d; });
+        child.on('error', reject);
+        child.on('exit', (code, signal) => resolve({ code, signal, stderr }));
+
+        const deadline = Date.now() + 15000;
+        const poll = setInterval(() => {
+            if (host.commands().some((c) => c.startsWith('restic '))) {
+                clearInterval(poll);
+                child.kill(sig);
+            } else if (Date.now() > deadline) {
+                clearInterval(poll);
+                child.kill('SIGKILL');
+                reject(new Error('restic never started'));
+            }
+        }, 50);
+    });
+}
+
+test('a container stopped for the backup is started again when the run is killed', async () => {
+    await withStubHost(KILLABLE_JOB, { podman: PODMAN_STUB, restic: RESTIC_STUB_HANGS },
+        async (host) => {
+            const result = await runAndSignal(host, 'SIGTERM');
+            const commands = host.commands();
+
+            assert.ok(commands.includes('podman stop postgres'),
+                'the test never got as far as stopping the container');
+            assert.ok(commands.includes('podman start postgres'),
+                'SIGTERM left the container stopped: ' + JSON.stringify(commands));
+            // Order matters: starting it again before the backup was abandoned
+            // would mean the copy ran against a running database after all.
+            assert.ok(commands.indexOf('podman start postgres') >
+                commands.findIndex((c) => c.startsWith('restic ')));
+
+            // Reported as what it was, and by exiting rather than by dying.
+            assert.equal(result.signal, null, 'the helper was killed instead of unwinding');
+            assert.equal(result.code, 2);
+            assert.match(result.stderr, /backup was interrupted/);
+            assert.match(result.stderr, /"kind": "CANCELLED"/);
+
+            // The state marker is what the Jobs screen reads once the journal has
+            // rotated, so an interrupted run must leave one.
+            const state = host.state();
+            assert.ok(state, 'no state file was written for the interrupted run');
+            assert.equal(state.kind, 'CANCELLED');
+            assert.equal(state.exit_code, 130);
+        });
+});
+
+test('the same holds for SIGINT, which is what a hand-run helper gets', async () => {
+    await withStubHost(KILLABLE_JOB, { podman: PODMAN_STUB, restic: RESTIC_STUB_HANGS },
+        async (host) => {
+            const result = await runAndSignal(host, 'SIGINT');
+            assert.ok(host.commands().includes('podman start postgres'),
+                'Ctrl-C left the container stopped');
+            assert.equal(result.signal, null);
+            assert.equal(result.code, 2);
+        });
 });

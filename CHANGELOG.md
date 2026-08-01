@@ -5,6 +5,55 @@ All notable changes to the Hangar Cockpit plugin are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added — v2 source kinds
+
+**Container volumes (Podman and Docker).** Back up named volumes from either
+runtime. Portability is real rather than assumed: `podman volume ls --format
+json` emits a JSON array while Docker's `--format` takes Go templates, so hangar
+uses `volume ls -q` plus `volume inspect`, which behave identically on both, and
+reads mount points from the inspect output rather than hardcoding a storage path.
+
+Rootless containers are per-user, and the backup runs as root from a systemd
+unit — root's podman is a different, empty store. A container source therefore
+records its owning user and runs every runtime command via `runuser`.
+
+**Consistency is an explicit choice**, because copying a running database's files
+can produce a backup that will not restore:
+
+| Mode | Assessment |
+|---|---|
+| `none` | Fine for static assets; unsafe for a live database |
+| `pause` | Better; no guarantee buffered writes reached disk |
+| `stop` | The only file-level mode genuinely safe for a database, at the cost of downtime |
+| `command` | A dump run inside the container. Safest, no downtime, user-supplied |
+
+hangar warns when `none` is chosen and a container name looks like a database.
+
+**Libvirt virtual machines.** Disk images plus the domain XML — a disk image
+without its XML is not a restorable VM, so it is included by default. Disk paths
+come from `virsh domblklist --details`, skipping empty CDROMs. Quiesce modes:
+`none` (crash-consistent at best), `agent` (needs qemu-guest-agent in the guest
+and degrades silently without it), `shutdown` (fully consistent, with downtime).
+
+### Fixed
+
+- **A backup interrupted by SIGTERM left containers stopped and guests frozen.**
+  Python kills the process on SIGTERM by default, so the `try/finally` that
+  unwinds pre-steps never ran. `systemctl stop`, a unit overrunning its timeout
+  and a host shutting down mid-run all deliver SIGTERM, so this was the common
+  case rather than an edge case.
+- A job with an exclude file raised a `TypeError` from the timer: the field is
+  normalised to an array, and the runner passed the list straight to argv.
+- `excludes` given as a bare string was iterated character by character.
+- The runner's name allowlists were `$`-anchored, which in Python also matches
+  before a trailing newline — so a name the editor rejected, the runner accepted.
+- Two live-database warnings for one source collapsed into one row, because the
+  list was keyed on the warning code.
+- "Back up now" on a job mixing files with volumes or domains ran only the
+  filesystem half in the browser and reported success.
+
 ## [1.0.0] — 2026-08-01
 
 First stable release. File-level backup with automatic retention thinning, a
