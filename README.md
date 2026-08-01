@@ -61,7 +61,20 @@ Optional, installed on demand for the features that need them:
 | `fuse3` | Browsing snapshots in the Logbook |
 | `rclone` | Off-site destinations rclone reaches and restic does not |
 | `rear` | Bare-metal rescue images |
-| `libvirt` | The recovery drill |
+| `libvirt` | Backing up virtual machines, and the recovery drill |
+
+### A note on virtual machines
+
+Hangar talks to `qemu:///system` as root, so it needs no group membership and is
+unaffected by polkit. If you want to run `virsh` against the system hypervisor
+*yourself*, add your account to the `libvirt` group and log back in:
+
+```sh
+sudo usermod -aG libvirt $USER
+```
+
+Without it, a read-write `virsh -c qemu:///system` command appears to hang — it
+is actually waiting on a polkit prompt that nothing is there to answer.
 
 ### A note for RHEL, CentOS, Rocky and Alma
 
@@ -199,8 +212,13 @@ cleanly when restic is not installed.
   workflow; Hangar generates a `BACKUP=EXTERNAL` configuration, which ReaR's own
   documentation calls a last resort. This is precisely why the recovery drill
   exists. Verify your rescue image.
-- **Libvirt VM and Podman volume sources are not implemented yet.** The source
-  model has the extension point; the implementations are planned.
+- **Backing up a running database's files can produce a backup that will not
+  restore.** Hangar warns when a container that looks like a database is backed
+  up with consistency `none`, but it cannot make a live copy safe. Use `stop`,
+  or `command` with a proper dump (`mongodump`, `pg_dump`), for databases.
+- **VM quiesce mode `agent` degrades silently.** It needs `qemu-guest-agent`
+  running inside the guest; without it the freeze fails and the copy is only
+  crash-consistent.
 - **Single host.** Cockpit's multi-machine fan-out is not used.
 
 ---
