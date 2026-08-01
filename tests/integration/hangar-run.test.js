@@ -437,3 +437,50 @@ test('the same holds for SIGINT, which is what a hand-run helper gets', async ()
             assert.equal(result.code, 2);
         });
 });
+
+test('a forget that emits a JSON document instead of JSON lines does not crash the run', () => {
+    // Found by running hangar for real, not by review. `restic forget --json` emits a
+    // single JSON ARRAY, while backup emits JSON *lines* — and the runner streams
+    // both through one reader. Calling .get() on a list raised AttributeError AFTER
+    // the snapshot had been written, and the handler that kills restic on an early
+    // exit then stranded an exclusive lock, so every later run failed REPO_LOCKED
+    // until a human ran `restic unlock`. A nightly job would have broken permanently
+    // the first time retention ran.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hangar-forget-'));
+    const bin = path.join(dir, 'bin');
+    try {
+        fs.mkdirSync(bin, { recursive: true });
+        // A restic stand-in that answers backup with JSON lines and forget with the
+        // document form, exactly as the real one does.
+        fs.writeFileSync(path.join(bin, 'restic'),
+            '#!/bin/sh\n' +
+            'for a in "$@"; do [ "$a" = "forget" ] && { printf \'[{"tags":null,"keep":[],"remove":[]}]\\n\'; exit 0; }; done\n' +
+            'printf \'{"message_type":"summary","snapshot_id":"deadbeef","files_new":1}\\n\'\n' +
+            'exit 0\n', { mode: 0o755 });
+
+        fs.mkdirSync(path.join(dir, 'repos'), { recursive: true });
+        fs.mkdirSync(path.join(dir, 'jobs'), { recursive: true });
+        fs.writeFileSync(path.join(dir, 'repos', 'main.json'), JSON.stringify(LOCAL_REPO));
+        fs.writeFileSync(path.join(dir, 'jobs', 'nightly.json'), JSON.stringify(SIMPLE_JOB));
+
+        const r = require('node:child_process').spawnSync('python3', [HELPER, 'nightly'], {
+            env: Object.assign({}, process.env, {
+                HANGAR_CONF_DIR: dir,
+                HANGAR_STATE_DIR: path.join(dir, 'state'),
+                PATH: bin + ':' + process.env.PATH
+            }),
+            encoding: 'utf8'
+        });
+
+        assert.equal(r.status, 0, `run failed: ${r.stderr}`);
+        assert.ok(!/Traceback/.test(r.stderr), `the run raised:\n${r.stderr}`);
+        assert.ok(!/AttributeError/.test(r.stderr), 'the list-vs-dict crash is back');
+
+        // The run must be recorded as a clean success, not merely "did not crash".
+        const state = JSON.parse(fs.readFileSync(path.join(dir, 'state', 'nightly.json'), 'utf8'));
+        assert.equal(state.status, 'ok');
+        assert.equal(state.exit_code, 0);
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});

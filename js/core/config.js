@@ -37,10 +37,11 @@
         mountRoot: '/run/hangar/mnt',
         mountIdleTimeoutSec: 900,
         notifyOnFailure: true,
-        // Self-update. Empty by default: hangar will not contact GitHub at all until
-        // an administrator names a repository, so a fresh install makes no outbound
-        // requests of its own.
-        updateRepo: '',
+        // Self-update. This is hangar's own upstream, so a fresh install can offer
+        // updates without being configured first. Note the consequence: the plugin
+        // contacts api.github.com once on page load. Clearing this field disables
+        // update checking entirely and stops all outbound requests.
+        updateRepo: 'ismetozalp/hangar',
         updateCheckOnStartup: true
     };
 

@@ -962,6 +962,16 @@ def stream_restic(argv, env, label):
                 msg = json.loads(line)
             except json.JSONDecodeError:
                 continue  # non-JSON noise on stdout is not fatal
+            # Not every restic command streams JSON *lines*. `forget --json` emits a
+            # single JSON ARRAY document, and `.get()` on a list raises — which used
+            # to end the run with a traceback AFTER the snapshot had been written,
+            # and worse, killed restic mid-forget and left an exclusive lock behind,
+            # so every subsequent run failed with REPO_LOCKED until someone
+            # intervened. There is nothing to stream from a document form: the
+            # caller only needs the exit code, and the UI parses the same output
+            # with HangarRestic.parseForget when it wants the detail.
+            if not isinstance(msg, dict):
+                continue
             mtype = msg.get("message_type")
             if mtype == "summary":
                 summary = msg
