@@ -73,9 +73,12 @@ function assertEqual(a, b, msg) {
 const DEFAULT_STUB = {
     spawn: {
         'restic version': 'restic 0.19.1 compiled with go1.26.4 on linux/amd64',
-        'rclone version': 'rclone v1.74.3',
+        'rclone --version': 'rclone v1.74.3',
         'fusermount3 --version': 'fusermount3 version: 3.16.2',
-        'rear -V': 'Relax-and-Recover 2.9',
+        'rear --version': 'Relax-and-Recover 2.9',
+        'virt-install --version': '4.1.0',
+        'unzip -v': 'UnZip 6.00 of 20 April 2009',
+        'curl --version': 'curl 8.9.1 (x86_64-redhat-linux-gnu)',
         'ls -1 /etc/hangar/repos': '',
         'ls -1 /etc/hangar/jobs': ''
     },

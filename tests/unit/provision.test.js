@@ -278,9 +278,11 @@ test('detectFamily accepts an already-parsed os-release object', () => {
 
 // ---------------------------------------------------------------- REQUIREMENTS
 
-test('REQUIREMENTS covers exactly the four tools, in install order', () => {
-    assert.deepEqual(P.TOOLS, ['restic', 'rclone', 'fuse3', 'rear']);
-    assert.deepEqual(Object.keys(P.REQUIREMENTS).sort(), ['fuse3', 'rclone', 'rear', 'restic']);
+test('REQUIREMENTS covers exactly the managed tools, in install order', () => {
+    assert.deepEqual(P.TOOLS,
+        ['restic', 'rclone', 'fuse3', 'rear', 'libvirt', 'unzip', 'curl']);
+    assert.deepEqual(Object.keys(P.REQUIREMENTS).sort(),
+        ['curl', 'fuse3', 'libvirt', 'rclone', 'rear', 'restic', 'unzip']);
 });
 
 test('REQUIREMENTS names a package for every family, and restic alone is mandatory', () => {
@@ -332,7 +334,10 @@ test('planFor marks restic on RHEL as packagekit with a binary fallback', () => 
         packages: ['restic'],
         fallback: 'binary',
         optional: false,
-        reason: P.REQUIREMENTS.restic.reason
+        reason: P.REQUIREMENTS.restic.reason,
+        // Enabling EPEL keeps restic a managed, signed, updatable package, so it is
+        // offered ahead of the loose binary rather than instead of it.
+        enableRepo: P.EPEL_PACKAGE
     });
 });
 
@@ -930,7 +935,7 @@ test('the recommended fallback versions satisfy the declared minimums', () => {
 test('planFor never throws and always yields a known method, for every family', () => {
     P.FAMILIES.concat(['unknown', '']).forEach((fam) => {
         const plan = P.planFor(P.TOOLS, fam);
-        assert.equal(plan.length, 4, fam);
+        assert.equal(plan.length, P.TOOLS.length, fam);
         plan.forEach((step) => {
             assert.ok([P.METHOD.PACKAGEKIT, P.METHOD.BINARY, P.METHOD.UNAVAILABLE].indexOf(step.method) >= 0,
                 fam + '/' + step.tool);

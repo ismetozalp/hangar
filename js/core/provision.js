@@ -45,7 +45,10 @@
     const METHOD = { PACKAGEKIT: 'packagekit', BINARY: 'binary', UNAVAILABLE: 'unavailable' };
 
     // Install order: restic first, because everything else is optional polish.
-    const TOOLS = ['restic', 'rclone', 'fuse3', 'rear'];
+    // curl and unzip look like odd entries for a backup tool, but self-update depends
+    // on both and minimal server images often ship neither — leaving the user to
+    // discover it only when an update fails halfway.
+    const TOOLS = ['restic', 'rclone', 'fuse3', 'rear', 'libvirt', 'unzip', 'curl'];
 
     const REQUIREMENTS = {
         restic: {
@@ -109,6 +112,51 @@
                 rhel: ['rear'], fedora: ['rear'], debian: ['rear'],
                 suse: ['rear'], arch: []
             }
+        },
+        libvirt: {
+            tool: 'libvirt',
+            // virt-install is what the drill actually shells out to, so probe for it
+            // rather than for libvirtd: a host can run libvirtd and still not be able
+            // to create the throwaway VM.
+            binary: 'virt-install',
+            versionArgs: ['--version'],
+            minVersion: null,
+            optional: true,
+            reason: 'Needed only to verify a rescue image by booting it in a throwaway VM.',
+            packages: {
+                rhel: ['virt-install'], fedora: ['virt-install'],
+                // Debian and Ubuntu ship virt-install in virtinst, not virt-install.
+                debian: ['virtinst'],
+                suse: ['virt-install'], arch: ['virt-install']
+            }
+        },
+        unzip: {
+            tool: 'unzip',
+            binary: 'unzip',
+            versionArgs: ['-v'],
+            minVersion: null,
+            optional: true,
+            // Frequently absent on minimal server images, and self-update fails at
+            // the unpack step with a bare "command not found" without it.
+            reason: 'Needed only to unpack a downloaded update.',
+            packages: {
+                rhel: ['unzip'], fedora: ['unzip'], debian: ['unzip'],
+                suse: ['unzip'], arch: ['unzip']
+            }
+        },
+        curl: {
+            tool: 'curl',
+            binary: 'curl',
+            versionArgs: ['--version'],
+            minVersion: null,
+            optional: true,
+            // The plugin's CSP forbids talking to GitHub from the browser, so the
+            // update check runs through curl on the host. No curl, no update check.
+            reason: 'Needed only to check for and download updates.',
+            packages: {
+                rhel: ['curl'], fedora: ['curl'], debian: ['curl'],
+                suse: ['curl'], arch: ['curl']
+            }
         }
     };
 
@@ -116,6 +164,10 @@
     // will have PackageKit resolve nothing — that is expected, not a bug, so the
     // plan carries the way out with it.
     const EPEL_ONLY = { rhel: ['restic'] };
+
+    // The package that enables EPEL. Installing this is itself a PackageKit
+    // operation, so the turnkey path never has to leave the D-Bus API.
+    const EPEL_PACKAGE = 'epel-release';
 
     // Official GitHub release assets. URLs only: a checksum value is never invented
     // here, it is downloaded from sha256Url and shown to the user for consent.
@@ -315,8 +367,14 @@
         }
 
         const epel = own(EPEL_ONLY, str(family));
-        if (Array.isArray(epel) && epel.indexOf(req.tool) >= 0 && own(BINARY_RELEASE, req.tool))
-            step.fallback = METHOD.BINARY;
+        if (Array.isArray(epel) && epel.indexOf(req.tool) >= 0) {
+            // Enabling EPEL is strictly better than downloading a loose binary: the
+            // package stays managed, signed and updatable by the system. So it is
+            // offered FIRST, and the binary remains only as the last resort for a
+            // host that cannot reach or use EPEL.
+            step.enableRepo = EPEL_PACKAGE;
+            if (own(BINARY_RELEASE, req.tool)) step.fallback = METHOD.BINARY;
+        }
 
         return step;
     }
@@ -600,7 +658,7 @@
     }
 
     const HangarProvision = {
-        FAMILIES, TOOLS, METHOD, REQUIREMENTS, EPEL_ONLY, BINARY_RELEASE, RECOMMENDED_VERSION, PK,
+        FAMILIES, TOOLS, METHOD, REQUIREMENTS, EPEL_ONLY, EPEL_PACKAGE, BINARY_RELEASE, RECOMMENDED_VERSION, PK,
         parseVersion, formatVersion, compareVersions, meetsMinimum,
         parseOsRelease, detectFamily,
         requirementFor, packagesFor, planFor, describeStep,

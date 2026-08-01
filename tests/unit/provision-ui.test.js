@@ -173,7 +173,7 @@ test('stepRows marks the optional tools optional', () => {
 
 test('every row on a full plan carries a reason and an action sentence', () => {
     const rows = UI.stepRows(P.planFor(P.TOOLS, 'fedora'));
-    assert.equal(rows.length, 4);
+    assert.equal(rows.length, P.TOOLS.length);
     for (const r of rows) {
         assert.notEqual(r.reason, '', r.tool + ' has no reason');
         assert.notEqual(r.action, '', r.tool + ' has no action sentence');
