@@ -61,11 +61,22 @@
         };
     }
 
-    function dbus() {
+    // cfg.dbus maps "<service>:<method>" to a reply array, or {error: "..."} to
+    // reject. Used to simulate PackageKit being absent (a ServiceUnknown name error)
+    // versus installed and answering.
+    function dbus(service) {
         return {
             call: function (p, i, m, a) {
-                cfg.calls.push({ kind: 'dbus', path: p, iface: i, method: m, args: a });
-                return Promise.reject(new Error('no dbus stub'));
+                cfg.calls.push({ kind: 'dbus', service: service, path: p, iface: i, method: m, args: a });
+                const scripted = cfg.dbus && (cfg.dbus[service + ':' + m] || cfg.dbus[m]);
+                if (scripted === undefined)
+                    return Promise.reject(new Error('no dbus stub for ' + service + ':' + m));
+                if (scripted && scripted.error) {
+                    const e = new Error(scripted.error);
+                    e.problem = scripted.problem;
+                    return Promise.reject(e);
+                }
+                return Promise.resolve(scripted);
             },
             wait: function () { return Promise.resolve(); },
             close: function () {},

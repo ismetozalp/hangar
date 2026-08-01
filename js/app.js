@@ -34,6 +34,37 @@
             settings: null,
             error: null,
 
+            // --- theming ------------------------------------------------------
+            // Applied before anything else renders, so the page never flashes the
+            // default palette and then repaint into the chosen one.
+            applyTheme(id) {
+                const T = root.HangarThemes;
+                if (!T || !root.document || !root.document.documentElement) return;
+                const chosen = id !== undefined ? id
+                    : ((this.settings && this.settings.theme) || T.DEFAULT_THEME);
+                const prefersDark = !!(root.matchMedia &&
+                    root.matchMedia('(prefers-color-scheme: dark)').matches);
+                root.document.documentElement.setAttribute(
+                    'data-bs-theme', T.resolve(chosen, prefersDark).attr);
+            },
+
+            // 'system' has to keep tracking the OS after load, or a user who
+            // switches their desktop to dark at dusk is left on the light palette
+            // until they reload.
+            _watchSystemTheme() {
+                if (this._themeWatched || !root.matchMedia) return;
+                this._themeWatched = true;
+                const mq = root.matchMedia('(prefers-color-scheme: dark)');
+                const onChange = () => {
+                    const id = (this.settings && this.settings.theme) || 'system';
+                    if (id === 'system') this.applyTheme();
+                };
+                // addEventListener is not available on MediaQueryList everywhere;
+                // addListener is the deprecated-but-universal fallback.
+                if (typeof mq.addEventListener === 'function') mq.addEventListener('change', onChange);
+                else if (typeof mq.addListener === 'function') mq.addListener(onChange);
+            },
+
             async init() {
                 try {
                     this.settings = await root.HangarConfig.readGlobal();
@@ -42,6 +73,16 @@
                     // sufficient to render the UI and let the user fix things.
                     this.settings = root.HangarConfig.mergeGlobal({});
                 }
+
+                this.applyTheme();
+                this._watchSystemTheme();
+                // A theme picked on the Settings screen must repaint the whole page,
+                // not just that tab, so the change comes back here as an event.
+                root.addEventListener('hangar:theme', (ev) => {
+                    const id = ev && ev.detail;
+                    if (this.settings) this.settings.theme = id;
+                    this.applyTheme(id);
+                });
 
                 try {
                     const P = root.HangarProvision;

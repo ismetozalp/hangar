@@ -8,10 +8,15 @@
 :root {
     --hangar-gutter: 1rem;
     --hangar-scrubber-w: 13rem;
-    --hangar-ok: #2e7d32;
-    --hangar-warn: #ed6c02;
-    --hangar-err: #c62828;
-    --hangar-idle: #6c757d;
+
+    /* Derived from Bootstrap's semantic colours rather than hardcoded, so every
+     * palette in themes.css restyles the status dots, badges and scrubber for free.
+     * A new theme states its Bootstrap variables and nothing here has to change.
+     * The literals are fallbacks for the case where Bootstrap has not loaded. */
+    --hangar-ok: var(--bs-success, #2e7d32);
+    --hangar-warn: var(--bs-warning, #ed6c02);
+    --hangar-err: var(--bs-danger, #c62828);
+    --hangar-idle: var(--bs-secondary-color, #6c757d);
 }
 
 body {
@@ -138,9 +143,47 @@ body {
     margin-left: 0.35rem;
 }
 
-.hangar-badge.added    { background: rgba(46, 125, 50, 0.18);  color: var(--hangar-ok); }
-.hangar-badge.modified { background: rgba(237, 108, 2, 0.18);  color: var(--hangar-warn); }
-.hangar-badge.removed  { background: rgba(198, 40, 40, 0.18);  color: var(--hangar-err); }
+/* Bootstrap 5.3's *-bg-subtle variables are themed, so these tint with the
+ * palette instead of staying a fixed rgba() that only suits the light theme. */
+.hangar-badge.added    { background: var(--bs-success-bg-subtle, rgba(46, 125, 50, 0.18)); color: var(--hangar-ok); }
+.hangar-badge.modified { background: var(--bs-warning-bg-subtle, rgba(237, 108, 2, 0.18)); color: var(--hangar-warn); }
+.hangar-badge.removed  { background: var(--bs-danger-bg-subtle, rgba(198, 40, 40, 0.18));  color: var(--hangar-err); }
+
+/* --- theme picker ------------------------------------------------------ */
+
+.hangar-swatch {
+    display: inline-block;
+    width: 1.6rem;
+    height: 1.6rem;
+    border-radius: 0.3rem;
+    border: 1px solid var(--bs-border-color, rgba(0, 0, 0, 0.2));
+    vertical-align: middle;
+}
+
+.hangar-theme-option {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    border: 1px solid transparent;
+    border-radius: 0.35rem;
+    padding: 0.35rem 0.6rem;
+    background: transparent;
+    cursor: pointer;
+    color: inherit;
+}
+
+.hangar-theme-option:hover { background: var(--bs-secondary-bg, rgba(0, 0, 0, 0.06)); }
+
+.hangar-theme-option[aria-pressed="true"] {
+    border-color: var(--bs-primary, #0d6efd);
+    background: var(--bs-primary-bg-subtle, rgba(13, 110, 253, 0.1));
+}
+
+/* Keyboard focus must stay obvious on every palette, including the dark ones. */
+.hangar-theme-option:focus-visible {
+    outline: 2px solid var(--bs-primary, #0d6efd);
+    outline-offset: 2px;
+}
 
 /* --- misc -------------------------------------------------------------- */
 

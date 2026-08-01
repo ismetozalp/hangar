@@ -20,6 +20,7 @@
     const Config = root.HangarConfig || (req ? req('../core/config.js') : null);
     const Prov = root.HangarProvision || (req ? req('../core/provision.js') : null);
     const Secrets = root.HangarSecrets || (req ? req('../core/secrets.js') : null);
+    const Themes = root.HangarThemes || (req ? req('../core/themes.js') : null);
 
     // ------------------------------------------------------------------ pure
 
@@ -526,11 +527,51 @@
             diagLoading: false,
             copyState: '',          // '' | 'copied' | 'failed'
 
+            // Appearance is deliberately NOT part of `form`. A theme is picked with
+            // one deliberate click and its effect is immediately visible, so making
+            // the user press Save afterwards would be busywork — and leaving the page
+            // in a colour they have not saved is worse than writing it at once.
+            theme: (Themes ? Themes.DEFAULT_THEME : 'system'),
+            themeError: '',
+
             // Pure helpers the template calls directly.
             remediationLabel: remediationLabel,
             errorText: errorText,
             describeTimeout: describeTimeout,
             statusClass: statusClass,
+            themes: (Themes ? Themes.selectable() : []),
+            swatchClass: (Themes ? Themes.swatchClass : function () { return 'hangar-swatch'; }),
+
+            isTheme(id) { return this.theme === id; },
+
+            async pickTheme(id) {
+                if (!Themes || !Themes.isValid(id) || id === this.theme) return false;
+                const previous = this.theme;
+                this.theme = id;
+                this.themeError = '';
+
+                // Repaint first: the click should feel instant, and the write is not
+                // what the user is waiting to see.
+                if (root.dispatchEvent && typeof root.CustomEvent === 'function') {
+                    root.dispatchEvent(new root.CustomEvent('hangar:theme', { detail: id }));
+                }
+
+                try {
+                    const current = this.saved || (await D.config.readGlobal());
+                    const next = Object.assign({}, current, { theme: id });
+                    await D.config.writeGlobal(next);
+                    this.saved = next;
+                    return true;
+                } catch (e) {
+                    // The palette is already applied, so say plainly that only the
+                    // saving failed rather than reverting the colour under the user.
+                    this.themeError = 'The theme was applied, but could not be saved: ' +
+                        errorText(e);
+                    this.theme = id;
+                    void previous;
+                    return false;
+                }
+            },
 
             async init() {
                 await this.load();
@@ -544,6 +585,12 @@
                 try {
                     const settings = await D.config.readGlobal();
                     this.saved = settings;
+                    // Appearance lives outside `form`, so it is read straight from
+                    // the loaded settings rather than through formFromSettings.
+                    if (Themes) {
+                        const t = settings && settings.theme;
+                        this.theme = Themes.isValid(t) ? t : Themes.DEFAULT_THEME;
+                    }
                     this.form = formFromSettings(settings);
                 } catch (e) {
                     // Unreadable settings are not a dead screen: defaults still let
@@ -719,6 +766,32 @@
         '    <span class="flex-grow-1"></span>',
         '    <span x-show="loading" class="text-secondary small">Loading…</span>',
         '  </div>',
+
+        // --- appearance ---------------------------------------------------
+        // Applied on click and written straight away; there is no Save for this,
+        // because the effect is the confirmation.
+        '  <section class="mb-4" aria-labelledby="hangar-appearance-title">',
+        '    <h3 class="h6" id="hangar-appearance-title">Appearance</h3>',
+        '    <div class="d-flex flex-wrap gap-1" role="group"',
+        '         aria-labelledby="hangar-appearance-title">',
+        '      <template x-for="t in themes" :key="t.id">',
+        '        <button type="button" class="hangar-theme-option"',
+        '                @click="pickTheme(t.id)"',
+        '                :aria-pressed="isTheme(t.id) ? \'true\' : \'false\'"',
+        '                :aria-label="\'Use the \' + t.label + \' theme\'">',
+        '          <span :class="swatchClass(t.id)" aria-hidden="true"></span>',
+        '          <span class="small" x-text="t.label"></span>',
+        '        </button>',
+        '      </template>',
+        '    </div>',
+        '    <div class="form-text">',
+        '      System follows this computer&#39;s light or dark preference and changes with it.',
+        '    </div>',
+        '    <div x-show="themeError">',
+        '      <div class="alert alert-warning py-2 px-3 small mt-2 mb-0" role="alert"',
+        '           x-text="themeError"></div>',
+        '    </div>',
+        '  </section>',
 
         // x-show sets an inline `display: none`, but Bootstrap's `.d-flex` is
         // `display: flex !important` and wins — so the two must never share an

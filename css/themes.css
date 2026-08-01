@@ -1,12 +1,17 @@
-/* themes.css — custom Bootstrap 5.3 `data-bs-theme` palettes for Manifest.
-   `system` / `light` / `dark` use Bootstrap's built-in modes and need no
-   block here. Each custom theme below overrides the key Bootstrap CSS
-   variables plus the Manifest --mf-* accents (banner, status dot,
-   selection). All are `base:'dark'` (they extend Bootstrap's dark mode) —
-   see js/core/themes.js THEMES registry. Contrast checked for WCAG AA body
-   text against its background. */
+/* themes.css — custom Bootstrap 5.3 `data-bs-theme` palettes for Hangar.
 
-/* ── Aqua — teal/cyan on deep slate ── */
+   `system` / `light` / `dark` use Bootstrap's built-in modes and need no block
+   here. Each custom theme below overrides the key Bootstrap CSS variables; see
+   js/core/themes.js for the registry.
+
+   Deliberately NO hangar-specific accent variables live in this file. css/hangar.css
+   derives --hangar-ok / --hangar-warn / --hangar-err / --hangar-idle from
+   --bs-success / --bs-warning / --bs-danger / --bs-secondary-color, so a new theme
+   only has to state its Bootstrap palette and the status dots, badges and scrubber
+   follow automatically. Adding a theme here needs no change anywhere else.
+
+   Contrast checked for WCAG AA body text against its background. */
+
 [data-bs-theme="aqua"] {
     --bs-body-bg: #071a1f;
     --bs-body-color: #d8f3f0;
@@ -26,12 +31,6 @@
     --bs-link-color: #5eead4;
     --bs-link-hover-color: #99f6e4;
 
-    --mf-banner-up-bg: #0f3d38;
-    --mf-banner-down-bg: #4a2e12;
-    --mf-dot-up: #2dd4bf;
-    --mf-dot-down: #94a3b8;
-    --mf-progress-fg: #2dd4bf;
-    --mf-row-selected-bg: #12414a;
 }
 
 /* ── Nord — arctic blue-grey ── */
@@ -54,12 +53,6 @@
     --bs-link-color: #88c0d0;
     --bs-link-hover-color: #8fbcbb;
 
-    --mf-banner-up-bg: #3b4a3f;
-    --mf-banner-down-bg: #4f4130;
-    --mf-dot-up: #a3be8c;
-    --mf-dot-down: #4c566a;
-    --mf-progress-fg: #88c0d0;
-    --mf-row-selected-bg: #3b4252;
 }
 
 /* ── Solarized (dark) — warm amber accents ── */
@@ -82,12 +75,6 @@
     --bs-link-color: #cb9500;
     --bs-link-hover-color: #e0a800;
 
-    --mf-banner-up-bg: #35400e;
-    --mf-banner-down-bg: #4a2a14;
-    --mf-dot-up: #859900;
-    --mf-dot-down: #586e75;
-    --mf-progress-fg: #b58900;
-    --mf-row-selected-bg: #0a4351;
 }
 
 /* ── Dracula — purple/pink on near-black ── */
@@ -110,12 +97,6 @@
     --bs-link-color: #ff79c6;
     --bs-link-hover-color: #ffb3de;
 
-    --mf-banner-up-bg: #1f4a2e;
-    --mf-banner-down-bg: #4a3a1a;
-    --mf-dot-up: #50fa7b;
-    --mf-dot-down: #6272a4;
-    --mf-progress-fg: #bd93f9;
-    --mf-row-selected-bg: #3b3e4f;
 }
 
 /* ── Gruvbox — warm retro on brown ── */
@@ -137,12 +118,6 @@
     --bs-danger: #cc241d;
     --bs-link-color: #83a598;
     --bs-link-hover-color: #8ec07c;
-    --mf-banner-up-bg: #3c441e;
-    --mf-banner-down-bg: #4a3423;
-    --mf-dot-up: #98971a;
-    --mf-dot-down: #928374;
-    --mf-progress-fg: #fe8019;
-    --mf-row-selected-bg: #45403a;
 }
 
 /* ── Catppuccin (Mocha) — pastel on deep indigo ── */
@@ -164,12 +139,6 @@
     --bs-danger: #f38ba8;
     --bs-link-color: #89b4fa;
     --bs-link-hover-color: #b4befe;
-    --mf-banner-up-bg: #2a3a2e;
-    --mf-banner-down-bg: #3a2e2a;
-    --mf-dot-up: #a6e3a1;
-    --mf-dot-down: #6c7086;
-    --mf-progress-fg: #cba6f7;
-    --mf-row-selected-bg: #45475a;
 }
 /* ── Tokyo Night — blue/purple night ── */
 [data-bs-theme="tokyonight"] {
@@ -190,12 +159,6 @@
     --bs-danger: #f7768e;
     --bs-link-color: #7dcfff;
     --bs-link-hover-color: #b4f9f8;
-    --mf-banner-up-bg: #29352b;
-    --mf-banner-down-bg: #3a2f26;
-    --mf-dot-up: #9ece6a;
-    --mf-dot-down: #565f89;
-    --mf-progress-fg: #7aa2f7;
-    --mf-row-selected-bg: #2f334d;
 }
 
 /* ── Rosé Pine — muted rose & iris ── */
@@ -217,12 +180,6 @@
     --bs-danger: #eb6f92;
     --bs-link-color: #c4a7e7;
     --bs-link-hover-color: #d7c4f0;
-    --mf-banner-up-bg: #2a333a;
-    --mf-banner-down-bg: #3a2e2a;
-    --mf-dot-up: #9ccfd8;
-    --mf-dot-down: #6e6a86;
-    --mf-progress-fg: #ebbcba;
-    --mf-row-selected-bg: #26233a;
 }
 
 /* ── Sunset — warm orange/rose on plum ── */
@@ -244,12 +201,6 @@
     --bs-danger: #ef4444;
     --bs-link-color: #fb7185;
     --bs-link-hover-color: #fda4af;
-    --mf-banner-up-bg: #3a3a1e;
-    --mf-banner-down-bg: #4a2e1e;
-    --mf-dot-up: #fbbf24;
-    --mf-dot-down: #9a7a8a;
-    --mf-progress-fg: #f97316;
-    --mf-row-selected-bg: #4a3344;
 }
 
 /* ── Sepia — warm paper (light) ── */
@@ -271,12 +222,6 @@
     --bs-danger: #a52a2a;
     --bs-link-color: #8b4513;
     --bs-link-hover-color: #a0522d;
-    --mf-banner-up-bg: #dce8c0;
-    --mf-banner-down-bg: #f0dcc0;
-    --mf-dot-up: #6b8e23;
-    --mf-dot-down: #a89878;
-    --mf-progress-fg: #a0522d;
-    --mf-row-selected-bg: #e3d5b8;
 }
 
 /* ── Theme-accent buttons ──
@@ -344,29 +289,23 @@
     filter: invert(1) grayscale(100%) brightness(200%);
 }
 
-/* Wire the manifest.css component classes to the --mf-* accent variables
-   (System/Light/Dark leave these unset and fall back to manifest.css's
-   Bootstrap-var defaults). */
-.mf-banner-up { background: var(--mf-banner-up-bg, var(--bs-success-bg-subtle, #d1e7dd)); }
-.mf-banner-down { background: var(--mf-banner-down-bg, var(--bs-warning-bg-subtle, #fff3cd)); }
-.mf-dot.up { background: var(--mf-dot-up, var(--bs-success, #198754)); }
-.mf-dot.down { background: var(--mf-dot-down, var(--bs-secondary, #6c757d)); }
-.mf-row-selected { background: var(--mf-row-selected-bg, var(--bs-primary-bg-subtle, #cfe2ff)); }
-.progress-bar, .mf-progress-fg { background-color: var(--mf-progress-fg, var(--bs-primary)); }
+/* hangar derives its accents from the Bootstrap semantic colours each theme sets
+   above (see css/hangar.css), so there is nothing to wire per component here.
+   The swatches below are the only theme-specific presentation this file needs. */
 
-/* Theme picker swatches (Settings → Appearance): a two-tone preview of each
-   theme — base background on one half, accent/primary on the other. The span's
-   size/border/radius come from its inline style; only the fill lives here. */
-.mf-theme-swatch-system    { background: linear-gradient(135deg, #f8f9fa 50%, #212529 50%); }
-.mf-theme-swatch-light     { background: linear-gradient(135deg, #f8f9fa 50%, #0d6efd 50%); }
-.mf-theme-swatch-dark      { background: linear-gradient(135deg, #212529 50%, #6ea8fe 50%); }
-.mf-theme-swatch-aqua      { background: linear-gradient(135deg, #071a1f 50%, #2dd4bf 50%); }
-.mf-theme-swatch-nord      { background: linear-gradient(135deg, #2e3440 50%, #88c0d0 50%); }
-.mf-theme-swatch-solarized { background: linear-gradient(135deg, #002b36 50%, #b58900 50%); }
-.mf-theme-swatch-dracula   { background: linear-gradient(135deg, #282a36 50%, #bd93f9 50%); }
-.mf-theme-swatch-gruvbox    { background: linear-gradient(135deg, #282828 50%, #d65d0e 50%); }
-.mf-theme-swatch-catppuccin { background: linear-gradient(135deg, #1e1e2e 50%, #cba6f7 50%); }
-.mf-theme-swatch-tokyonight { background: linear-gradient(135deg, #1a1b26 50%, #7aa2f7 50%); }
-.mf-theme-swatch-rosepine   { background: linear-gradient(135deg, #191724 50%, #eb6f92 50%); }
-.mf-theme-swatch-sunset     { background: linear-gradient(135deg, #2b1e2e 50%, #f97316 50%); }
-.mf-theme-swatch-sepia      { background: linear-gradient(135deg, #f4ecd8 50%, #a0522d 50%); }
+/* Theme picker swatches (Settings -> Appearance): a two-tone preview of each
+   theme - base background on one half, accent/primary on the other. The span's
+   size/border/radius come from hangar.css; only the fill lives here. */
+.hangar-swatch-system    { background: linear-gradient(135deg, #f8f9fa 50%, #212529 50%); }
+.hangar-swatch-light     { background: linear-gradient(135deg, #f8f9fa 50%, #0d6efd 50%); }
+.hangar-swatch-dark      { background: linear-gradient(135deg, #212529 50%, #6ea8fe 50%); }
+.hangar-swatch-aqua      { background: linear-gradient(135deg, #071a1f 50%, #2dd4bf 50%); }
+.hangar-swatch-nord      { background: linear-gradient(135deg, #2e3440 50%, #88c0d0 50%); }
+.hangar-swatch-solarized { background: linear-gradient(135deg, #002b36 50%, #b58900 50%); }
+.hangar-swatch-dracula   { background: linear-gradient(135deg, #282a36 50%, #bd93f9 50%); }
+.hangar-swatch-gruvbox    { background: linear-gradient(135deg, #282828 50%, #d65d0e 50%); }
+.hangar-swatch-catppuccin { background: linear-gradient(135deg, #1e1e2e 50%, #cba6f7 50%); }
+.hangar-swatch-tokyonight { background: linear-gradient(135deg, #1a1b26 50%, #7aa2f7 50%); }
+.hangar-swatch-rosepine   { background: linear-gradient(135deg, #191724 50%, #eb6f92 50%); }
+.hangar-swatch-sunset     { background: linear-gradient(135deg, #2b1e2e 50%, #f97316 50%); }
+.hangar-swatch-sepia      { background: linear-gradient(135deg, #f4ecd8 50%, #a0522d 50%); }

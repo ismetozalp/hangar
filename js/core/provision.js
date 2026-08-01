@@ -169,6 +169,91 @@
     // operation, so the turnkey path never has to leave the D-Bus API.
     const EPEL_PACKAGE = 'epel-release';
 
+    // ---------------------------------------------------------- manual fallback
+    //
+    // PackageKit is the one prerequisite hangar cannot install for the user: it IS
+    // the mechanism. When it is absent the turnkey path is genuinely unavailable,
+    // and the only honest response is to say so and give the exact command for THIS
+    // distribution — never a generic "install PackageKit" that leaves the user
+    // guessing which tool their system uses.
+    //
+    // Package name casing is not cosmetic: it is `PackageKit` on RPM distributions
+    // and `packagekit` on Debian and Arch.
+    const PACKAGE_MANAGER = {
+        rhel:   { tool: 'dnf',    install: 'dnf install -y',            packagekit: 'PackageKit' },
+        fedora: { tool: 'dnf',    install: 'dnf install -y',            packagekit: 'PackageKit' },
+        debian: { tool: 'apt',    install: 'apt install -y',            packagekit: 'packagekit' },
+        suse:   { tool: 'zypper', install: 'zypper install -y',         packagekit: 'PackageKit' },
+        arch:   { tool: 'pacman', install: 'pacman -S --needed',        packagekit: 'packagekit' }
+    };
+
+    function packageManagerFor(family) {
+        return own(PACKAGE_MANAGER, str(family)) || null;
+    }
+
+    // A shell command the user can copy verbatim. Returns '' for an unknown family
+    // rather than guessing a package manager — a wrong command is worse than none.
+    function manualCommand(family, packages) {
+        const pm = packageManagerFor(family);
+        if (!pm) return '';
+        const list = (Array.isArray(packages) ? packages : [packages])
+            .map(str)
+            .filter(function (p) { return p !== ''; });
+        if (!list.length) return '';
+        return 'sudo ' + pm.install + ' ' + list.join(' ');
+    }
+
+    function packageKitPackageFor(family) {
+        const pm = packageManagerFor(family);
+        return pm ? pm.packagekit : '';
+    }
+
+    // The command that restores the turnkey path itself.
+    function packageKitCommand(family) {
+        return manualCommand(family, [packageKitPackageFor(family)]);
+    }
+
+    // Everything the UI needs to explain a missing PackageKit on this host:
+    // what to install to get turnkey back, and — for a user who would rather not
+    // install PackageKit at all — the one command that installs the tools directly.
+    function manualInstructions(family, missing) {
+        const fam = FAMILIES.indexOf(str(family)) >= 0 ? str(family) : 'unknown';
+        const pm = packageManagerFor(fam);
+        const tools = (Array.isArray(missing) ? missing : [missing])
+            .map(function (m) { return (m && typeof m === 'object') ? str(m.tool) : str(m); })
+            .filter(function (t) { return own(REQUIREMENTS, t); });
+
+        const packages = [];
+        tools.forEach(function (t) {
+            (packagesFor(t, fam) || []).forEach(function (p) {
+                if (packages.indexOf(p) < 0) packages.push(p);
+            });
+        });
+
+        // On RHEL the direct route needs EPEL first, or `dnf install restic` simply
+        // reports that nothing matches — which reads like a broken instruction.
+        const epel = own(EPEL_ONLY, fam);
+        const needsEpel = Array.isArray(epel) && tools.some(function (t) { return epel.indexOf(t) >= 0; });
+
+        const direct = [];
+        if (needsEpel) direct.push(manualCommand(fam, [EPEL_PACKAGE]));
+        const pkgCmd = manualCommand(fam, packages);
+        if (pkgCmd) direct.push(pkgCmd);
+
+        return {
+            family: fam,
+            known: !!pm,
+            packageManager: pm ? pm.tool : '',
+            packageKitPackage: packageKitPackageFor(fam),
+            // Preferred: restore turnkey, then let hangar do the rest.
+            packageKitCommand: packageKitCommand(fam),
+            // Alternative: skip PackageKit entirely and install the tools by hand.
+            directCommands: direct.filter(Boolean),
+            packages: packages,
+            needsEpel: needsEpel
+        };
+    }
+
     // Official GitHub release assets. URLs only: a checksum value is never invented
     // here, it is downloaded from sha256Url and shown to the user for consent.
     const BINARY_RELEASE = {
@@ -517,6 +602,50 @@
         return typeof cockpit !== 'undefined' && cockpit && typeof cockpit[member] === 'function';
     }
 
+    // Is the turnkey mechanism itself present?
+    //
+    // Answered by reading a property rather than by creating a transaction, because
+    // CreateTransaction prompts for authentication — asking the user for a password
+    // merely to discover whether a button should be shown would be hostile.
+    //
+    // Resolves to { available, reason } and never rejects: "cannot tell" has to be
+    // reported, not thrown, since this runs while the page is still rendering.
+    function packageKitAvailable() {
+        if (!hasCockpit('dbus'))
+            return Promise.resolve({ available: false, reason: 'no-cockpit' });
+
+        let client;
+        try {
+            client = cockpit.dbus(PK.SERVICE);
+        } catch (e) {
+            return Promise.resolve({ available: false, reason: 'not-installed' });
+        }
+
+        return client.call(PK.PATH, 'org.freedesktop.DBus.Properties', 'Get',
+            [PK.IFACE, 'VersionMajor'])
+            .then(function (reply) {
+                const v = reply && reply[0];
+                // cockpit unwraps the variant to { v: <value> } or the value itself.
+                const major = (v && typeof v === 'object' && 'v' in v) ? v.v : v;
+                return { available: true, reason: '', version: Number(major) || null };
+            })
+            .catch(function (ex) {
+                // A name that cannot be activated means the package is absent; any
+                // other failure means it is there but not answering.
+                const msg = str(ex && (ex.message || ex.problem));
+                const missing = /ServiceUnknown|NameHasNoOwner|not provided by any|was not provided/i.test(msg);
+                return {
+                    available: false,
+                    reason: missing ? 'not-installed' : 'unreachable',
+                    message: msg
+                };
+            })
+            .then(function (result) {
+                if (client && typeof client.close === 'function') client.close();
+                return result;
+            });
+    }
+
     // Every PackageKit action has the same shape — create a transaction, wire the
     // signals, call the method, settle on Finished — so it lives in one place.
     function runTransaction(method, args, onPackage, onProgress) {
@@ -658,14 +787,17 @@
     }
 
     const HangarProvision = {
-        FAMILIES, TOOLS, METHOD, REQUIREMENTS, EPEL_ONLY, EPEL_PACKAGE, BINARY_RELEASE, RECOMMENDED_VERSION, PK,
+        FAMILIES, TOOLS, METHOD, REQUIREMENTS, EPEL_ONLY, EPEL_PACKAGE, PACKAGE_MANAGER, BINARY_RELEASE, RECOMMENDED_VERSION, PK,
+        packageManagerFor, manualCommand, packageKitPackageFor, packageKitCommand,
+        manualInstructions,
         parseVersion, formatVersion, compareVersions, meetsMinimum,
         parseOsRelease, detectFamily,
         requirementFor, packagesFor, planFor, describeStep,
         normalizeArch, binaryFallbackFor,
         evaluateProbe, missingFrom,
         resolveFilter, classifyPackageKitError,
-        probe, probeAll, detectFamilyLive, resolvePackages, installPackages, installStep
+        probe, probeAll, detectFamilyLive, resolvePackages, installPackages, installStep,
+        packageKitAvailable
     };
     root.HangarProvision = HangarProvision;
     if (typeof module !== 'undefined' && module.exports) module.exports = HangarProvision;

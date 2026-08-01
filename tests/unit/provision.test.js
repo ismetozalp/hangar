@@ -1502,3 +1502,107 @@ test('detectFamilyLive answers unknown when os-release cannot be read or is empt
 test('every cockpit stub was removed again, so the module is still bare', () => {
     assert.equal(typeof cockpit, 'undefined');
 });
+
+// --- PackageKit missing: the one thing hangar cannot install for the user ---
+//
+// PackageKit IS the install mechanism, so its absence is a genuine dead end for the
+// turnkey path. These pin the escape hatch: the exact command for THIS distribution,
+// never a generic instruction and never a guessed one.
+
+test('manualCommand builds the right install line per family', () => {
+    assert.equal(P.manualCommand('rhel', ['restic']), 'sudo dnf install -y restic');
+    assert.equal(P.manualCommand('fedora', ['restic']), 'sudo dnf install -y restic');
+    assert.equal(P.manualCommand('debian', ['restic']), 'sudo apt install -y restic');
+    assert.equal(P.manualCommand('suse', ['restic']), 'sudo zypper install -y restic');
+    assert.equal(P.manualCommand('arch', ['restic']), 'sudo pacman -S --needed restic');
+});
+
+test('manualCommand returns nothing for an unknown family rather than guessing', () => {
+    // A wrong package-manager command is worse than no command: it fails in a way
+    // that looks like hangar is broken.
+    for (const fam of ['unknown', '', null, undefined, 'martian', 42]) {
+        assert.equal(P.manualCommand(fam, ['restic']), '', String(fam));
+    }
+});
+
+test('manualCommand handles empty and hostile package lists', () => {
+    assert.equal(P.manualCommand('debian', []), '');
+    assert.equal(P.manualCommand('debian', null), '');
+    assert.equal(P.manualCommand('debian', ['']), '');
+    assert.equal(P.manualCommand('debian', 'restic'), 'sudo apt install -y restic');
+    assert.equal(P.manualCommand('debian', ['a', 'b']), 'sudo apt install -y a b');
+});
+
+test('the PackageKit package name is cased correctly per family', () => {
+    // Not cosmetic: apt and pacman will not find "PackageKit".
+    assert.equal(P.packageKitPackageFor('rhel'), 'PackageKit');
+    assert.equal(P.packageKitPackageFor('fedora'), 'PackageKit');
+    assert.equal(P.packageKitPackageFor('suse'), 'PackageKit');
+    assert.equal(P.packageKitPackageFor('debian'), 'packagekit');
+    assert.equal(P.packageKitPackageFor('arch'), 'packagekit');
+    assert.equal(P.packageKitPackageFor('unknown'), '');
+});
+
+test('packageKitCommand names the package manager the host actually has', () => {
+    assert.equal(P.packageKitCommand('rhel'), 'sudo dnf install -y PackageKit');
+    assert.equal(P.packageKitCommand('debian'), 'sudo apt install -y packagekit');
+    assert.equal(P.packageKitCommand('arch'), 'sudo pacman -S --needed packagekit');
+    assert.equal(P.packageKitCommand('unknown'), '');
+});
+
+test('manualInstructions offers both the recommended and the direct route', () => {
+    const i = P.manualInstructions('debian', ['restic', 'fuse3']);
+    assert.equal(i.known, true);
+    assert.equal(i.family, 'debian');
+    assert.equal(i.packageManager, 'apt');
+    assert.equal(i.packageKitCommand, 'sudo apt install -y packagekit');
+    assert.deepEqual(i.directCommands, ['sudo apt install -y restic fuse3']);
+    assert.equal(i.needsEpel, false);
+});
+
+test('on RHEL the direct route enables EPEL first', () => {
+    // Without this, `dnf install restic` reports that nothing matches — which reads
+    // like hangar printed a broken command.
+    const i = P.manualInstructions('rhel', ['restic']);
+    assert.equal(i.needsEpel, true);
+    assert.equal(i.directCommands.length, 2);
+    assert.equal(i.directCommands[0], 'sudo dnf install -y epel-release');
+    assert.equal(i.directCommands[1], 'sudo dnf install -y restic');
+});
+
+test('EPEL is not mentioned when nothing missing actually needs it', () => {
+    const i = P.manualInstructions('rhel', ['fuse3', 'unzip']);
+    assert.equal(i.needsEpel, false);
+    assert.deepEqual(i.directCommands, ['sudo dnf install -y fuse3 unzip']);
+});
+
+test('manualInstructions maps tools to this distribution package names', () => {
+    // virt-install is 'virtinst' on Debian — the classic cross-distro mistake.
+    assert.ok(P.manualInstructions('debian', ['libvirt']).packages.includes('virtinst'));
+    assert.ok(P.manualInstructions('rhel', ['libvirt']).packages.includes('virt-install'));
+});
+
+test('manualInstructions is honest about an unrecognised distribution', () => {
+    const i = P.manualInstructions('martian', ['restic']);
+    assert.equal(i.known, false);
+    assert.equal(i.family, 'unknown');
+    assert.equal(i.packageKitCommand, '');
+    assert.deepEqual(i.directCommands, []);
+});
+
+test('manualInstructions ignores tool names it does not manage', () => {
+    const i = P.manualInstructions('debian', ['restic', 'nonsense', '__proto__', null]);
+    assert.deepEqual(i.packages, ['restic']);
+});
+
+test('manualInstructions never emits a duplicate package', () => {
+    const i = P.manualInstructions('debian', ['restic', 'restic']);
+    assert.deepEqual(i.packages, ['restic']);
+});
+
+test('packageKitAvailable reports rather than throws when cockpit is absent', async () => {
+    // Runs while the dialog is still rendering, so it must never reject.
+    const r = await P.packageKitAvailable();
+    assert.equal(r.available, false);
+    assert.equal(r.reason, 'no-cockpit');
+});

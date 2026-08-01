@@ -82,7 +82,12 @@ const DEFAULT_STUB = {
         'ls -1 /etc/hangar/repos': '',
         'ls -1 /etc/hangar/jobs': ''
     },
-    files: { '/etc/hangar/config.json': JSON.stringify({ mountRoot: '/run/hangar/mnt' }) }
+    files: {
+        '/etc/hangar/config.json': JSON.stringify({ mountRoot: '/run/hangar/mnt' }),
+        // Family detection reads this; without it every distro-specific answer
+        // degrades to "unknown", which would quietly weaken these tests.
+        '/etc/os-release': 'NAME="Red Hat Enterprise Linux"\nID="rhel"\nID_LIKE="centos fedora"\nVERSION_ID="10.2"\n'
+    }
 };
 
 async function open(browser, stub) {
@@ -94,7 +99,10 @@ async function open(browser, stub) {
     page.on('pageerror', (e) => consoleErrors.push(`pageerror: ${e.message}`));
 
     await page.addInitScript((s) => { window.__hangarStub = s; },
-        Object.assign({}, DEFAULT_STUB, stub || {}));
+        Object.assign({}, DEFAULT_STUB, stub || {},
+            // PackageKit answers by default; individual tests override this.
+            { dbus: Object.assign({ 'org.freedesktop.PackageKit:Get': [{ v: 1 }] },
+                (stub && stub.dbus) || {}) }));
     await page.goto(`http://127.0.0.1:${PORT}/index.html`, { waitUntil: 'networkidle' });
     // Alpine boots asynchronously: boot.js injects partials, then loads Alpine.
     await page.waitForSelector('.hangar-shell', { timeout: 10000 });
@@ -328,6 +336,120 @@ async function main() {
                     'an older release was offered as an upgrade');
             });
 
+            await ctx.close();
+        }
+
+        // ---- themes
+        {
+            const { ctx, page } = await open(browser);
+
+            await check('the saved theme is applied to <html> before anything renders', async () => {
+                const attr = await page.getAttribute('html', 'data-bs-theme');
+                assert(attr === 'light' || attr === 'dark',
+                    `system should resolve to light or dark, got ${attr}`);
+            });
+
+            await check('the Settings screen offers every registered theme', async () => {
+                await page.click('.nav-pills .nav-link:text-is("Settings")');
+                await page.waitForSelector('.hangar-theme-option', { timeout: 5000 });
+                const count = await page.locator('.hangar-theme-option').count();
+                const registry = await page.evaluate(() => window.HangarThemes.THEMES.length);
+                assertEqual(count, registry, 'picker does not show every theme');
+            });
+
+            await check('picking a theme repaints the whole page and persists it', async () => {
+                await page.click('.hangar-theme-option:has-text("Nord")');
+                await page.waitForTimeout(300);
+                assertEqual(await page.getAttribute('html', 'data-bs-theme'), 'nord');
+
+                // Written immediately — no Save step for a theme.
+                const written = await page.evaluate(() => window.__hangarStub.calls
+                    .filter((c) => c.kind === 'replace' && /config\.json$/.test(c.path))
+                    .map((c) => JSON.parse(c.content).theme));
+                assert(written.includes('nord'), `theme was not persisted: ${JSON.stringify(written)}`);
+            });
+
+            await check('a picked theme actually changes the rendered colours', async () => {
+                // The attribute alone proves nothing if themes.css lacks the palette.
+                const bg = await page.evaluate(() =>
+                    getComputedStyle(document.body).backgroundColor);
+                await page.click('.hangar-theme-option:has-text("Sepia")');
+                await page.waitForTimeout(300);
+                const after = await page.evaluate(() =>
+                    getComputedStyle(document.body).backgroundColor);
+                assert(bg !== after, `background did not change between themes (${bg})`);
+            });
+
+            await check('a theme pick does not mark the settings form dirty', async () => {
+                // It is written on click, so claiming unsaved changes would be a lie.
+                assertEqual(await page.isVisible('.badge:text-is("Unsaved changes")'), false);
+            });
+
+            if (process.env.SHOT) await page.screenshot({ path: 'tests/e2e-theme.png', fullPage: true });
+            await ctx.close();
+        }
+
+        // ---- PackageKit missing: the turnkey dead end
+        {
+            const { ctx, page } = await open(browser, {
+                spawn: Object.assign({}, DEFAULT_STUB.spawn, {
+                    'restic version': { error: true, message: 'not found', exit_status: 127 }
+                }),
+                dbus: {
+                    'org.freedesktop.PackageKit:Get': {
+                        error: 'org.freedesktop.DBus.Error.ServiceUnknown: ' +
+                            'The name org.freedesktop.PackageKit was not provided by any .service files'
+                    }
+                }
+            });
+
+            await check('a missing PackageKit is explained rather than silently failing', async () => {
+                await page.click('.alert-warning button:text-is("Install")');
+                await page.waitForSelector('#hangar-provision.show', { timeout: 5000 });
+                await page.waitForTimeout(600);
+                const text = await page.textContent('#hangar-provision');
+                assert(/cannot install anything on this system automatically/i.test(text),
+                    'no warning about the missing mechanism');
+                assert(/PackageKit is not installed/i.test(text),
+                    `the reason is not stated: ${text.slice(0, 300)}`);
+            });
+
+            await check('the exact command for this distribution is offered', async () => {
+                // Wait for the command itself rather than reading whatever is on
+                // screen — the dialog may still be probing.
+                await page.waitForSelector('#hangar-provision code', { timeout: 5000 });
+                const text = await page.textContent('#hangar-provision');
+                // The host is RHEL-family, so it must say dnf — never a generic
+                // "use your package manager".
+                assert(/sudo dnf install -y PackageKit/.test(text),
+                    `no per-distro command found: ${text.slice(0, 400)}`);
+                assert(/sudo dnf install -y epel-release/.test(text),
+                    'the direct route omits EPEL, so installing restic would fail');
+            });
+
+            await check('the dialog does not promise a shell-free install it cannot deliver', async () => {
+                // innerText, not textContent: textContent returns hidden nodes too, so
+                // it cannot tell "removed from the page" from "still in the DOM".
+                const shown = await page.evaluate(() =>
+                    document.querySelector('#hangar-provision').innerText);
+                assert(!/nothing has\s+to be typed at a shell/i.test(shown),
+                    'the dialog claims nothing must be typed, directly above two shell commands');
+            });
+
+            await check('the Install button is withdrawn, not left dangling', async () => {
+                // A greyed-out Install invites repeated clicking on something that
+                // cannot work; the commands are the action in this state.
+                const visible = await page.evaluate(() => {
+                    const btns = Array.from(document.querySelectorAll('#hangar-provision button'))
+                        .filter((b) => /^Install/.test(b.textContent.trim()));
+                    return btns.filter((b) => b.getClientRects().length > 0).length;
+                });
+                assertEqual(visible, 0, 'Install is still offered with no way to honour it');
+                assert(await page.isVisible('#hangar-provision button:text-is("Check again")'),
+                    'no way to re-check after running the command');
+            });
+
+            if (process.env.SHOT) await page.screenshot({ path: 'tests/e2e-nopackagekit.png', fullPage: true });
             await ctx.close();
         }
 

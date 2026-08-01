@@ -19,7 +19,10 @@
 
             <div class="modal-body">
 
-                <p class="text-secondary small">
+                <!-- Withdrawn when PackageKit is missing: promising that nothing has
+                     to be typed, immediately above instructions to type two commands,
+                     reads as the dialog not knowing what it is doing. -->
+                <p class="text-secondary small" x-show="!packageKitMissing()">
                     Hangar installs these through the system package manager, so nothing has
                     to be typed at a shell.
                 </p>
@@ -43,6 +46,78 @@
 
                 <div x-show="!loading && !error && !rows.length" class="hangar-empty">
                     Everything hangar needs is already installed.
+                </div>
+
+                <!-- PackageKit missing ---------------------------------------
+                     hangar cannot install this one for you: it IS the mechanism
+                     everything else goes through. So the dialog stops pretending
+                     and hands over the exact command for this distribution. -->
+                <div x-show="packageKitMissing()">
+                    <div class="alert alert-warning" role="alert">
+                        <strong>Hangar cannot install anything on this system automatically.</strong>
+                        <div class="small mt-1" x-text="packageKitReason()"></div>
+                        <div class="small mt-1">
+                            Hangar installs packages through PackageKit, so this is the one
+                            thing it cannot set up for you. Run one of the commands below,
+                            then choose <em>Check again</em>.
+                        </div>
+                    </div>
+
+                    <!-- Preferred: restore the turnkey path itself. -->
+                    <template x-if="manualKnown() && manual.packageKitCommand">
+                        <div class="mb-3">
+                            <div class="small fw-semibold mb-1">
+                                Recommended — install PackageKit, then hangar can do the rest:
+                            </div>
+                            <div class="d-flex align-items-center gap-2">
+                                <code class="hangar-rawlog flex-grow-1 mb-0"
+                                      x-text="manual.packageKitCommand"></code>
+                                <button type="button" class="btn btn-sm btn-outline-secondary"
+                                        @click="copyCommand(manual.packageKitCommand)"
+                                        :aria-label="'Copy: ' + manual.packageKitCommand">Copy</button>
+                            </div>
+                        </div>
+                    </template>
+
+                    <!-- Alternative: skip PackageKit and install the tools directly. -->
+                    <template x-if="manualKnown() && manual.directCommands.length">
+                        <div class="mb-2">
+                            <div class="small fw-semibold mb-1">
+                                Or install the tools directly and skip PackageKit:
+                            </div>
+                            <template x-for="(cmd, i) in manual.directCommands" :key="i">
+                                <div class="d-flex align-items-center gap-2 mb-1">
+                                    <code class="hangar-rawlog flex-grow-1 mb-0" x-text="cmd"></code>
+                                    <button type="button" class="btn btn-sm btn-outline-secondary"
+                                            @click="copyCommand(cmd)"
+                                            :aria-label="'Copy: ' + cmd">Copy</button>
+                                </div>
+                            </template>
+                            <div class="form-text" x-show="manual.needsEpel">
+                                The first command enables EPEL, which is where this
+                                distribution keeps restic.
+                            </div>
+                        </div>
+                    </template>
+
+                    <!-- Unknown distribution: say so rather than guess a command. -->
+                    <template x-if="!manualKnown()">
+                        <div class="alert alert-secondary py-2 px-3 small" role="alert">
+                            Hangar does not recognise this distribution, so it cannot give
+                            you an exact command. Install
+                            <strong>PackageKit</strong>
+                            with your system's package manager, or install these packages
+                            directly:
+                            <span class="hangar-mono"
+                                  x-text="(manual && manual.packages.length) ? manual.packages.join(' ') : 'restic'"></span>.
+                        </div>
+                    </template>
+
+                    <div class="d-flex align-items-center gap-2">
+                        <button type="button" class="btn btn-sm btn-primary"
+                                @click="recheck()" :disabled="loading">Check again</button>
+                        <span x-show="copied" class="text-success small">Copied to the clipboard.</span>
+                    </div>
                 </div>
 
                 <!-- What is missing, and why it is needed --------------------- -->
@@ -202,8 +277,11 @@
                 <button type="button" class="btn btn-outline-secondary"
                         x-show="retryableRows().length && !busy && !consent"
                         @click="retryAll()">Retry failed</button>
+                <!-- Hidden rather than disabled when PackageKit is missing: a greyed
+                     Install button invites the user to keep clicking it. The
+                     commands in the body are the action in that state. -->
                 <button type="button" class="btn btn-primary"
-                        x-show="rows.length"
+                        x-show="rows.length && !packageKitMissing()"
                         :disabled="busy || loading || !!consent || pending() === 0"
                         @click="installAll()">
                     <span x-show="!busy">Install</span>

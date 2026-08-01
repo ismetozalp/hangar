@@ -401,6 +401,13 @@
             error: null,            // failure of something that is not one row
             request: null,          // what open() was asked for, so it can be retried
 
+            // PackageKit is the mechanism, so hangar cannot install it for the user.
+            // When it is missing the dialog stops offering an Install button it
+            // cannot honour, and shows the exact commands for THIS distribution.
+            pk: { available: true, reason: '', checked: false },
+            manual: null,           // { packageKitCommand, directCommands, ... }
+            copied: '',             // which command was last copied
+
             init() {
                 if (typeof root.addEventListener !== 'function') return;
                 root.addEventListener('hangar:provision', (ev) => {
@@ -426,6 +433,19 @@
                     this.family = await Prov.detectFamilyLive();
                     this.arch = await detectArch();
                     this.rows = stepRows(Prov.planFor(list, this.family));
+
+                    // Checked after the plan is built, so the instructions can name
+                    // the actual packages this host is missing rather than a generic
+                    // list. A failure here must not hide the plan.
+                    try {
+                        this.pk = Object.assign({ checked: true },
+                            await Prov.packageKitAvailable());
+                    } catch (e) {
+                        this.pk = { available: false, reason: 'unreachable', checked: true };
+                    }
+                    if (!this.pk.available) {
+                        this.manual = Prov.manualInstructions(this.family, list);
+                    }
                 } catch (e) {
                     // Every one of these can reject, and an empty rows[] renders as
                     // "everything hangar needs is already installed". Swallowing the
@@ -460,6 +480,47 @@
             // --- derived state ------------------------------------------
 
             anyDownloads() { return needsConsent(this.rows); },
+
+            // --- PackageKit missing -------------------------------------------
+
+            // Only true once the check has actually run, so the warning never
+            // flashes up while the dialog is still loading.
+            packageKitMissing() { return this.pk.checked && !this.pk.available; },
+
+            // Distinguishes "PackageKit is not installed" from "it is installed but
+            // not answering" — different problems with different fixes.
+            packageKitReason() {
+                if (this.pk.reason === 'not-installed')
+                    return 'PackageKit is not installed on this system.';
+                if (this.pk.reason === 'unreachable')
+                    return 'PackageKit is installed but is not responding.';
+                if (this.pk.reason === 'no-cockpit')
+                    return 'This page cannot reach the system to install anything.';
+                return 'PackageKit is unavailable.';
+            },
+
+            // An unknown distribution is stated plainly rather than given a guessed
+            // command: a wrong install line is worse than none.
+            manualKnown() { return !!(this.manual && this.manual.known); },
+
+            async copyCommand(cmd) {
+                this.copied = '';
+                const text = String(cmd || '');
+                if (!text) return false;
+                try {
+                    if (root.navigator && root.navigator.clipboard &&
+                        typeof root.navigator.clipboard.writeText === 'function') {
+                        await root.navigator.clipboard.writeText(text);
+                        this.copied = text;
+                        return true;
+                    }
+                } catch (e) { /* fall through — the command is on screen to select */ }
+                return false;
+            },
+
+            // Re-run the whole check: the expected flow is that the user runs the
+            // command in a terminal and comes straight back here.
+            async recheck() { await this.open(this.request); },
 
             pending() {
                 return this.rows.filter(function (r) {

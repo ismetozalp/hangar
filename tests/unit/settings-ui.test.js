@@ -77,9 +77,58 @@ test('the component constructs with no deps, no DOM and no cockpit', () => {
     assert.equal(c.dirty(), false);
 });
 
-test('the editable set matches the defaults core/config.js ships, minus version', () => {
-    const editable = Object.keys(DEFAULTS).filter((k) => k !== 'version').sort();
+test('the editable set matches the defaults core/config.js ships, minus the two it does not own', () => {
+    // `version` is a schema marker owned by core/config.js, not a preference.
+    // `theme` IS a preference, but it is applied and written on click rather than
+    // through the form — so it must not appear in the dirty check or the Save
+    // payload, or picking a colour would leave the screen claiming unsaved changes.
+    const NOT_FORM_FIELDS = ['version', 'theme'];
+    const editable = Object.keys(DEFAULTS)
+        .filter((k) => !NOT_FORM_FIELDS.includes(k)).sort();
     assert.deepEqual(UI.EDITABLE.slice().sort(), editable);
+    for (const k of NOT_FORM_FIELDS) {
+        assert.ok(!UI.EDITABLE.includes(k), `${k} must not be a form field`);
+    }
+});
+
+test('picking a theme applies it and writes it without touching the form', () => {
+    const Themes = require('../../js/core/themes.js');
+    const deps = stubDeps();
+    const c = UI.hangarSettingsUi(deps);
+
+    const events = [];
+    const prevDispatch = globalThis.dispatchEvent;
+    const prevCustom = globalThis.CustomEvent;
+    globalThis.CustomEvent = class { constructor(type, init) { this.type = type; this.detail = init && init.detail; } };
+    globalThis.dispatchEvent = (ev) => { events.push(ev); return true; };
+
+    return (async () => {
+        try {
+            await c.load();
+            const before = JSON.stringify(c.form);
+            assert.equal(await c.pickTheme('nord'), true);
+
+            assert.equal(c.theme, 'nord');
+            // The rest of the page has to repaint, not just this tab.
+            assert.equal(events.length, 1);
+            assert.equal(events[0].type, 'hangar:theme');
+            assert.equal(events[0].detail, 'nord');
+            // Written straight away, and the form is untouched.
+            assert.equal(deps.written[deps.written.length - 1].theme, 'nord');
+            assert.equal(JSON.stringify(c.form), before, 'the form must not change');
+            assert.equal(c.dirty(), false, 'a theme pick must not look like an unsaved edit');
+
+            // An unknown or unchanged theme is a no-op rather than a write.
+            const writes = deps.written.length;
+            assert.equal(await c.pickTheme('nord'), false);
+            assert.equal(await c.pickTheme('nope'), false);
+            assert.equal(deps.written.length, writes);
+            assert.ok(Themes.isValid(c.theme));
+        } finally {
+            globalThis.dispatchEvent = prevDispatch;
+            globalThis.CustomEvent = prevCustom;
+        }
+    })();
 });
 
 test('mount() is a no-op without a document', () => {
