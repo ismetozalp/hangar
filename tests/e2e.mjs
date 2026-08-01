@@ -292,6 +292,29 @@ async function main() {
                 await page.waitForTimeout(300);
             });
 
+            await check('a successful install clears the banner and the header chip', async () => {
+                // Reported from real use: hangar installed the tools, but the banner
+                // and the "2 tool(s) missing" chip kept showing what was true at page
+                // load — so a working install looked like a failed one.
+                assert(await page.isVisible('.alert-warning'), 'the gate should be showing to begin with');
+                assert(await page.isVisible('.badge:has-text("missing")'), 'the chip should be showing');
+
+                // Make the system report the tools as present, exactly as a real
+                // install does, then announce it the way provision-ui now does.
+                await page.evaluate(() => {
+                    window.__hangarStub.spawn['restic version'] =
+                        'restic 0.19.1 compiled with go1.26.4 on linux/amd64';
+                    window.__hangarStub.spawn['rear --version'] = 'Relax-and-Recover 2.9';
+                    window.dispatchEvent(new CustomEvent('hangar:provisioned'));
+                });
+                await page.waitForTimeout(700);
+
+                assertEqual(await page.isVisible('.alert-warning'), false,
+                    'the prerequisite banner survived a successful install');
+                assertEqual(await page.isVisible('.badge:has-text("missing")'), false,
+                    'the header chip still claims tools are missing');
+            });
+
             if (process.env.SHOT) await page.screenshot({ path: 'tests/e2e-provision.png', fullPage: true });
             await ctx.close();
         }

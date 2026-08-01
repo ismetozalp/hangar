@@ -84,21 +84,13 @@
                     this.applyTheme(id);
                 });
 
-                try {
-                    const P = root.HangarProvision;
-                    // probe() takes a single tool; probeAll()/missingFrom() is the pair
-                    // that answers "what is still needed". missingFrom returns tool
-                    // NAMES, so pair each with the reason the UI shows the user.
-                    const results = await P.probeAll();
-                    this.missing = P.missingFrom(results).map(function (tool) {
-                        let reason = '';
-                        try { reason = P.requirementFor(tool).reason || ''; } catch (e) { /* unknown tool */ }
-                        return { tool: tool, reason: reason };
-                    });
-                } catch (e) {
-                    this.error = e;
-                    this.missing = [];
-                }
+                await this.refreshMissing();
+
+                // The prerequisite banner and the header chip are a view of the
+                // system, not a one-off snapshot taken at load. Re-probe whenever
+                // something claims to have changed it, or a successful install
+                // leaves the page still saying tools are missing.
+                root.addEventListener('hangar:provisioned', () => { this.refreshMissing(); });
 
                 // Deliberately after the prerequisite probe and never blocking on it:
                 // an unreachable GitHub must not stop the plugin rendering.
@@ -112,6 +104,31 @@
                 // #/logbook lands straight on the Logbook.
                 const frag = (root.location && root.location.hash || '').replace(/^#\/?/, '');
                 if (frag && TABS.some(function (t) { return t.id === frag; })) this.tab = frag;
+            },
+
+            // Ask the system what is still missing. Called at load and again after
+            // anything that may have installed something.
+            async refreshMissing() {
+                const P = root.HangarProvision;
+                if (!P || typeof P.probeAll !== 'function') { this.missing = []; return this.missing; }
+                try {
+                    // probe() takes a single tool; probeAll()/missingFrom() is the pair
+                    // that answers "what is still needed". missingFrom returns tool
+                    // NAMES, so pair each with the reason the UI shows the user.
+                    const results = await P.probeAll();
+                    this.missing = P.missingFrom(results).map(function (tool) {
+                        let reason = '';
+                        try { reason = P.requirementFor(tool).reason || ''; } catch (e) { /* unknown tool */ }
+                        return { tool: tool, reason: reason };
+                    });
+                    // A previous probe failure must not keep an error on screen once a
+                    // later probe has succeeded.
+                    this.error = null;
+                } catch (e) {
+                    this.error = e;
+                    this.missing = [];
+                }
+                return this.missing;
             },
 
             missingSummary() {

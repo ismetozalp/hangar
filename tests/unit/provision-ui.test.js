@@ -1477,3 +1477,30 @@ test('alerts announce themselves', () => {
     for (const a of alerts)
         assert.match(a, /role="(alert|status)"/, a);
 });
+
+test('finishing an install announces it so the rest of the page can re-probe', () => {
+    // Without this the header chip and prerequisite banner keep showing what was
+    // true at page load, so a successful install still reads as a failure.
+    const c = UI.hangarProvisionUi();
+    const seen = [];
+    const prevDispatch = globalThis.dispatchEvent;
+    const prevCustom = globalThis.CustomEvent;
+    globalThis.CustomEvent = class { constructor(type) { this.type = type; } };
+    globalThis.dispatchEvent = (ev) => { seen.push(ev.type); return true; };
+    try {
+        assert.equal(c.announceInstalled(), true);
+        assert.deepEqual(seen, ['hangar:provisioned']);
+    } finally {
+        globalThis.dispatchEvent = prevDispatch;
+        globalThis.CustomEvent = prevCustom;
+    }
+});
+
+test('announcing is a no-op rather than a crash with no event support', () => {
+    const c = UI.hangarProvisionUi();
+    const prevDispatch = globalThis.dispatchEvent;
+    globalThis.dispatchEvent = undefined;
+    try {
+        assert.equal(c.announceInstalled(), false);
+    } finally { globalThis.dispatchEvent = prevDispatch; }
+});

@@ -135,3 +135,73 @@ test('confirm dialog resolves true and drops its resolver', () => {
     assert.equal(resolved, true);
     assert.equal(c._resolve, null);
 });
+
+// --- the prerequisite banner is a live view, not a load-time snapshot -----
+
+function stubProvision(missingTools) {
+    return {
+        probeAll: async () => missingTools.map((t) => ({ tool: t, present: false, ok: false })),
+        missingFrom: (results) => results.map((r) => r.tool),
+        requirementFor: (t) => ({ tool: t, reason: `${t} is needed.` })
+    };
+}
+
+test('refreshMissing asks the system and pairs each tool with its reason', async () => {
+    const a = App.hangarApp();
+    globalThis.HangarProvision = stubProvision(['rclone', 'rear']);
+    try {
+        await a.refreshMissing();
+        assert.deepEqual(a.missing.map((m) => m.tool), ['rclone', 'rear']);
+        assert.match(a.missing[0].reason, /needed/);
+    } finally { delete globalThis.HangarProvision; }
+});
+
+test('a later successful probe clears an earlier probe error', async () => {
+    const a = App.hangarApp();
+    a.error = new Error('an earlier failure');
+    globalThis.HangarProvision = stubProvision([]);
+    try {
+        await a.refreshMissing();
+        assert.deepEqual(a.missing, []);
+        assert.equal(a.error, null, 'a stale probe error stayed on screen');
+    } finally { delete globalThis.HangarProvision; }
+});
+
+test('installing the missing tools clears the banner rather than leaving it stale', async () => {
+    // Reported from real use: hangar installed the tools successfully, but the
+    // header chip and the prerequisite banner kept saying "2 tools missing",
+    // which reads as though the install had failed.
+    const a = App.hangarApp();
+    globalThis.HangarProvision = stubProvision(['rclone', 'rear']);
+    try {
+        await a.refreshMissing();
+        assert.equal(a.missing.length, 2);
+
+        // The system changed underneath us — exactly what a successful install does.
+        globalThis.HangarProvision = stubProvision([]);
+        await a.refreshMissing();
+        assert.deepEqual(a.missing, [], 'the banner would still be showing');
+        assert.equal(a.missingSummary(), '');
+    } finally { delete globalThis.HangarProvision; }
+});
+
+test('refreshMissing degrades quietly when provisioning is unavailable', async () => {
+    const a = App.hangarApp();
+    a.missing = [{ tool: 'restic', reason: 'x' }];
+    await a.refreshMissing();          // no HangarProvision global at all
+    assert.deepEqual(a.missing, []);
+});
+
+test('a probe that rejects is reported and does not leave a stale list', async () => {
+    const a = App.hangarApp();
+    a.missing = [{ tool: 'rclone', reason: 'x' }];
+    globalThis.HangarProvision = {
+        probeAll: async () => { throw new Error('bridge gone'); },
+        missingFrom: () => [], requirementFor: () => ({})
+    };
+    try {
+        await a.refreshMissing();
+        assert.deepEqual(a.missing, []);
+        assert.ok(a.error, 'the failure was swallowed');
+    } finally { delete globalThis.HangarProvision; }
+});

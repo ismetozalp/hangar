@@ -592,7 +592,25 @@
                         'Nothing further was installed. The reason is shown below.';
                 } finally {
                     this.busy = false;
+                    // Tell the rest of the page that the system changed. Without this
+                    // the header chip and the prerequisite banner keep showing what
+                    // was true when the page loaded — so a successful install still
+                    // reads as "2 tools missing", which looks like the install failed.
+                    // Announced even on failure: a partial run still installed
+                    // something, and the banner should reflect what is true now.
+                    this.announceInstalled();
                 }
+            },
+
+            // Deliberately carries no payload. The listener re-probes the system
+            // rather than trusting this screen's idea of what happened — the system
+            // is the source of truth, and a user may also have installed something
+            // in a terminal while this was open.
+            announceInstalled() {
+                if (typeof root.dispatchEvent !== 'function' ||
+                    typeof root.CustomEvent !== 'function') return false;
+                root.dispatchEvent(new root.CustomEvent('hangar:provisioned'));
+                return true;
             },
 
             async installRow(row) {
