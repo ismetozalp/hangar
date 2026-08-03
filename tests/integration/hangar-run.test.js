@@ -685,3 +685,135 @@ test('hangar-run agrees with js/engine/restic.js on which kind a run gets', () =
     assert.equal(answers[pairs.findIndex(([c, t]) => c === 3 && t === expiry)], 'READ_ERRORS');
     assert.equal(answers[pairs.findIndex(([c, t]) => c === 1 && t === quota)], 'GENERIC');
 });
+
+// --- the whole false-positive sweep, driven through BOTH implementations -----
+//
+// SIGNAL_CASES above is the short table. This is the long one, and it exists
+// because a disagreement between the two copies is not a cosmetic drift: the
+// editor decides whether the repository shows a "sign in again" button, and the
+// runner decides what the 03:00 unit writes into the state file the morning
+// after. One saying expiry and the other not is a repository that looks broken
+// in one place and fine in the other.
+//
+// The corpus is the same one tests/unit/rclone.test.js sweeps, so a case added
+// in one place must be added in both — deliberately, since it is the AGREEMENT
+// that is under test here, not the verdict.
+
+const FALSE_POSITIVE_CORPUS = [
+    // Ordinary failures, each with a remedy that is not re-authorising.
+    ['error listing: permission denied', false],
+    ['Fatal: unable to open repo: stat /srv/repo: permission denied', false],
+    ['mkdir /srv/repo/data: permission denied', false],
+    ['Failed to copy: 403 storageQuotaExceeded', false],
+    ["googleapi: Error 403: The user's Drive storage quota has been exceeded., quotaExceeded", false],
+    ['NoSuchBucket: The specified bucket does not exist', false],
+    ['ContainerNotFound: The specified container does not exist', false],
+    ['Get "https://s3.eu-central-1.amazonaws.com/": dial tcp: lookup s3.eu-central-1.amazonaws.com: no such host', false],
+    ['temporary failure in name resolution', false],
+    ['dial tcp 10.0.0.5:8000: connect: connection refused', false],
+    ['read tcp 10.0.0.2:5000->10.0.0.9:443: read: connection reset by peer', false],
+    ['net/http: TLS handshake timeout', false],
+    ['x509: certificate signed by unknown authority', false],
+    ['Fatal: wrong password or no key found', false],
+    ['Fatal: unable to open repository: repository is already locked exclusively by PID 42 on host nas', false],
+    ['Fatal: unable to open config file: Stat: file does not exist\nIs there a repository at the following location?', false],
+    ['write /srv/repo/data/ab: no space left on device', false],
+    ['disk quota exceeded', false],
+    ['401 Unauthorized', false],
+    ['HTTP/1.1 401 Unauthorized', false],
+    ['403 Forbidden', false],
+    ['403 Forbidden: The user does not have permission to access this folder', false],
+    ['Access Denied', false],
+    ['AccessDenied: Access Denied, status code: 403', false],
+    ['access_denied', false],
+    ['SignatureDoesNotMatch: The request signature we calculated does not match', false],
+    ['429 Too Many Requests', false],
+    ['403: User Rate Limit Exceeded, userRateLimitExceeded', false],
+    ['ERROR : x: Failed to copy: googleapi: Error 429: Rate Limit Exceeded, rateLimitExceeded', false],
+    ["couldn't fetch to", false],
+    ['inval', false],
+    [' garbled��', false],
+    ['', false],
+    ['   ', false],
+    ['\n\n\n', false],
+    ['NOTICE: using token from the config file', false],
+    // A file NAME is not a diagnosis.
+    ['error: lstat /home/alice/token: permission denied', false],
+    ['error: open /var/log/token_expired.log: permission denied', false],
+    ['error: lstat /srv/oauth2/data: permission denied', false],
+    ['error: open /home/bob/bearer.key: permission denied', false],
+    ['Fatal: unable to open file /etc/hangar/invalid_grant.json: permission denied', false],
+    ['ERROR : secrets/token.json: Failed to copy: 403 Forbidden', false],
+    ['ERROR : token/db.sql: Failed to copy: 403 Forbidden', false],
+    ['error: lstat ./oauth2/data: permission denied', false],
+    ['error: lstat ~/tokens: permission denied', false],
+    ['error: lstat ../bearer: permission denied', false],
+    ['Get "https://s3.example.com/bucket/token-store/x": 403 Forbidden', false],
+    // Per-line pairing.
+    ['ERROR : db.sql: Failed to copy: 403 Forbidden: storageQuotaExceeded\n' +
+        'NOTICE: using token from the config file', false],
+    ['403 Forbidden\nusing token from the config file', false],
+    // Line separators. Python's str.splitlines() breaks on all of these and the
+    // JavaScript now does too; before it did not, and a bare carriage return —
+    // which fills rclone's progress output — joined two unrelated lines into one
+    // false expiry on the editor side only.
+    ['403 Forbidden\rTransferred: 1 token of many', false],
+    ['403 Forbidden\r\nusing token from the config file', false],
+    ['403 Forbidden\voauth token', false],
+    ['403 Forbidden\foauth token', false],
+    ['403 Forbidden\x1coauth token', false],
+    ['403 Forbidden\x1doauth token', false],
+    ['403 Forbidden\x1eoauth token', false],
+    ['403 Forbidden\x85oauth token', false],
+    ['403 Forbidden\u2028oauth token', false],
+    ['403 Forbidden\u2029oauth token', false],
+    ["couldn't fetch\rtoken", false],
+    // The genuine article, every wording hangar claims to recognise.
+    ["couldn't fetch token - maybe it has expired?", true],
+    ['couldn’t fetch token - maybe it has expired?', true],
+    ['couldnt fetch token', true],
+    ['Failed to create file system for "gd:x": couldn\'t fetch token - maybe it has expired?', true],
+    ['refresh with "rclone config reconnect gdrive:"', true],
+    ['rclone config reconnect box:', true],
+    ['oauth2: token expired and refresh token is not set', true],
+    ['invalid_grant', true],
+    ['INVALID_GRANT', true],
+    ['{"error":"invalid_grant","error_description":"Token has been expired or revoked."}', true],
+    ['Token has been expired or revoked.', true],
+    ['Refresh token has expired', true],
+    ['AADSTS700082: The refresh token has expired due to inactivity.', true],
+    ['expired_access_token', true],
+    ['{"error_summary":"expired_access_token/..."}', true],
+    ['unexpected HTTP status 401: {"error_summary": "expired_access_token/.", ' +
+        '"error": {".tag": "expired_access_token"}}', true],
+    ['401 Unauthorized: the bearer token is no longer accepted', true],
+    ['googleapi: Error 401: Expected OAuth 2 access token, ..., unauthorized', true],
+    ['2026/07/31 03:00:12 ERROR : backups/db: Failed to copy: failed to open ' +
+        'source object: couldn\'t fetch token - maybe it has expired?', true],
+    ['Post "https://oauth2.googleapis.com/token": oauth2: cannot fetch token: 401', true]
+];
+
+test('the two expiry implementations agree on the whole false-positive corpus', () => {
+    const answers = pythonAnswers('auth_expired', FALSE_POSITIVE_CORPUS.map(([t]) => [t]));
+    FALSE_POSITIVE_CORPUS.forEach(([text, expected], i) => {
+        assert.equal(Rclone.isAuthExpired(text), expected,
+            'js/core/rclone.js disagrees with the table: ' + JSON.stringify(text));
+        assert.equal(answers[i], expected,
+            'libexec/hangar-run disagrees with the table: ' + JSON.stringify(text));
+    });
+    // The sweep must not be passable by a function that always answers false.
+    assert.ok(FALSE_POSITIVE_CORPUS.filter(([, e]) => e).length >= 18);
+    assert.ok(FALSE_POSITIVE_CORPUS.filter(([, e]) => !e).length >= 50);
+});
+
+test('the runner answers no, rather than raising, for a stderr that is not text', () => {
+    // classify_run() is called on whatever the channel handed back. `text or ""`
+    // let a non-string reach .splitlines() and raise an AttributeError out of a
+    // classifier whose entire contract is to answer yes or no — and it would have
+    // done so on the failure path, where nothing is left to catch it.
+    const answers = pythonAnswers('auth_expired', [[null], [123], [true], [[]], [{}], [1.5]]);
+    assert.deepEqual(answers, [false, false, false, false, false, false]);
+    [null, 123, true, [], {}, 1.5].forEach((v) => {
+        assert.equal(Rclone.isAuthExpired(v), false);
+    });
+});

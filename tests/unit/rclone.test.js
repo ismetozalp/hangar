@@ -2394,3 +2394,192 @@ test('updateRemoteToken: reuses mergeConfigSection rather than editing the file 
     assert.equal(/f\.replace\(|mergeConfigSection\(/.test(body), false,
         'updateRemoteToken writes the config file itself');
 });
+
+// ================================================================== expiry:
+// the false-positive sweep
+//
+// The risk this section exists for is not a missed expiry. It is the OPPOSITE:
+// telling someone their sign-in lapsed when it did not. That costs them a
+// pointless re-authorisation AND hides the real cause behind a green button —
+// they fix the login, the backup fails again the next night, and the bucket
+// policy or the full disk that actually broke it is never looked at.
+//
+// So every ordinary failure a cloud destination can produce is swept here and
+// asserted NOT to be expiry, one named case each, and the genuine wordings are
+// swept beside them so the sweep cannot be satisfied by a function that always
+// answers false.
+//
+// tests/integration/hangar-run.test.js drives the same corpus through the Python
+// copy in libexec/hangar-run. A message the editor calls expiry and the runner
+// does not (or the reverse) is a bug in itself.
+
+// Every entry is a real failure with a DIFFERENT remedy from re-authorising.
+const NOT_EXPIRY = [
+    ['permission denied', 'error listing: permission denied'],
+    ['permission denied on a local path', 'Fatal: unable to open repo: stat /srv/repo: permission denied'],
+    ['permission denied creating a directory', 'mkdir /srv/repo/data: permission denied'],
+    ['quota exceeded', 'Failed to copy: 403 storageQuotaExceeded'],
+    ['quota exceeded, spelled out', "googleapi: Error 403: The user's Drive storage quota has been exceeded., quotaExceeded"],
+    ['bucket not found', 'NoSuchBucket: The specified bucket does not exist'],
+    ['container not found', 'ContainerNotFound: The specified container does not exist'],
+    ['DNS resolution failure', 'Get "https://s3.eu-central-1.amazonaws.com/": dial tcp: lookup s3.eu-central-1.amazonaws.com: no such host'],
+    ['DNS resolution failure, resolver wording', 'temporary failure in name resolution'],
+    ['connection refused', 'dial tcp 10.0.0.5:8000: connect: connection refused'],
+    ['connection reset', 'read tcp 10.0.0.2:5000->10.0.0.9:443: read: connection reset by peer'],
+    ['TLS handshake failure', 'net/http: TLS handshake timeout'],
+    ['TLS certificate failure', 'x509: certificate signed by unknown authority'],
+    ['wrong restic password', 'Fatal: wrong password or no key found'],
+    ['repository locked', 'Fatal: unable to open repository: repository is already locked exclusively by PID 42 on host nas'],
+    ['repository does not exist', 'Fatal: unable to open config file: Stat: file does not exist\nIs there a repository at the following location?'],
+    ['disk full', 'write /srv/repo/data/ab: no space left on device'],
+    ['disk quota', 'disk quota exceeded'],
+    ['a bare 401', '401 Unauthorized'],
+    ['a bare 401 with the status line', 'HTTP/1.1 401 Unauthorized'],
+    ['a bare 403', '403 Forbidden'],
+    ['a 403 that names a folder permission', '403 Forbidden: The user does not have permission to access this folder'],
+    ['access denied', 'Access Denied'],
+    ['access denied, S3 wording', 'AccessDenied: Access Denied, status code: 403'],
+    ['access_denied, the OAuth code for a REFUSED consent', 'access_denied'],
+    ['a bad signature', 'SignatureDoesNotMatch: The request signature we calculated does not match'],
+    ['rate limiting', '429 Too Many Requests'],
+    ['rate limiting, Google wording', '403: User Rate Limit Exceeded, userRateLimitExceeded'],
+    ['rate limiting mid-copy', 'ERROR : x: Failed to copy: googleapi: Error 429: Rate Limit Exceeded, rateLimitExceeded'],
+    ['a truncated message', "couldn't fetch to"],
+    ['a truncated code', 'inval'],
+    ['a garbled message', ' garbled��'],
+    ['an empty string', ''],
+    ['whitespace only', '   '],
+    ['blank lines only', '\n\n\n'],
+    ['a token mentioned in passing', 'NOTICE: using token from the config file']
+];
+
+NOT_EXPIRY.forEach(([label, text]) => {
+    test('isAuthExpired: NOT expiry — ' + label, () => {
+        assert.equal(Rclone.isAuthExpired(text), false,
+            'reported as expiry: ' + JSON.stringify(text));
+    });
+});
+
+test('isAuthExpired: a quota refusal and a token mention are not one fact', () => {
+    // Pairing is per line. A stderr tail routinely carries an unrelated NOTICE
+    // about the config file forty lines from the error that actually stopped the
+    // backup; joining the two is the cheapest way to invent an expiry.
+    assert.equal(Rclone.isAuthExpired(
+        'ERROR : db.sql: Failed to copy: 403 Forbidden: storageQuotaExceeded\n' +
+        'NOTICE: using token from the config file'), false);
+    assert.equal(Rclone.isAuthExpired('403 Forbidden\nusing token from the config file'), false);
+});
+
+// --- a file NAME is not a diagnosis ----------------------------------------
+//
+// This is the class that got through. Both tools report the path they failed on,
+// and a backup tool of all things is pointed at directories full of files called
+// token, oauth2, bearer.key and invalid_grant.json. Reading the name as a signal
+// turns "permission denied" into "your sign-in expired".
+
+const PATHS_NOT_SIGNALS = [
+    ['a file called token', 'error: lstat /home/alice/token: permission denied'],
+    ['a log called token_expired.log', 'error: open /var/log/token_expired.log: permission denied'],
+    ['a directory called oauth2', 'error: lstat /srv/oauth2/data: permission denied'],
+    ['a key called bearer.key', 'error: open /home/bob/bearer.key: permission denied'],
+    ['a file called invalid_grant.json', 'Fatal: unable to open file /etc/hangar/invalid_grant.json: permission denied'],
+    ['a relative path with a 403', 'ERROR : secrets/token.json: Failed to copy: 403 Forbidden'],
+    ['a directory called token with a 403', 'ERROR : token/db.sql: Failed to copy: 403 Forbidden'],
+    ['a ./ path', 'error: lstat ./oauth2/data: permission denied'],
+    ['a ~/ path', 'error: lstat ~/tokens: permission denied'],
+    ['a ../ path', 'error: lstat ../bearer: permission denied'],
+    ['a URL whose path mentions tokens', 'Get "https://s3.example.com/bucket/token-store/x": 403 Forbidden']
+];
+
+PATHS_NOT_SIGNALS.forEach(([label, text]) => {
+    test('isAuthExpired: a path is not a signal — ' + label, () => {
+        assert.equal(Rclone.isAuthExpired(text), false,
+            'a filename was read as a diagnosis: ' + JSON.stringify(text));
+    });
+});
+
+test('isAuthExpired: masking a path does not mask the message beside it', () => {
+    // The mask must not become a way to lose a real expiry. rclone prints a
+    // timestamp with slashes and the object it was copying, and the sentence that
+    // matters comes after both.
+    assert.equal(Rclone.isAuthExpired(
+        '2026/07/31 03:00:12 ERROR : backups/db: Failed to copy: failed to open ' +
+        'source object: couldn\'t fetch token - maybe it has expired?'), true);
+    assert.equal(Rclone.isAuthExpired(
+        'Post "https://oauth2.googleapis.com/token": oauth2: cannot fetch token: 401'), true);
+});
+
+test('isAuthExpired: Dropbox\'s code survives the path mask despite its slash', () => {
+    // expired_access_token/... has a slash inside the API code for exactly this
+    // failure. A mask that blanked every slash-bearing run would delete the one
+    // word that decides and file a real expiry as "restic reported an error".
+    assert.equal(Rclone.isAuthExpired('{"error_summary":"expired_access_token/..."}'), true);
+    assert.equal(Rclone.isAuthExpired(
+        'unexpected HTTP status 401: {"error_summary": "expired_access_token/.", ' +
+        '"error": {".tag": "expired_access_token"}}'), true);
+});
+
+// --- the genuine wordings ---------------------------------------------------
+
+const IS_EXPIRY = [
+    ['rclone: couldn\'t fetch token', "couldn't fetch token - maybe it has expired?"],
+    ['rclone: with a typographic apostrophe', 'couldn’t fetch token - maybe it has expired?'],
+    ['rclone: with the apostrophe lost', 'couldnt fetch token'],
+    ['rclone: in the sentence it really appears in',
+        'Failed to create file system for "gd:x": couldn\'t fetch token - maybe it has expired?'],
+    ['rclone naming its own remedy', 'refresh with "rclone config reconnect gdrive:"'],
+    ['rclone: the bare command', 'rclone config reconnect box:'],
+    ['oauth2: no refresh token to renew with', 'oauth2: token expired and refresh token is not set'],
+    ['invalid_grant', 'invalid_grant'],
+    ['invalid_grant shouted', 'INVALID_GRANT'],
+    ['Google: expired or revoked',
+        '{"error":"invalid_grant","error_description":"Token has been expired or revoked."}'],
+    ['Google: the description alone', 'Token has been expired or revoked.'],
+    ['Box: 60 days of inactivity', 'Refresh token has expired'],
+    ['OneDrive: AADSTS700082', 'AADSTS700082: The refresh token has expired due to inactivity.'],
+    ['Dropbox: expired_access_token', 'expired_access_token'],
+    ['a 401 that names the credential', '401 Unauthorized: the bearer token is no longer accepted'],
+    ['a 401 that names the OAuth token',
+        'googleapi: Error 401: Expected OAuth 2 access token, ..., unauthorized']
+];
+
+IS_EXPIRY.forEach(([label, text]) => {
+    test('isAuthExpired: IS expiry — ' + label, () => {
+        assert.equal(Rclone.isAuthExpired(text), true,
+            'missed a real expiry: ' + JSON.stringify(text));
+    });
+});
+
+test('isAuthExpired: the sweep is not satisfied by a function that always says no', () => {
+    // A guard on the guard. If someone tightens the patterns until the
+    // false-positive half passes trivially, this fails.
+    assert.equal(NOT_EXPIRY.every(([, t]) => Rclone.isAuthExpired(t) === false), true);
+    assert.equal(IS_EXPIRY.every(([, t]) => Rclone.isAuthExpired(t) === true), true);
+    assert.ok(IS_EXPIRY.length >= 15);
+    assert.ok(NOT_EXPIRY.length >= 30);
+});
+
+// --- line separators --------------------------------------------------------
+
+test('isAuthExpired: a carriage return separates lines, as it does for the runner', () => {
+    // rclone's progress output is full of bare carriage returns. Treating one as
+    // an ordinary character joined a status code on one line to a token word on
+    // the next — a false expiry the Python copy, which splits on \r, never saw.
+    assert.equal(Rclone.isAuthExpired('403 Forbidden\rTransferred: 1 token of many'), false);
+    assert.equal(Rclone.isAuthExpired('403 Forbidden\r\nusing token from the config file'), false);
+});
+
+test('isAuthExpired: every separator Python splits on splits here too', () => {
+    // Spelled out rather than assumed: the two implementations must divide the
+    // same text into the same lines or they can reach different verdicts on it.
+    ['\r', '\n', '\r\n', '\v', '\f', '\x1c', '\x1d', '\x1e', '\x85', '\u2028', '\u2029']
+        .forEach((sep) => {
+            assert.equal(Rclone.isAuthExpired('403 Forbidden' + sep + 'oauth token'), false,
+                'joined across ' + JSON.stringify(sep));
+        });
+});
+
+test('isAuthExpired: a separator inside a phrase does not manufacture one either', () => {
+    assert.equal(Rclone.isAuthExpired("couldn't fetch\rtoken"), false);
+    assert.equal(Rclone.isAuthExpired('invalid\x85_grant'), false);
+});

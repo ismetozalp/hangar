@@ -1020,10 +1020,26 @@ const AUTH = { OAUTH: 'oauth', CREDENTIALS: 'credentials', EXTERNAL: 'external',
     // blanked out before the line is judged, leaving only the words the tool
     // wrote ABOUT the failure.
     //
-    // A run ends at a quote or a brace, so a JSON error body is not swallowed
-    // whole: Dropbox's {"error_summary":"expired_access_token/..."} keeps the
-    // `.tag` copy of the code, which is the one that decides.
-    const PATHISH_RE = /[^\s"'{}<>|]*\/[^\s"'{}<>|]*/g;
+    // What counts as a path is deliberately narrower than "contains a slash",
+    // and Dropbox is why. Its error body is
+    // {"error_summary":"expired_access_token/..."} — a slash inside the API code
+    // for precisely this failure. Blanking every slash-bearing run would delete
+    // the one word that decides and turn a real expiry into "restic reported an
+    // error". So a run only counts as a path when it says so:
+    //
+    //   1. it is a URL, or it starts with /, ./, ../ or ~/ — then everything from
+    //      that marker to the end of the run goes; or
+    //   2. it is a relative path that ENDS IN A FILE EXTENSION — secrets/token.json,
+    //      token/db.sql — where the whole thing goes.
+    //
+    // "expired_access_token/..." matches neither as a whole; only its "/..." tail
+    // goes, under rule 1, and the code itself survives to be recognised.
+    //
+    // A run ends at a quote or a brace, so a JSON error body is never swallowed
+    // whole either way.
+    const PATHISH_RE = new RegExp(
+        '(?:[A-Za-z][A-Za-z0-9+.-]*://|~/|\\.{1,2}/|/)[^\\s"\'{}<>|]*' +
+        '|[A-Za-z0-9_.@+-]+(?:/[A-Za-z0-9_.@+-]+)+\\.[A-Za-z0-9]{1,8}', 'g');
 
     function maskPaths(line) {
         return line.indexOf('/') < 0 ? line : line.replace(PATHISH_RE, ' ');
@@ -1048,7 +1064,7 @@ const AUTH = { OAUTH: 'oauth', CREDENTIALS: 'credentials', EXTERNAL: 'external',
     // status code and a token word — a false expiry the other side did not see.
     // Splitting on more is also the safe direction: fewer lines joined means
     // fewer accidental pairings.
-    const LINE_SPLIT_RE = /\r\n|[\n\r\v\f\x1c\x1d\x1e\x85  ]/;
+    const LINE_SPLIT_RE = /\r\n|[\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029]/;
 
     function isAuthExpired(text) {
         const s = str(text);

@@ -959,3 +959,379 @@ test('the module stays pure: no cockpit call and no ES module syntax', () => {
 test('the module registers its global as well as its CommonJS export', () => {
     assert.equal(globalThis.HangarSizeGuard, G);
 });
+
+// ============================================================ the second sweep
+//
+// Written as an attack on the module rather than a description of it. Every case
+// below is a way someone might get the guard to delete more than it should, or
+// to call a run that stopped a run that succeeded. The three questions are:
+//
+//   1. can any input reach a forget that takes the repository below the floor?
+//   2. can a malformed or hostile limit turn into a deletion rather than a refusal?
+//   3. does a run that stopped short read like a run that stopped short?
+
+// --- 1. the floor, swept over every count and every ordering ----------------
+
+function snapshotsAt(times) {
+    return times.map((t, i) => ({ id: String.fromCharCode(97 + i).repeat(64), time: t }));
+}
+
+function isoDay(n) {
+    return new Date(Date.UTC(2026, 0, 1 + n)).toISOString();
+}
+
+test('floor: no snapshot count, from 0 to 40, ever plans a forget below the floor', () => {
+    // The brute-force version of the module's one load-bearing rule. Far over the
+    // limit, so nothing except the floor can be what stops it.
+    for (let floor = 1; floor <= 6; floor++) {
+        for (let n = 0; n <= 40; n++) {
+            const snaps = snapshotsAt(Array.from({ length: n }, (_, i) => isoDay(i)));
+            const d = G.planTrim({
+                currentBytes: 1e15, limitBytes: 1, snapshots: snaps,
+                minSnapshots: floor, maxIterations: 1000
+            });
+            if (d.action === 'forget')
+                assert.ok(n - 1 >= floor,
+                    'planned a forget with ' + n + ' snapshots and a floor of ' + floor);
+            else
+                assert.ok(n <= floor,
+                    'refused to forget with ' + n + ' snapshots and a floor of ' + floor);
+        }
+    }
+});
+
+test('floor: a single snapshot is never the one that goes, at any floor', () => {
+    [undefined, null, 0, -100, 1, 3, 1e6].forEach((min) => {
+        const d = G.planTrim({
+            currentBytes: 1e15, limitBytes: 1,
+            snapshots: snapshotsAt([isoDay(0)]), minSnapshots: min
+        });
+        assert.equal(d.action, 'floor-reached', 'floor ' + min);
+        assert.equal(d.snapshot, null);
+    });
+});
+
+test('floor: zero snapshots is a stop, not a forget of nothing', () => {
+    const d = G.planTrim({ currentBytes: 1e15, limitBytes: 1, snapshots: [], minSnapshots: 1 });
+    assert.equal(d.action, 'floor-reached');
+    assert.equal(d.reason, 'no-snapshots');
+    assert.equal(d.snapshot, null);
+    assert.ok(d.remaining > 0, 'a stop must still report how far over it is');
+});
+
+test('floor: entries that are not objects do not count towards it and are not deleted', () => {
+    // Two real snapshots and a lot of noise: the count that matters is 2, so a
+    // floor of 2 stops. Counting the noise would let the guard delete a real one.
+    const real = snapshotsAt([isoDay(0), isoDay(1)]);
+    const d = G.planTrim({
+        currentBytes: 1e15, limitBytes: 1,
+        snapshots: [null, 'x', 7, [], undefined, real[0], real[1]],
+        minSnapshots: 2
+    });
+    assert.equal(d.action, 'floor-reached');
+    assert.equal(d.reason, 'floor');
+});
+
+test('floor: an unnameable snapshot still counts as surviving history', () => {
+    // Three entries, one with no id. The floor is about how much history is left,
+    // so the entry we cannot name still protects the two we can.
+    const d = G.planTrim({
+        currentBytes: 1e15, limitBytes: 1, minSnapshots: 3,
+        snapshots: [{ id: 'a'.repeat(64), time: isoDay(0) },
+            { id: 'b'.repeat(64), time: isoDay(1) },
+            { time: isoDay(2) }]
+    });
+    assert.equal(d.action, 'floor-reached');
+    assert.equal(d.reason, 'floor');
+});
+
+test('floor: nothing datable is a stop that says so, not a guess at the oldest', () => {
+    const d = G.planTrim({
+        currentBytes: 1e15, limitBytes: 1, minSnapshots: 1,
+        snapshots: [{ id: 'a'.repeat(64) }, { id: 'b'.repeat(64), time: '' },
+            { id: 'c'.repeat(64), time: 'yesterday' }, { id: 'd'.repeat(64), time: 1700000000 }]
+    });
+    assert.equal(d.action, 'floor-reached');
+    assert.equal(d.reason, 'undatable');
+    assert.equal(d.snapshot, null);
+    assert.match(G.describeOutcome(d), /cannot tell which is oldest/);
+});
+
+// --- 2. the oldest, in every ordering ---------------------------------------
+
+function permutations(a) {
+    if (a.length <= 1) return [a];
+    const out = [];
+    a.forEach((x, i) => {
+        const rest = a.slice(0, i).concat(a.slice(i + 1));
+        permutations(rest).forEach((p) => out.push([x].concat(p)));
+    });
+    return out;
+}
+
+test('oldest: every one of the 120 orderings of five snapshots picks the same one', () => {
+    const snaps = snapshotsAt([isoDay(4), isoDay(0), isoDay(3), isoDay(1), isoDay(2)]);
+    const want = snaps[1].id;                       // isoDay(0), the oldest
+    const orders = permutations(snaps);
+    assert.equal(orders.length, 120);
+    orders.forEach((order) => {
+        const d = G.planTrim({
+            currentBytes: 1e15, limitBytes: 1, snapshots: order, minSnapshots: 1
+        });
+        assert.equal(d.action, 'forget');
+        assert.equal(d.snapshot.id, want, 'ordering changed the choice');
+    });
+});
+
+test('oldest: sorted, reverse-sorted and shuffled input agree', () => {
+    const times = Array.from({ length: 12 }, (_, i) => isoDay(i));
+    const snaps = snapshotsAt(times);
+    const want = snaps[0].id;
+    const shuffled = snaps.slice();
+    // A fixed shuffle: a failure has to be reproducible.
+    [[0, 7], [1, 11], [2, 4], [3, 9], [5, 10], [6, 8]]
+        .forEach(([i, j]) => { const t = shuffled[i]; shuffled[i] = shuffled[j]; shuffled[j] = t; });
+    [snaps, snaps.slice().reverse(), shuffled].forEach((order) => {
+        const d = G.planTrim({
+            currentBytes: 1e15, limitBytes: 1, snapshots: order, minSnapshots: 1
+        });
+        assert.equal(d.snapshot.id, want);
+    });
+});
+
+test('oldest: duplicate timestamps break on id, identically for every ordering', () => {
+    // Two snapshots taken in the same second is ordinary — two jobs on one
+    // repository, or a manual run beside the timer. Without a tie-break the
+    // choice would depend on array order, which is exactly what this module
+    // refuses to trust.
+    const same = '2026-03-01T02:00:00Z';
+    const snaps = [
+        { id: 'c'.repeat(64), time: same },
+        { id: 'a'.repeat(64), time: same },
+        { id: 'b'.repeat(64), time: same },
+        { id: 'd'.repeat(64), time: '2026-06-01T02:00:00Z' }   // plainly later
+    ];
+    permutations(snaps).forEach((order) => {
+        const d = G.planTrim({
+            currentBytes: 1e15, limitBytes: 1, snapshots: order, minSnapshots: 1
+        });
+        assert.equal(d.action, 'forget');
+        assert.equal(d.snapshot.id, 'a'.repeat(64));
+    });
+});
+
+test('oldest: a mixture of datable and undatable never picks an undatable one', () => {
+    const snaps = [
+        { id: 'a'.repeat(64), time: 'not a date' },
+        { id: 'b'.repeat(64), time: isoDay(9) },
+        { id: 'c'.repeat(64) },
+        { id: 'd'.repeat(64), time: isoDay(2) },
+        { id: 'e'.repeat(64), time: null }
+    ];
+    permutations(snaps).forEach((order) => {
+        const d = G.planTrim({
+            currentBytes: 1e15, limitBytes: 1, snapshots: order, minSnapshots: 1
+        });
+        assert.equal(d.action, 'forget');
+        assert.equal(d.snapshot.id, 'd'.repeat(64), 'chose an undatable or a newer one');
+    });
+});
+
+test('oldest: an epoch number is never read as a time, in either direction', () => {
+    // A bare number could be seconds or milliseconds, and the factor of 1000
+    // between them reverses the list. Refused, so the entry is simply undatable —
+    // and here that leaves the ISO one as the only candidate even though its
+    // number is far larger.
+    const d = G.planTrim({
+        currentBytes: 1e15, limitBytes: 1, minSnapshots: 1,
+        snapshots: [{ id: 'a'.repeat(64), time: 0 },
+            { id: 'b'.repeat(64), time: 1 },
+            { id: 'c'.repeat(64), time: isoDay(100) }]
+    });
+    assert.equal(d.snapshot.id, 'c'.repeat(64));
+});
+
+// --- 3. a hostile limit must refuse, never delete ---------------------------
+
+const HOSTILE_LIMITS = [
+    ['a negative size', '-5G'],
+    ['a negative number', -5e9],
+    ['negative zero', '-0'],
+    ['an exponent', '1e999'],
+    ['a small exponent', '1e3'],
+    ['letters', 'abc'],
+    ['null', null],
+    ['undefined', undefined],
+    ['an empty string', ''],
+    ['whitespace', '   '],
+    ['a boolean', true],
+    ['an object', {}],
+    ['an array', []],
+    ['a number in an array', [500]],
+    ['a number past MAX_SAFE_INTEGER', Number.MAX_SAFE_INTEGER + 1],
+    ['a huge float', 1e308],
+    ['Infinity', Infinity],
+    ['NaN', NaN],
+    ['400 digits', '9'.repeat(400)],
+    ['400 digits with a unit', '9'.repeat(400) + 'G'],
+    ['a NUL after the unit', '500G' + NUL],
+    ['a NUL before the number', NUL + '500G'],
+    ['a NUL inside the number', '5' + NUL + '00G'],
+    ['a thousands separator', '500,000'],
+    ['an underscore separator', '500_000'],
+    ['hexadecimal', '0x10'],
+    ['trailing words', '500GB extra'],
+    ['a four-letter unit', '500GBBB'],
+    ['an unknown unit', '500%'],
+    ['a constructor collision', '500constructor'],
+    ['two decimal points', '5.5.5G'],
+    ['a leading plus', '+5G'],
+    ['Arabic-Indic digits', '٥٠٠GB'],
+    ['fullwidth letters', '500ＧＢ'],
+    ['a very long string', LONG]
+];
+
+HOSTILE_LIMITS.forEach(([what, value]) => {
+    test('a hostile limit refuses rather than deletes — ' + what, () => {
+        const bytes = G.parseSize(value);
+        // Either unreadable, or readable and not a usable limit. Never a usable
+        // positive number invented out of junk.
+        if (bytes !== null) assert.ok(bytes <= 0, what + ' parsed to ' + bytes);
+
+        // The invariant, whatever the value turns out to be: it never becomes a
+        // deletion. Handed straight to planTrim as bytes, and handed to it again
+        // as whatever parseSize made of it.
+        const snaps = snapshotsAt([isoDay(0), isoDay(1), isoDay(2), isoDay(3)]);
+        [value, bytes].forEach((limitBytes) => {
+            const d = G.planTrim({
+                currentBytes: 1e15, limitBytes: limitBytes, minSnapshots: 1, snapshots: snaps
+            });
+            assert.notEqual(d.action, 'forget', what + ' planned a deletion');
+            assert.equal(d.snapshot, null);
+            // A value that is not a usable byte count must be refused outright.
+            // A finite positive one that merely dwarfs the repository — 1e308 —
+            // is a real limit nothing will ever exceed, and 'under-limit' is the
+            // honest answer to it.
+            const usable = typeof limitBytes === 'number' &&
+                Number.isFinite(limitBytes) && limitBytes > 0;
+            assert.equal(d.reason, usable ? 'under-limit' : 'no-limit', what);
+        });
+
+        // And the editor blocks the save, so a limit nobody can read never
+        // reaches a runner at all.
+        if (value !== undefined && value !== null && value !== '')
+            assert.equal(G.hasBlockingProblem(G.validateGuard({ limit: value })), true,
+                what + ' would have saved');
+    });
+});
+
+test('a limit that is an unmeasurable size deletes nothing even when far over', () => {
+    // The dangerous direction: "I could not measure it" must never become
+    // "delete until it fits".
+    [undefined, null, NaN, Infinity, -1, '600', true, {}, []].forEach((current) => {
+        const d = G.planTrim({
+            currentBytes: current, limitBytes: 1, minSnapshots: 1,
+            snapshots: snapshotsAt([isoDay(0), isoDay(1), isoDay(2), isoDay(3)])
+        });
+        assert.equal(d.action, 'none', label(current));
+        assert.equal(d.reason, 'unknown-size');
+        assert.equal(d.remaining, 0);
+    });
+});
+
+// --- 4. a stopped run must read as stopped ---------------------------------
+
+test('a floor-reached run never reads as a success', () => {
+    ['floor', 'no-snapshots', 'undatable'].forEach((reason) => {
+        const s = G.describeOutcome({ action: 'floor-reached', reason: reason, remaining: 40e9 });
+        assert.match(s, /^Stopped:/, reason);
+        assert.match(s, /still 40 GB over/, reason);
+        assert.equal(/within its size limit/.test(s), false, reason);
+        assert.equal(/success|succeeded|completed/i.test(s), false, reason);
+    });
+});
+
+test('an exhausted run never reads as a success', () => {
+    const s = G.describeOutcome({ action: 'exhausted', reason: 'budget', remaining: 12e9 });
+    assert.match(s, /^Stopped after/);
+    assert.match(s, /still 12 GB over/);
+    assert.equal(/within its size limit/.test(s), false);
+});
+
+test('a stop with no measured overshoot still says it is over', () => {
+    // remaining may be missing or unreadable on a record that came back from the
+    // runner. The sentence must not quietly become "the repository is fine".
+    [undefined, null, 0, -1, NaN, 'lots', {}].forEach((remaining) => {
+        const s = G.describeOutcome({ action: 'floor-reached', reason: 'floor', remaining: remaining });
+        assert.match(s, /still over its size limit/, label(remaining));
+    });
+});
+
+test('an unmeasurable run says nothing was changed, never that it is within limit', () => {
+    const s = G.describeOutcome({ action: 'none', reason: 'unknown-size', remaining: 0 });
+    assert.match(s, /could not be measured/);
+    assert.match(s, /Nothing was changed/);
+});
+
+test('an unrecognised outcome is reported as unrecognised, not smoothed into success', () => {
+    [{}, null, undefined, 'ok', 42, { action: 'done' }, { action: 'forget-all' },
+        { action: 'none', reason: 'made up' }].forEach((r) => {
+        const s = G.describeOutcome(r);
+        assert.equal(typeof s, 'string');
+        assert.equal(/^Stopped/.test(s) || /no usable decision/.test(s) ||
+            /within its size limit/.test(s), true, label(r) + ' -> ' + s);
+        assert.equal(/deleted \d/.test(s), false);
+    });
+});
+
+test('only under-limit and no-limit are allowed to read as "nothing to do"', () => {
+    // The inverse of the sweep above: enumerate everything that MAY produce a
+    // reassuring sentence, so a new action cannot join the list by accident.
+    const reassuring = /within its size limit|No size limit is set/;
+    [['none', 'under-limit'], ['none', 'no-limit'], ['none', 'unknown-size'],
+        ['forget', 'oldest'], ['floor-reached', 'floor'], ['floor-reached', 'no-snapshots'],
+        ['floor-reached', 'undatable'], ['exhausted', 'budget']]
+        .forEach(([action, reason]) => {
+            const s = G.describeOutcome({
+                action: action, reason: reason, remaining: action === 'none' ? 0 : 5e9,
+                snapshot: { shortId: 'deadbeef' }
+            });
+            const ok = action === 'none' && (reason === 'under-limit' || reason === 'no-limit');
+            assert.equal(reassuring.test(s), ok, action + '/' + reason + ' -> ' + s);
+        });
+});
+
+// --- 5. the budget ----------------------------------------------------------
+
+test('the budget stops the loop, and the floor is reported ahead of it', () => {
+    const snaps = snapshotsAt([isoDay(0), isoDay(1), isoDay(2), isoDay(3)]);
+    const spent = G.planTrim({
+        currentBytes: 1e15, limitBytes: 1, snapshots: snaps,
+        minSnapshots: 1, iterations: 20, maxIterations: 20
+    });
+    assert.equal(spent.action, 'exhausted');
+    assert.equal(spent.reason, 'budget');
+
+    // When both apply, the floor wins: it is the durable condition, and saying
+    // "budget spent" would invite an operator to raise the budget and re-run,
+    // which cannot help.
+    const both = G.planTrim({
+        currentBytes: 1e15, limitBytes: 1, snapshots: snaps,
+        minSnapshots: 4, iterations: 20, maxIterations: 20
+    });
+    assert.equal(both.action, 'floor-reached');
+    assert.equal(both.reason, 'floor');
+});
+
+test('an unreadable iteration count cannot buy extra passes', () => {
+    // "We do not know how many passes have run" reads as zero, which is safe only
+    // because the budget still bounds the loop; a negative or fractional count
+    // must not become a licence to keep going past it.
+    [-1, -1e9, 2.5, NaN, Infinity, '100', null, undefined, true, {}].forEach((it) => {
+        const d = G.planTrim({
+            currentBytes: 1e15, limitBytes: 1, minSnapshots: 1, iterations: it,
+            maxIterations: 0, snapshots: snapshotsAt([isoDay(0), isoDay(1)])
+        });
+        assert.equal(d.action, 'exhausted', label(it));
+    });
+});

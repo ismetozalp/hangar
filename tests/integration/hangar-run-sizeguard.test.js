@@ -85,6 +85,15 @@ if cmd == "snapshots":
     sys.exit(0)
 
 if cmd == "stats":
+    # Counted so a test can fail the measurement that comes AFTER a prune, which
+    # is the one place the guard has already deleted something when it loses the
+    # ability to tell how much good it did.
+    st["stats_calls"] = st.get("stats_calls", 0) + 1
+    save()
+    if st.get("stats_fails_after") and st["stats_calls"] > st["stats_fails_after"]:
+        sys.stderr.write("stub: stats was told to fail after %d calls\\n"
+                         % st["stats_fails_after"])
+        sys.exit(1)
     mode = ""
     if "--mode" in argv:
         i = argv.index("--mode")
@@ -360,7 +369,12 @@ const SIZE_CASES = [
     '1e3 GB', '0x10', '1,000 GB', '1_000 GB', '500 GB extra', 'GB', '', '   ',
     '500\nGB', '500 GB\n', '500 QB', '500 gigabytes', '.5 GB', '5.', '5..0 GB',
     '+500 GB', '--500 GB', '500 -GB', 'Infinity', 'NaN', '500\tGB', '٥٠٠ GB',
-    500, 500.6, -500, 0, 1e21, null, true, false
+    500, 500.6, -500, 0, 1e21, null, true, false,
+    // The exact edge of an exact number. floor(x + 0.5) is not Math.round up
+    // here: past 2**52 the "+ 0.5" is not representable and rounds up on its
+    // own, so the runner refused the largest limit the editor accepts.
+    9007199254740991, '9007199254740991', '9007199254740991B', 9007199254740992,
+    '9007199254740992', 4503599627370497, '4503599627370497'
 ];
 
 test('hangar-run and js/core/sizeguard.js read every size the same way', () => {
@@ -828,4 +842,250 @@ test('nothing the guard does ever raises', () => {
                 assert.ok(r.status === 0, 'exit ' + r.status + ' for ' + JSON.stringify(guard));
             });
     });
+});
+
+// ======================================================= the shape on disk
+//
+// The guard's logic was right and it never ran. hangar-run looked for a nested
+// `sizeGuard` object; js/features/repos-ui.js has always saved the limit FLAT, as
+// `sizeLimit` and `minSnapshots` beside `kind` and `path`, and js/core/repos.js
+// reads it there to validate and describe the repository. Nothing wrote the shape
+// the runner read, so every size limit configured in the editor was silently
+// ignored — and the failure was invisible from both ends, because the editor
+// echoed "Understood as 500 GB" and the runner reported a clean backup.
+//
+// These tests build the repository through the editor's own function rather than
+// by hand, which is what the corpus above could not do: a hand-written fixture
+// agrees with whatever the runner happens to read, whichever that is.
+
+const ReposUi = require('../../js/features/repos-ui.js');
+
+// Exactly what the editor saves when someone fills in the size section.
+function repoAsSaved(form) {
+    return ReposUi.formStateToRepo('local', Object.assign(
+        { id: 'main', path: '/srv/backup' }, form));
+}
+
+test('a repository saved by the editor actually gets a guard', () => {
+    const repo = repoAsSaved({ sizeLimit: '500 GB', minSnapshots: '5' });
+    // The premise, asserted rather than assumed: this is the flat shape.
+    assert.equal(repo.sizeLimit, '500 GB');
+    assert.equal(repo.minSnapshots, 5);
+    assert.equal(repo.sizeGuard, undefined);
+
+    withHost(repo, JOB, { snapshots: [] }, (host) => {
+        const guard = plan(host.dir, JOB.id).guard;
+        assert.ok(guard, 'the editor saved a size limit the runner cannot see');
+        assert.equal(guard.limit, '500 GB');
+        assert.equal(guard.limitBytes, 500 * GB);
+        assert.equal(guard.minSnapshots, 5);
+        assert.equal(guard.maxIterations, Guard.DEFAULTS.maxIterations);
+    });
+});
+
+test('a repository saved by the editor is measured and trimmed for real', () => {
+    // End to end on the shape that exists on real hosts: over the limit, the
+    // oldest goes first, and the run comes back inside the limit.
+    withHost(repoAsSaved({ sizeLimit: '70 GB', minSnapshots: '1' }), JOB,
+        { raw: 100 * GB, grow: 0, free_per_forget: 20 * GB, snapshots: SNAPS }, (host) => {
+            const r = host.run();
+            assert.equal(r.status, 0, r.stderr);
+            const forgets = guardForgets(host.calls());
+            assert.equal(forgets.length, 2);
+            assert.ok(forgets[0].includes(SNAPS[0].id), 'did not forget the oldest first');
+            assert.ok(forgets[1].includes(SNAPS[1].id));
+            assert.equal(r.state.status, 'ok');
+            assert.equal(r.state.size_guard.action, 'none');
+            assert.equal(r.state.size_guard.reason, 'under-limit');
+        });
+});
+
+test('the editor\'s floor is the floor the runner applies', () => {
+    // The number that stops the deleting has to be the one the user typed. The
+    // backup adds a fifth snapshot to the four already there, so a floor of 4
+    // permits exactly ONE deletion — while the module's own default of 3, which
+    // is what a runner that could not see the user's setting would fall back to,
+    // would take two. The count is the assertion.
+    withHost(repoAsSaved({ sizeLimit: '1 GB', minSnapshots: '4' }), JOB,
+        { raw: 100 * GB, grow: 0, free_per_forget: 0, snapshots: SNAPS }, (host) => {
+            const r = host.run();
+            assert.equal(r.status, 0, r.stderr);
+            const forgets = guardForgets(host.calls());
+            assert.equal(forgets.length, 1, 'deleted past the floor the editor showed');
+            assert.ok(forgets[0].includes(SNAPS[0].id), 'did not take the oldest');
+            assert.equal(r.state.size_guard.min_snapshots, 4);
+            assert.equal(r.state.size_guard.reason, 'floor');
+            // Still over, and the run says so rather than reporting a clean night.
+            assert.equal(r.state.status, 'size-limit-exceeded');
+            assert.match(r.stderr, /still .* over its size limit/);
+        });
+});
+
+test('a floor already reached in the editor\'s shape deletes nothing at all', () => {
+    // Four snapshots plus the one this run wrote, and a floor of 5: nothing may
+    // go, and the run must say it is still over instead of claiming success.
+    withHost(repoAsSaved({ sizeLimit: '1 GB', minSnapshots: '5' }), JOB,
+        { raw: 100 * GB, grow: 0, free_per_forget: 0, snapshots: SNAPS }, (host) => {
+            const r = host.run();
+            assert.equal(r.status, 0, r.stderr);
+            assert.deepEqual(guardForgets(host.calls()), [],
+                'deleted despite the floor already being reached');
+            assert.equal(host.repo().snapshots.length, SNAPS.length + 1);
+            assert.equal(r.state.size_guard.reason, 'floor');
+            assert.equal(r.state.status, 'size-limit-exceeded');
+            assert.match(Guard.describeOutcome(r.state.size_guard), /^Stopped:/);
+        });
+});
+
+test('a repository the editor saved with no limit still runs without a guard', () => {
+    const repo = repoAsSaved({ minSnapshots: '5' });
+    assert.equal(repo.sizeLimit, undefined);
+    assert.equal(repo.minSnapshots, 5, 'the floor is kept even with no limit');
+    withHost(repo, JOB, { snapshots: [] }, (host) => {
+        assert.equal(plan(host.dir, JOB.id).guard, null);
+        const r = host.run();
+        assert.equal(r.status, 0, r.stderr);
+        assert.equal(r.state.size_guard, undefined);
+        assert.deepEqual(subcommandsOf(host.calls()), ['backup']);
+    });
+});
+
+test('the flat limit wins over a stale nested one', () => {
+    // Both present is not a shape anything writes, but a hand-edited file can
+    // carry it. The editor's field is the one the user is looking at and the one
+    // the next save overwrites, so it is the one that must apply.
+    const repo = Object.assign(repoAsSaved({ sizeLimit: '2 GB', minSnapshots: '2' }),
+        { sizeGuard: { limit: '900 GB', minSnapshots: 9 } });
+    withHost(repo, JOB, { snapshots: [] }, (host) => {
+        const guard = plan(host.dir, JOB.id).guard;
+        assert.equal(guard.limit, '2 GB');
+        assert.equal(guard.minSnapshots, 2);
+    });
+});
+
+test('a nested guard alone still works, so a hand-written file is not dropped', () => {
+    withHost(repoWithGuard({ limit: '3 GB', minSnapshots: 2, maxIterations: 4 }), JOB,
+        { snapshots: [] }, (host) => {
+            const guard = plan(host.dir, JOB.id).guard;
+            assert.equal(guard.limit, '3 GB');
+            assert.equal(guard.minSnapshots, 2);
+            assert.equal(guard.maxIterations, 4);
+        });
+});
+
+// ================================================ a hostile limit on disk
+//
+// The repository file is root-owned, but it is still a file someone edits by
+// hand, restores from a backup of /etc, or writes with a script. Every one of
+// these must produce a refusal and a warning — never a deletion, and never a
+// failed run, because refusing to back up over a typo in one optional field
+// leaves the host with no backups at all.
+
+const NUL = '\u0000';
+
+const HOSTILE_ON_DISK = [
+    ['a negative size', '-5G'],
+    ['a negative number', -5000000000],
+    ['an exponent', '1e999'],
+    ['letters', 'abc'],
+    ['zero', '0'],
+    ['zero bytes as a number', 0],
+    ['a boolean', true],
+    ['an object', { limit: '500 GB' }],
+    ['an array', ['500 GB']],
+    ['a number past MAX_SAFE_INTEGER', 9007199254740992],
+    ['400 digits', '9'.repeat(400)],
+    ['a NUL after the unit', '500G' + NUL],
+    ['a NUL inside the number', '5' + NUL + '00G'],
+    ['a thousands separator', '500,000 GB'],
+    ['trailing words', '500GB extra'],
+    ['an unknown unit', '500 QB'],
+    ['whitespace only', '   '],
+    ['a newline in the middle', '500\nGB'],
+    ['a very long string', 'x'.repeat(10000)]
+];
+
+HOSTILE_ON_DISK.forEach(([what, limit]) => {
+    test('a hostile limit on disk refuses and warns, and never deletes — ' + what, () => {
+        const repo = Object.assign(repoAsSaved({ minSnapshots: '1' }), { sizeLimit: limit });
+        withHost(repo, JOB, { raw: 900 * GB, grow: 0, free_per_forget: 900 * GB,
+            snapshots: SNAPS }, (host) => {
+            assert.equal(plan(host.dir, JOB.id).guard, null, what + ' produced a guard');
+            const r = host.run();
+            // The backup still happens. That is the whole point of warning rather
+            // than dying: one bad optional field must not cost a night's backup.
+            assert.equal(r.status, 0, r.stderr);
+            assert.equal(r.state.status, 'ok');
+            assert.deepEqual(guardForgets(host.calls()), [], what + ' deleted a snapshot');
+            assert.equal(host.repo().snapshots.length, SNAPS.length + 1,
+                what + ' lost a snapshot');
+            // Nothing was even measured: with no usable limit there is nothing to
+            // measure against.
+            assert.deepEqual(subcommandsOf(host.calls()), ['backup']);
+            assert.match(r.stderr, /size limit/, what + ' passed in silence');
+        });
+    });
+});
+
+test('a limit hangar cannot read is named in the warning, so it can be corrected', () => {
+    const repo = Object.assign(repoAsSaved({ minSnapshots: '1' }), { sizeLimit: '500 QB' });
+    withHost(repo, JOB, { snapshots: [] }, (host) => {
+        const warnings = plan(host.dir, JOB.id).warnings;
+        const w = warnings.find((x) => x.code === 'limit-unparseable');
+        assert.ok(w, 'no unparseable warning: ' + JSON.stringify(warnings));
+        assert.equal(w.limit, '500 QB');
+        assert.match(w.message, /no snapshots will be deleted for size/);
+    });
+});
+
+test('a limit of zero is refused as a limit, not obeyed as one, in the flat shape', () => {
+    // The dangerous misreading of zero: "everything is over the limit".
+    const repo = Object.assign(repoAsSaved({ minSnapshots: '1' }), { sizeLimit: '0' });
+    withHost(repo, JOB, { raw: 900 * GB, grow: 0, free_per_forget: 900 * GB,
+        snapshots: SNAPS }, (host) => {
+        const warnings = plan(host.dir, JOB.id).warnings;
+        assert.ok(warnings.some((x) => x.code === 'limit-not-positive'));
+        const r = host.run();
+        assert.deepEqual(guardForgets(host.calls()), []);
+        assert.equal(r.state.status, 'ok');
+    });
+});
+
+test('a measurement that fails after a prune stops, and never reports success', () => {
+    // The worst moment to lose the measurement: a snapshot has already been
+    // deleted, so the guard has done real damage and can no longer say whether it
+    // helped. It must stop there, report the overshoot it last knew about, and
+    // never let the run come back as a clean night.
+    withHost(repoAsSaved({ sizeLimit: '10 GB', minSnapshots: '1' }), JOB,
+        { raw: 100 * GB, grow: 0, free_per_forget: 90 * GB, snapshots: SNAPS,
+            stats_fails_after: 1 }, (host) => {
+            const r = host.run();
+            assert.equal(r.status, 0, r.stderr, 'a written snapshot must not fail the unit');
+            assert.equal(guardForgets(host.calls()).length, 1, 'it kept deleting blind');
+            assert.equal(r.state.size_guard.action, 'none');
+            assert.equal(r.state.size_guard.reason, 'unknown-size');
+            assert.match(r.state.size_guard.error, /could not be measured after pruning/);
+            // The overshoot it last measured, not zero: "we stopped knowing" is
+            // not "we finished".
+            assert.ok(r.state.size_guard.remaining > 0);
+            assert.equal(r.state.status, 'size-limit-exceeded');
+            assert.match(r.stderr, /still 90 GB over its size limit/);
+            assert.match(Guard.describeOutcome(r.state.size_guard), /Nothing was changed/);
+        });
+});
+
+test('a prune that fails on the second pass stops there, still over and saying so', () => {
+    // The first forget works, the second is refused. The guard must not keep
+    // hammering a repository that will not let go of anything.
+    withHost(repoAsSaved({ sizeLimit: '10 GB', minSnapshots: '1' }), JOB,
+        { raw: 100 * GB, grow: 0, free_per_forget: 5 * GB, snapshots: SNAPS,
+            forget_fails_on: SNAPS[1].id }, (host) => {
+            const r = host.run();
+            assert.equal(r.status, 0, r.stderr);
+            assert.equal(guardForgets(host.calls()).length, 2);
+            assert.equal(r.state.size_guard.forgotten.length, 1);
+            assert.match(r.state.size_guard.error, /failed with exit 1/);
+            assert.equal(r.state.status, 'size-limit-exceeded');
+            assert.match(r.stderr, /still .* over its size limit/);
+        });
 });

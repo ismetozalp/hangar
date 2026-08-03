@@ -104,6 +104,37 @@ AUTH_SIGNAL_RE = re.compile(
     r"(\boauth2?\b|\btokens?\b|\bbearer\b|invalid_grant|grant_type|\bre-?authoriz\w*)",
     re.IGNORECASE)
 
+# A file NAME is not a diagnosis. Mirrors PATHISH_RE in js/core/rclone.js.
+#
+# restic and rclone both report the path they failed on, and a path may contain
+# the very words that decide here: /home/u/.config/gcloud/token,
+# secrets/token.json, /srv/oauth2/data, bearer.key, invalid_grant.json,
+# /var/log/token_expired.log. Read as signal, any of those turns an ordinary
+# "permission denied" or "403 Forbidden" into "your sign-in expired" — the
+# operator re-authorises a destination that was never the problem while the real
+# cause is hidden.
+#
+# What counts as a path is narrower than "contains a slash", and Dropbox is why:
+# its error body is {"error_summary": "expired_access_token/..."}, a slash inside
+# the API code for precisely this failure. Blanking every slash-bearing run would
+# delete the one word that decides. So a run only counts as a path when it says
+# so: it is a URL or starts with /, ./, ../ or ~/ (everything from that marker
+# goes), or it is a relative path ending in a file extension — secrets/token.json,
+# token/db.sql — in which case the whole thing goes. "expired_access_token/..."
+# matches neither as a whole; only its "/..." tail goes, and the code survives.
+PATHISH_RE = re.compile(
+    r"(?:[A-Za-z][A-Za-z0-9+.-]*://|~/|\.{1,2}/|/)[^\s\"'{}<>|]*"
+    r"|[A-Za-z0-9_.@+-]+(?:/[A-Za-z0-9_.@+-]+)+\.[A-Za-z0-9]{1,8}")
+
+# Exactly what Python's str.splitlines() breaks on, spelled out so the JavaScript
+# can match it character for character. splitlines() was used here and /\r?\n/
+# there, and the difference is not academic: a bare CARRIAGE RETURN, which fills
+# rclone's progress output, is a line break to one and an ordinary character to
+# the other. "403 Forbidden\rTransferred: 1 token" was one line on the JavaScript
+# side, carrying a status code and a token word — a false expiry the runner never
+# saw.
+LINE_SPLIT_RE = re.compile("\r\n|[\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029]")
+
 # Kinds whose classification is only a guess, and so may be improved by reading
 # the text. 10/11/12 carry restic's own authoritative answer; 0/3/130 must never
 # be reclassified, because exit 3 WROTE the snapshot.
@@ -116,6 +147,10 @@ def _line_is_expiry(line):
     return bool(AMBIGUOUS_AUTH_RE.search(line) and AUTH_SIGNAL_RE.search(line))
 
 
+def _mask_paths(line):
+    return PATHISH_RE.sub(" ", line) if "/" in line else line
+
+
 def auth_expired(text):
     """True when this stderr says the destination's sign-in has expired.
 
@@ -124,11 +159,23 @@ def auth_expired(text):
     the false positive worth avoiding — a wrong "your login expired" sends the
     operator through a pointless re-authorisation and hides the real cause.
 
-    Each line is also tried with its underscores opened out, because '_' is a
+    Anything shaped like a path is blanked out first, for the same reason: the
+    words that decide have to come from what the tool said about the failure, not
+    from the name of the file it failed on.
+
+    Each line is then tried with its underscores opened out, because '_' is a
     word character: r"\\btoken\\b" does not match inside Dropbox's
     "expired_access_token", which is the API code for precisely this failure.
+    Masking comes first — opening out the underscores of a path we are about to
+    discard would only invent phrases to match on.
     """
-    for line in (text or "").splitlines():
+    # Not `text or ""`: a non-string would reach .splitlines() and raise an
+    # AttributeError out of a classifier whose whole contract is to answer
+    # yes or no. isAuthExpired() answers False for the same input.
+    if not isinstance(text, str) or not text:
+        return False
+    for line in LINE_SPLIT_RE.split(text):
+        line = _mask_paths(line)
         if not line:
             continue
         if _line_is_expiry(line):
@@ -910,12 +957,25 @@ GUARD_TIME_RE = re.compile(
 
 
 def js_round(x):
-    """Math.round: half rounds towards +infinity.
+    """Math.round: half rounds towards +infinity, and an integer comes back as is.
 
-    Python's round() is banker's rounding — round(2.5) is 2, Math.round(2.5) is 3 —
-    and a limit that differs between the editor and the runner is a limit nobody
-    can reason about.
+    Two different traps, and both were live here:
+
+      - Python's round() is banker's rounding. round(2.5) is 2, Math.round(2.5)
+        is 3, so round() cannot be used at all.
+      - floor(x + 0.5) is not Math.round either. Past 2**52 the "+ 0.5" is not
+        representable and rounds up on its own: floor(9007199254740991 + 0.5) is
+        9007199254740992, one past MAX_SAFE_INT, so parse_size() refused the
+        largest limit the editor accepts. ECMA-262 returns an integral argument
+        unchanged, and so does this.
+
+    A limit that differs between the editor and the runner is a limit nobody can
+    reason about, which is why the corpus test drives both over the same strings.
     """
+    if isinstance(x, int):
+        return x
+    if math.isfinite(x) and float(x).is_integer():
+        return int(x)
     return int(math.floor(x + 0.5))
 
 
@@ -1172,6 +1232,41 @@ def plan_trim(cfg):
     return trim_decision("forget", best[0], "oldest", remaining)
 
 
+def guard_settings(repo, warnings):
+    """The three size-guard fields, wherever this repository keeps them.
+
+    FLAT is the shape the product writes. formStateToRepo() in
+    js/features/repos-ui.js saves `sizeLimit` and `minSnapshots` beside `kind` and
+    `path`, and validate()/describe() in js/core/repos.js read them from there.
+    This helper used to look only for a nested `sizeGuard` object, which nothing
+    has ever written — so every size limit configured in the editor was silently
+    ignored and the guard never ran on a real host. The failure was invisible from
+    both ends: the editor echoed "Understood as 500 GB" and the runner reported a
+    clean backup.
+
+    The nested object is still read, second, so a hand-written or older
+    repository file keeps working. Flat wins if somehow both are present: it is
+    the one the editor will overwrite on the next save, so it is the one the user
+    is looking at.
+    """
+    nested = repo.get("sizeGuard")
+    if nested is not None and nested != "" and nested != {} and not isinstance(nested, dict):
+        warn(warnings, "size-guard", "guard-not-object",
+             "the repository's size guard is not an object, so no size limit is "
+             "enforced and no snapshots will be deleted for size")
+        nested = None
+    if not isinstance(nested, dict):
+        nested = {}
+
+    def field(flat_key, nested_key):
+        v = repo.get(flat_key)
+        return nested.get(nested_key) if v is None or v == "" else v
+
+    return (field("sizeLimit", "limit"),
+            field("minSnapshots", "minSnapshots"),
+            field("maxIterations", "maxIterations"))
+
+
 def guard_config(repo, warnings):
     """The repository's size guard, or None when it has none.
 
@@ -1181,16 +1276,7 @@ def guard_config(repo, warnings):
     still happens, nothing is deleted for size, and the reason is in the plan and in
     the journal where an operator can see it.
     """
-    cfg = repo.get("sizeGuard")
-    if cfg is None or cfg == "" or cfg == {}:
-        return None
-    if not isinstance(cfg, dict):
-        warn(warnings, "size-guard", "guard-not-object",
-             "the repository's size guard is not an object, so no size limit is "
-             "enforced and no snapshots will be deleted for size")
-        return None
-
-    raw = cfg.get("limit")
+    raw, min_snapshots, max_iterations = guard_settings(repo, warnings)
     if raw is None or raw == "":
         return None
 
@@ -1211,8 +1297,8 @@ def guard_config(repo, warnings):
     return {
         "limit": str(raw),
         "limitBytes": limit_bytes,
-        "minSnapshots": effective_floor(cfg.get("minSnapshots")),
-        "maxIterations": effective_budget(cfg.get("maxIterations")),
+        "minSnapshots": effective_floor(min_snapshots),
+        "maxIterations": effective_budget(max_iterations),
     }
 
 
