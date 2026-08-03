@@ -149,6 +149,41 @@ body {
 .hangar-badge.modified { background: var(--bs-warning-bg-subtle, rgba(237, 108, 2, 0.18)); color: var(--hangar-warn); }
 .hangar-badge.removed  { background: var(--bs-danger-bg-subtle, rgba(198, 40, 40, 0.18));  color: var(--hangar-err); }
 
+/* --- scrollable modals with a <form> wrapper ---------------------------- */
+
+/* Bootstrap's .modal-dialog-scrollable constrains .modal-body because the body is
+ * a FLEX CHILD of .modal-content. Four of hangar's modals wrap header/body/footer
+ * in a <form> so Enter submits the dialog — and that block-level form breaks the
+ * chain: it grows to its content, the body is never constrained, and a tall form
+ * runs off the bottom of the screen with no scrollbar and no reachable buttons.
+ *
+ * Re-establish the chain through the form. min-height: 0 is the load-bearing part:
+ * a flex item defaults to min-height: auto, which refuses to shrink below its
+ * content and is why the body measured 1517px inside a 644px dialog. */
+.modal-dialog-scrollable .modal-content > form {
+    display: flex;
+    flex-direction: column;
+    flex: 1 1 auto;
+    min-height: 0;
+    max-height: 100%;
+}
+
+.modal-dialog-scrollable .modal-content > form > .modal-body {
+    overflow-y: auto;
+    min-height: 0;
+}
+
+/* Scrollbars are easy to miss on the dark palettes, which makes a scrollable
+ * dialog look truncated. Give them contrast against whichever theme is active. */
+.modal-body,
+.hangar-body,
+.hangar-tree,
+.hangar-scrubber,
+.hangar-rawlog {
+    scrollbar-width: thin;
+    scrollbar-color: var(--bs-secondary-color, #6c757d) transparent;
+}
+
 /* --- version / update badge -------------------------------------------- */
 
 /* One control, two jobs: check when idle, install when an update is waiting.

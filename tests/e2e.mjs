@@ -408,6 +408,75 @@ async function main() {
             await ctx.close();
         }
 
+
+        // ---- modal sizing, in its own context
+        //
+        // Opening six modals leaves Bootstrap teardown state behind — backdrops,
+        // body classes, focus traps. Unpicking that reliably is not worth it when a
+        // fresh page costs a second, and a leaked backdrop silently swallows the
+        // clicks of whatever test runs next.
+        {
+            const { ctx, page } = await open(browser);
+            const settle = async () => {
+                await page.waitForSelector('.hangar-shell', { timeout: 10000 });
+                await page.waitForTimeout(500);
+            };
+            await settle();
+            await check('every modal fits the screen and scrolls when it is too tall', async () => {
+                // Reported from real use: the job editor ran off the bottom of the
+                // screen with no scrollbar and no reachable buttons.
+                //
+                // Cause: Bootstrap's .modal-dialog-scrollable constrains .modal-body
+                // because the body is a flex CHILD of .modal-content. Four modals
+                // wrap header/body/footer in a <form> so Enter submits, and a
+                // block-level form breaks that chain — the body grew to its content
+                // (1517px inside a 644px dialog) so there was nothing to scroll.
+                const ids = ['hangar-job-edit', 'hangar-repo-edit', 'hangar-password',
+                    'hangar-restore', 'hangar-provision', 'hangar-fspicker'];
+                const bad = [];
+
+                await page.setViewportSize({ width: 900, height: 620 });
+                for (const id of ids) {
+                    const r = await page.evaluate(async (id) => {
+                        const el = document.getElementById(id);
+                        if (!el || !window.bootstrap) return null;
+                        window.bootstrap.Modal.getOrCreateInstance(el).show();
+                        await new Promise((r) => setTimeout(r, 300));
+                        const dlg = el.querySelector('.modal-dialog');
+                        const body = el.querySelector('.modal-body');
+                        const box = dlg.getBoundingClientRect();
+                        body.scrollTop = 9999;
+                        const moved = body.scrollTop;
+                        body.scrollTop = 0;
+                        const out = {
+                            id,
+                            fits: box.bottom <= window.innerHeight + 1 && box.top >= -1,
+                            // Either it all fits, or it can actually be scrolled.
+                            reachable: body.scrollHeight <= body.clientHeight + 2 || moved > 0
+                        };
+                        const m = window.bootstrap.Modal.getOrCreateInstance(el);
+                        m.hide();
+                        await new Promise((r) => setTimeout(r, 220));
+                        // dispose + sweep: a lingering backdrop swallows the clicks
+                        // of whatever test runs next.
+                        m.dispose();
+                        document.querySelectorAll('.modal-backdrop').forEach((b) => b.remove());
+                        document.body.classList.remove('modal-open');
+                        document.body.style.removeProperty('overflow');
+                        document.body.style.removeProperty('padding-right');
+                        return out;
+                    }, id);
+                    if (!r) continue;
+                    if (!r.fits) bad.push(`${r.id}: runs off the screen`);
+                    if (!r.reachable) bad.push(`${r.id}: content is cut off with no way to scroll`);
+                }
+                await page.setViewportSize({ width: 1280, height: 900 });
+
+                assertEqual(bad.length, 0, bad.join(' | '));
+            });
+            await ctx.close();
+        }
+
         // ---- themes
         {
             const { ctx, page } = await open(browser);

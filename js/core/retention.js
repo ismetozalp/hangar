@@ -63,7 +63,28 @@
             last: 10, hourly: 168, daily: 90, weekly: 104, monthly: 60, yearly: 10
         }),
         // For small or expensive destinations: recent days plus a short tail.
-        'space-saver': Object.freeze({ last: 1, daily: 7, monthly: 3 })
+        'space-saver': Object.freeze({ last: 1, daily: 7, monthly: 3 }),
+
+        // Age-based, which is what people usually mean by "delete backups older
+        // than a month". `--keep-within` keeps EVERY snapshot inside the window
+        // rather than thinning it, so an hourly job on a 30-day window keeps ~720
+        // snapshots — cheap in a deduplicating repository, but worth knowing.
+        //
+        // Each carries `last: 1` as a floor. Without it, a repository whose newest
+        // snapshot is already older than the window would have every snapshot
+        // forgotten in one run: restic measures the window from the LATEST
+        // snapshot, so a job that stops running is safe, but one whose source
+        // disappears and whose window then lapses is not.
+        'last-30-days': Object.freeze({ last: 1, within: '30d' }),
+        'last-90-days': Object.freeze({ last: 1, within: '90d' }),
+        'last-year': Object.freeze({ last: 1, within: '1y' }),
+
+        // Age-based with thinning: everything for a week, then one a day for a
+        // month and one a month for a year. Usually what someone wants when they
+        // ask for "30 days" but does not want 700 snapshots.
+        'recent-then-thin': Object.freeze({
+            last: 1, within: '7d', daily: 30, monthly: 12
+        })
     };
     Object.freeze(PRESETS);
 

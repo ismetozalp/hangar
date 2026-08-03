@@ -723,7 +723,11 @@
                 this.repoId = trimmed(o.repoId);
                 verify = typeof o.verify === 'function' ? o.verify : null;
                 this.providerId = '';
-                this.step = 'instructions';
+                // Deliberately no step until rclone's config has answered: the two
+                // possible steps are a token paste and "hangar cannot do this for
+                // you", and flashing the wrong one of those is worse than a moment
+                // with neither.
+                this.step = '';
                 showModal(MODAL_ID);
                 await this.checkRclone();
                 try {

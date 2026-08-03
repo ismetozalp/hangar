@@ -1829,6 +1829,28 @@ test('opening the wizard normally afterwards is a creation again, with nothing c
     });
 });
 
+test('repair mode shows neither step until it knows which one is right', async () => {
+    // The two possibilities are "paste a token" and "hangar cannot do this for
+    // you". Flashing the wrong one of those is worse than a moment with neither.
+    let release = null;
+    const pending = new Promise((r) => { release = r; });
+    await withStubs([
+        [Prov, 'probe', present()],
+        [Rclone, 'providerOfRemote', () => pending]
+    ], async () => {
+        const c = Ui.hangarRcloneUi();
+        const opening = c.open({ reauthorize: 'gdrive' });
+        await Promise.resolve();
+        assert.equal(c.at('authorize'), false);
+        assert.equal(c.at('instructions'), false);
+        assert.equal(c.reconnecting(), true, 'the dialog still says what it is for');
+        release(Rclone.providerFor('drive'));
+        await opening;
+        assert.equal(c.step, 'authorize');
+    });
+    assert.match(MODAL, /Reading this destination's settings/);
+});
+
 test('the markup reuses the one paste box rather than growing a second', () => {
     // The duplication that would matter most: two textareas means two places for
     // the token handling to drift apart.

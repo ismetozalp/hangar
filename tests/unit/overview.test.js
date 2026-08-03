@@ -1639,3 +1639,444 @@ test('the partial-listing notice is a warning, not a failure', async () => {
     assert.ok(O.TEMPLATE.includes('x-for="w in warnings" :key="w.key"'),
         'the unreadable files must be enumerated, and keyed so none of them collide');
 });
+
+// ==========================================================================
+// An expired cloud destination: the banner someone meets after a bad night.
+//
+// Three facts decide whether it is useful or is one more red box to scroll
+// past: WHICH repository, that it is failing NOW, and when it last worked.
+// "My backups have been broken for three weeks" is the discovery this whole
+// feature exists to make impossible.
+// ==========================================================================
+
+const DAY = 86400000;
+
+const DRIVE = { id: 'drive', label: 'Google Drive', auth: 'oauth' };
+const BOX = { id: 'box', label: 'Box', auth: 'oauth' };
+const JOTTA = { id: 'jottacloud', label: 'Jottacloud', auth: 'external' };
+const BOX_POLICY = { provider: 'box', label: 'Box', inactivityDays: 60,
+    reason: 'Box expires its refresh token after 60 days of inactivity.' };
+
+// A repository row as the screen builds one, with its destination resolved.
+function cloudRepo(over) {
+    const o = over || {};
+    return O.repoRow(
+        { id: o.id || 'nas', kind: 'rclone', remote: o.remote || 'gdrive' },
+        { totalSize: 2048, snapshotsCount: 7 },
+        o.error || null,
+        null,
+        { remote: o.remote || 'gdrive',
+          provider: o.provider === undefined ? DRIVE : o.provider,
+          expiryPolicy: o.expiryPolicy || null });
+}
+
+// A job row that failed on authorisation last night.
+function expiredJob(over) {
+    const o = over || {};
+    return O.jobRow({ id: o.id || 'nightly', name: o.name || 'Nightly', repo: o.repo || 'nas' },
+        state({ status: 'failed', kind: 'AUTH_EXPIRED', exit_code: 1,
+            finished: SEC(NOW), last_success: o.lastSuccess === undefined ? undefined : o.lastSuccess }),
+        unit(), NOW);
+}
+
+// --- what "last succeeded" means ----------------------------------------
+
+test('lastSuccessMs only counts a run that actually wrote something', () => {
+    assert.equal(O.lastSuccessMs(state({ status: 'ok' })), NOW);
+    // exit 3 WROTE the snapshot, so the destination did accept a write.
+    assert.equal(O.lastSuccessMs(state({ status: 'partial' })), NOW);
+    // The snapshot exists; only the retention pass failed.
+    assert.equal(O.lastSuccessMs(state({ status: 'prune-failed' })), NOW);
+    // A failed run is not a success, and hangar must be able to say it does not
+    // know rather than quote the time of the failure.
+    assert.equal(O.lastSuccessMs(state({ status: 'failed', kind: 'AUTH_EXPIRED' })), null);
+    assert.equal(O.lastSuccessMs(null), null);
+    assert.equal(O.lastSuccessMs('corrupt'), null);
+    assert.equal(O.lastSuccessMs({}), null);
+});
+
+test('a recorded last_success is believed over anything inferred', () => {
+    // Forward compatibility, not decoration: the day the helper carries the last
+    // success across a failure, this screen tells the truth with no change here.
+    const s = state({ status: 'failed', kind: 'AUTH_EXPIRED', last_success: SEC(NOW) - 20 * 86400 });
+    assert.equal(O.lastSuccessMs(s), NOW - 20 * DAY);
+    // Milliseconds (systemd) and seconds (the helper) both arrive.
+    assert.equal(O.lastSuccessMs({ status: 'failed', last_success: NOW }), NOW);
+    assert.equal(O.lastSuccessMs({ status: 'failed', lastSuccess: SEC(NOW) }), NOW);
+    assert.equal(O.lastSuccessMs({ status: 'failed', last_success: 0 }), null);
+    assert.equal(O.lastSuccessMs({ status: 'failed', last_success: 'yesterday' }), null);
+});
+
+test('a job row reports its last SUCCESS separately from its last run', () => {
+    // A job that has failed every night for three weeks ran last night. Showing
+    // that as the headline is the misreading this feature exists to prevent.
+    const row = expiredJob({ lastSuccess: SEC(NOW) - 21 * 86400 });
+    assert.equal(row.status, 'failed');
+    assert.equal(row.remediation, 'reauthorize');
+    assert.equal(row.lastRun, NOW);
+    assert.equal(row.lastSuccess, NOW - 21 * DAY);
+    assert.match(row.lastSuccessText, /week|day/);
+    assert.notEqual(row.lastRunText, row.lastSuccessText);
+});
+
+test('repoLastSuccess is the newest success across every job on that repository', () => {
+    const jobs = [
+        O.jobRow({ id: 'a', repo: 'nas' }, state({ finished: SEC(NOW) - 3 * 86400 }), unit(), NOW),
+        O.jobRow({ id: 'b', repo: 'nas' }, state({ finished: SEC(NOW) - 86400 }), unit(), NOW),
+        O.jobRow({ id: 'c', repo: 'other' }, state({ finished: SEC(NOW) }), unit(), NOW),
+        O.jobRow({ id: 'd', repo: 'nas' }, state({ status: 'failed', kind: 'AUTH_EXPIRED' }), unit(), NOW)
+    ];
+    assert.equal(O.repoLastSuccess(jobs, 'nas'), NOW - DAY);
+    assert.equal(O.repoLastSuccess(jobs, 'other'), NOW);
+    assert.equal(O.repoLastSuccess(jobs, 'gone'), null);
+    assert.equal(O.repoLastSuccess(null, 'nas'), null);
+    assert.equal(O.repoLastSuccess(jobs, ''), null);
+});
+
+test('a destination with no recorded success says so, rather than claiming never', () => {
+    // hangar only knows what its state files say. Overstating that on a red
+    // banner is the kind of wrong that costs trust exactly when it is needed.
+    const s = O.lastSuccessSentence(null, NOW);
+    assert.match(s, /no record/i);
+    assert.ok(!/never backed up/i.test(s));
+    assert.match(O.lastSuccessSentence(NOW - 3 * DAY, NOW), /last backed up successfully/i);
+});
+
+// --- the reactive banner -------------------------------------------------
+
+test('an expired destination says which repository, and that it is failing now', () => {
+    const banners = O.authBanners([expiredJob()], [cloudRepo()], NOW);
+    assert.equal(banners.length, 1);
+    const b = banners[0];
+    assert.equal(b.level, 'danger');
+    assert.equal(b.kind, 'expired');
+    assert.equal(b.repoId, 'nas');
+    assert.match(b.title, /\bnas\b/);
+    // Present tense and unqualified: this already happened last night.
+    assert.match(b.title, /are failing/);
+    assert.ok(!/may fail|might/i.test(b.title + b.message));
+    assert.match(b.message, /Google Drive/);
+    assert.match(b.message, /gdrive/);
+    // And it says why retrying is not the answer.
+    assert.match(b.message, /same failure every night|until it is signed in again/i);
+});
+
+test('the banner carries when it last succeeded, and which jobs stopped', () => {
+    const jobs = [
+        expiredJob({ id: 'nightly', name: 'Nightly', lastSuccess: SEC(NOW) - 21 * 86400 }),
+        expiredJob({ id: 'weekly', name: 'Weekly documents', lastSuccess: SEC(NOW) - 21 * 86400 })
+    ];
+    const b = O.authBanners(jobs, [cloudRepo()], NOW)[0];
+    assert.equal(b.lastSuccess, NOW - 21 * DAY);
+    assert.match(b.lastSuccessText, /last backed up successfully/i);
+    assert.match(b.lastSuccessText, /days? ago/);
+    assert.deepEqual(b.jobs, ['Nightly', 'Weekly documents']);
+});
+
+test('a destination whose last success is unknown still gets an honest banner', () => {
+    const b = O.authBanners([expiredJob()], [cloudRepo()], NOW)[0];
+    assert.equal(b.lastSuccess, null);
+    assert.match(b.lastSuccessText, /no record of a successful backup/i);
+});
+
+test('the repository\'s own health check can raise the banner on its own', () => {
+    // No job state at all — the size read failed with AUTH_EXPIRED. That is still
+    // a destination that is refusing this server.
+    const repo = cloudRepo({ error: Errors.create('AUTH_EXPIRED', 'sign-in expired') });
+    assert.equal(repo.remediation, 'reauthorize');
+    const b = O.authBanners([], [repo], NOW)[0];
+    assert.equal(b.kind, 'expired');
+    assert.deepEqual(b.jobs, []);
+});
+
+test('the banner is built from the typed error\'s remediation, not from a parallel notion', () => {
+    // AUTH_EXPIRED -> 'reauthorize' comes from errors.js; nothing here re-decides
+    // what an expired destination is.
+    assert.equal(Errors.REMEDIATION[Errors.KIND.AUTH_EXPIRED], 'reauthorize');
+    const other = O.jobRow({ id: 'n', repo: 'nas' },
+        state({ status: 'failed', kind: 'REPO_LOCKED' }), unit(), NOW);
+    assert.equal(other.remediation, 'unlock');
+    assert.deepEqual(O.authBanners([other], [cloudRepo()], NOW), []);
+});
+
+test('a repository with no cloud destination is never given a sign-in banner', () => {
+    const local = O.repoRow({ id: 'usb', kind: 'local', path: '/srv/b' }, null, null, null, null);
+    assert.equal(local.remote, '');
+    assert.deepEqual(O.authBanners([], [local], NOW), []);
+    // Even when a job on it failed for a completely different reason.
+    const j = O.jobRow({ id: 'n', repo: 'usb' }, state({ status: 'failed', kind: 'NO_SPACE' }), unit(), NOW);
+    assert.deepEqual(O.authBanners([j], [local], NOW), []);
+});
+
+test('the provider hangar cannot sign in to is offered instructions, not a flow', () => {
+    // Jottacloud has no `rclone authorize` hook at all, so there is no token to
+    // paste. Offering a flow that cannot complete costs more than saying so.
+    const b = O.authBanners([expiredJob()],
+        [cloudRepo({ provider: JOTTA, remote: 'jotta' })], NOW)[0];
+    assert.equal(b.external, true);
+    assert.equal(b.canReconnect, false);
+    assert.equal(b.actionLabel, 'What to do');
+    assert.match(b.message, /Jottacloud/);
+});
+
+test('an unidentified provider still gets the button — the wizard can look for itself', () => {
+    const b = O.authBanners([expiredJob()], [cloudRepo({ provider: null })], NOW)[0];
+    assert.equal(b.canReconnect, true);
+    assert.equal(b.actionLabel, 'Reconnect');
+    assert.match(b.message, /The cloud destination/);
+});
+
+// --- the proactive warning ----------------------------------------------
+
+test('expiryWarning only speaks when a provider declares a deadline', () => {
+    assert.equal(O.expiryWarning(null, NOW - 50 * DAY, NOW), null);
+    assert.equal(O.expiryWarning({}, NOW - 50 * DAY, NOW), null);
+    assert.equal(O.expiryWarning({ inactivityDays: 0 }, NOW - 50 * DAY, NOW), null);
+    assert.equal(O.expiryWarning({ inactivityDays: 'sixty' }, NOW - 50 * DAY, NOW), null);
+});
+
+test('expiryWarning says nothing while the deadline is far away', () => {
+    assert.equal(O.expiryWarning(BOX_POLICY, NOW, NOW), null);
+    assert.equal(O.expiryWarning(BOX_POLICY, NOW - 45 * DAY, NOW), null);
+    // The boundary: 14 days left is the first day worth mentioning.
+    assert.equal(O.expiryWarning(BOX_POLICY, NOW - 45 * DAY - 1, NOW), null);
+    assert.ok(O.expiryWarning(BOX_POLICY, NOW - 46 * DAY, NOW));
+    assert.equal(O.EXPIRY_WARN_DAYS, 14);
+});
+
+test('expiryWarning counts from the last write, because inactivity is the rule', () => {
+    const w = O.expiryWarning(BOX_POLICY, NOW - 51 * DAY, NOW);
+    assert.equal(w.idleDays, 51);
+    assert.equal(w.daysLeft, 9);
+    assert.equal(w.overdue, false);
+    assert.equal(w.inactivityDays, 60);
+    assert.equal(w.deadline, NOW - 51 * DAY + 60 * DAY);
+});
+
+test('past the deadline is still amber, and still about what has not happened yet', () => {
+    const w = O.expiryWarning(BOX_POLICY, NOW - 70 * DAY, NOW);
+    assert.equal(w.overdue, true);
+    assert.ok(w.daysLeft <= 0);
+});
+
+test('a deadline is never invented from a date hangar does not have', () => {
+    assert.equal(O.expiryWarning(BOX_POLICY, null, NOW), null);
+    assert.equal(O.expiryWarning(BOX_POLICY, 0, NOW), null);
+    assert.equal(O.expiryWarning(BOX_POLICY, 'lately', NOW), null);
+    // A clock that ran backwards is skew, not a deadline.
+    assert.equal(O.expiryWarning(BOX_POLICY, NOW + 5 * DAY, NOW), null);
+});
+
+test('a repository nobody writes to warns before it expires, in amber', () => {
+    const job = O.jobRow({ id: 'archive', name: 'Archive', repo: 'nas' },
+        state({ status: 'ok', finished: SEC(NOW) - 51 * 86400 }), unit(), NOW);
+    const b = O.authBanners([job],
+        [cloudRepo({ provider: BOX, remote: 'boxed', expiryPolicy: BOX_POLICY })], NOW)[0];
+    assert.equal(b.level, 'warning', 'amber: nothing has failed yet');
+    assert.equal(b.kind, 'expiring');
+    assert.match(b.title, /expires in about 9 days/);
+    assert.match(b.message, /60 days without activity/);
+    assert.match(b.message, /51 days/);
+    // Clearly about the future, and it names both ways out.
+    assert.ok(!/are failing|has stopped/i.test(b.title + b.message));
+    assert.match(b.message, /Backing up to it now resets that clock/);
+    assert.equal(b.canReconnect, true);
+});
+
+test('an overdue idle destination is warned about without claiming it has failed', () => {
+    const job = O.jobRow({ id: 'archive', repo: 'nas' },
+        state({ status: 'ok', finished: SEC(NOW) - 70 * 86400 }), unit(), NOW);
+    const b = O.authBanners([job],
+        [cloudRepo({ provider: BOX, expiryPolicy: BOX_POLICY })], NOW)[0];
+    assert.equal(b.level, 'warning');
+    assert.match(b.title, /may already have expired/i);
+    assert.match(b.message, /nothing has tried/i);
+});
+
+test('a destination that is already failing gets one banner, not two', () => {
+    const job = expiredJob({ lastSuccess: SEC(NOW) - 70 * 86400 });
+    const banners = O.authBanners([job],
+        [cloudRepo({ provider: BOX, expiryPolicy: BOX_POLICY })], NOW);
+    assert.equal(banners.length, 1);
+    assert.equal(banners[0].kind, 'expired', 'a report of failure outranks a warning about one');
+});
+
+test('a busy repository on a provider with a deadline is left alone', () => {
+    const job = O.jobRow({ id: 'nightly', repo: 'nas' }, state({ status: 'ok' }), unit(), NOW);
+    assert.deepEqual(O.authBanners([job],
+        [cloudRepo({ provider: BOX, expiryPolicy: BOX_POLICY })], NOW), []);
+});
+
+test('authBanners survives hostile input rather than blanking the screen', () => {
+    assert.deepEqual(O.authBanners(null, null, NOW), []);
+    assert.deepEqual(O.authBanners('x', 'y', NOW), []);
+    assert.deepEqual(O.authBanners([null, 'x'], [null, 'x', 7], NOW), []);
+    const weird = O.repoRow({ id: 'nas', kind: 'rclone' }, null,
+        Errors.create('AUTH_EXPIRED', 'x'), null, { remote: 5, provider: 'nope', expiryPolicy: 3 });
+    assert.equal(weird.remote, '');
+    assert.equal(weird.providerLabel, '');
+    const b = O.authBanners([], [weird], NOW)[0];
+    assert.match(b.message, /The cloud destination/);
+});
+
+// --- the component end to end -------------------------------------------
+
+function cloudDeps(over) {
+    const o = over || {};
+    return {
+        config: Object.assign(fakeDeps().config, {
+            readRepo: async () => ({ id: 'nas', kind: 'rclone', remote: 'gdrive', prefix: 'b' }),
+            readState: async () => state({ status: 'failed', kind: 'AUTH_EXPIRED', exit_code: 1 })
+        }, o.config || {}),
+        rclone: Object.assign({
+            remoteNameFromRepoUrl: (url) => (/^rclone:/.test(String(url)) ? 'gdrive' : null),
+            providerOfRemote: async () => DRIVE,
+            expiryPolicy: () => null,
+            externalSetup: () => null
+        }, o.rclone || {})
+    };
+}
+
+test('the screen raises the banner for an expired destination after a failed night', async () => {
+    const c = component(cloudDeps());
+    await c.refresh();
+    assert.equal(c.banners.length, 1);
+    const b = c.banners[0];
+    assert.equal(b.repoId, 'nas');
+    assert.equal(b.remote, 'gdrive');
+    assert.equal(b.providerLabel, 'Google Drive');
+    assert.equal(b.canReconnect, true);
+    assert.equal(c.jobs[0].remediation, 'reauthorize');
+});
+
+test('the banner disappears when the destination stops failing', async () => {
+    const c = component(cloudDeps({ config: { readState: async () => state({ status: 'ok' }) } }));
+    await c.refresh();
+    assert.deepEqual(c.banners, []);
+});
+
+test('Reconnect opens the same wizard the destination was created in', async () => {
+    const c = component(cloudDeps());
+    await c.refresh();
+    const seen = [];
+    const saved = [globalThis.CustomEvent, globalThis.dispatchEvent,
+        Object.prototype.hasOwnProperty.call(globalThis, 'CustomEvent')];
+    globalThis.CustomEvent = class { constructor(n, o) { this.type = n; this.detail = (o || {}).detail; } };
+    globalThis.dispatchEvent = (ev) => { seen.push(ev); return true; };
+    try {
+        assert.equal(c.actOnBanner(c.banners[0]), true);
+    } finally {
+        if (saved[2]) { globalThis.CustomEvent = saved[0]; globalThis.dispatchEvent = saved[1]; }
+        else { delete globalThis.CustomEvent; delete globalThis.dispatchEvent; }
+    }
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].type, 'hangar:rclone-remote');
+    assert.equal(seen[0].detail.reauthorize, 'gdrive');
+    assert.equal(seen[0].detail.repoId, 'nas');
+    assert.equal(typeof seen[0].detail.verify, 'function');
+});
+
+test('the job row\'s own button performs the repair rather than describing it', async () => {
+    // It used to only expand a panel telling the user to go elsewhere. A screen
+    // that can take you there and instead tells you where to go is how a failure
+    // survives another night.
+    assert.equal(O.expands('reauthorize'), false);
+    const c = component(cloudDeps());
+    await c.refresh();
+    const seen = [];
+    globalThis.CustomEvent = class { constructor(n, o) { this.type = n; this.detail = (o || {}).detail; } };
+    globalThis.dispatchEvent = (ev) => { seen.push(ev); return true; };
+    try {
+        await c.remediate(c.jobs[0]);
+    } finally {
+        delete globalThis.CustomEvent; delete globalThis.dispatchEvent;
+    }
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].detail.reauthorize, 'gdrive');
+    assert.equal(c.expanded, null, 'and it did not just open a panel');
+});
+
+test('a repository row remediation reaches the same repair', async () => {
+    const c = component(cloudDeps({ config: { readState: async () => state({ status: 'ok' }) } }));
+    await c.refresh();
+    const seen = [];
+    globalThis.CustomEvent = class { constructor(n, o) { this.type = n; this.detail = (o || {}).detail; } };
+    globalThis.dispatchEvent = (ev) => { seen.push(ev); return true; };
+    try {
+        await c.remediateRepo({ id: 'nas', remediation: 'reauthorize' });
+    } finally {
+        delete globalThis.CustomEvent; delete globalThis.dispatchEvent;
+    }
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].detail.reauthorize, 'gdrive');
+});
+
+test('a repository with no remote reports why it cannot be signed in to', async () => {
+    // A local folder: there is no cloud sign-in to renew, whatever asked.
+    const c = component(cloudDeps({
+        config: { readRepo: async () => ({ id: 'nas', kind: 'local', path: '/srv/b' }) }
+    }));
+    await c.refresh();
+    assert.equal(c.repos[0].remote, '');
+    assert.equal(c.reconnect({ repoId: 'nas' }), false);
+    assert.ok(c.actionError, 'a silent no-op on a pressed button is the failure mode');
+    assert.match(c.errorText(c.actionError), /does not write through an rclone remote/i);
+});
+
+test('an unreadable rclone configuration costs the banner nothing but the provider name', async () => {
+    const c = component(cloudDeps({ rclone: {
+        providerOfRemote: async () => { throw Errors.create('GENERIC', 'no rclone here'); }
+    } }));
+    await c.refresh();
+    assert.equal(c.repos.length, 1, 'the repository is still on screen');
+    assert.equal(c.banners.length, 1);
+    assert.equal(c.banners[0].providerLabel, 'The cloud destination');
+    assert.equal(c.banners[0].canReconnect, true);
+});
+
+test('the proactive warning reaches the screen from the provider table', async () => {
+    const Rclone = require('../../js/core/rclone.js');
+    // Not a number invented here: Box's own rule, declared beside the provider.
+    const policy = Rclone.expiryPolicy('box');
+    assert.equal(policy.inactivityDays, 60);
+    assert.equal(Rclone.expiryPolicy('drive'), null, 'no invented deadlines');
+
+    const c = component(cloudDeps({
+        config: { readState: async () => state({ status: 'ok', finished: SEC(NOW) - 55 * 86400 }) },
+        rclone: { providerOfRemote: async () => BOX, expiryPolicy: () => policy }
+    }));
+    c.now = NOW;
+    await c.refresh();
+    // refresh() stamps its own clock, so assert on the shape rather than the day.
+    assert.equal(c.banners.length, 1);
+    assert.equal(c.banners[0].kind, 'expiring');
+    assert.equal(c.banners[0].level, 'warning');
+});
+
+test('instructions for an external provider come from externalSetup', async () => {
+    const Rclone = require('../../js/core/rclone.js');
+    const c = component(cloudDeps({ rclone: {
+        providerOfRemote: async () => JOTTA,
+        externalSetup: (id) => Rclone.externalSetup(id)
+    } }));
+    await c.refresh();
+    const b = c.banners[0];
+    assert.equal(b.canReconnect, false);
+    // Pressing it opens the instructions instead of a flow that cannot run.
+    assert.equal(c.actOnBanner(b), false);
+    assert.equal(c.expanded, b.id);
+    assert.deepEqual(c.instructionsFor(b).steps, Rclone.externalSetup('jottacloud').steps);
+});
+
+test('a banner announces itself, and its action is a real button', () => {
+    // A live region has to be in the DOM before the message arrives, or there is
+    // nothing to announce a change to.
+    assert.match(O.TEMPLATE, /aria-live="assertive"/);
+    assert.ok(O.TEMPLATE.includes('x-for="b in banners" :key="b.id"'));
+    assert.ok(O.TEMPLATE.includes('@click="actOnBanner(b)"'));
+    assert.ok(O.TEMPLATE.includes('x-text="b.lastSuccessText"'));
+    assert.ok(O.TEMPLATE.includes('<button type="button" class="btn btn-sm"'));
+    // The instructions panel is a disclosure, and says so.
+    assert.ok(O.TEMPLATE.includes('hangar-banner-'));
+    assert.match(O.TEMPLATE, /:aria-expanded="b\.canReconnect \? null/);
+});

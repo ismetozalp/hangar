@@ -461,6 +461,11 @@
     function expansionFor(row) {
         const r = obj(row) || {};
         const files = Array.isArray(r.unreadableFiles) ? r.unreadableFiles : [];
+        // Kept although the button no longer opens this panel: without it, a
+        // reauthorize row that some other path expanded would fall through to the
+        // count branch and state that 0 files could not be read — a false
+        // sentence about a backup, which is the one thing never worth saving a
+        // branch over.
         if (r.remediation === 'reauthorize')
             return {
                 kind: 'auth', files: [], more: 0,
@@ -1116,7 +1121,6 @@
                 switch (normRemediation(row.remediation)) {
                 case 'list-unreadable':
                 case 'free-space':
-                case 'reauthorize':
                     this.toggle(row.id);
                     return;
                 case 'unlock':
@@ -1151,10 +1155,12 @@
             reconnect(banner) {
                 const b = obj(banner) || {};
                 const repoId = typeof b.repoId === 'string' ? b.repoId : '';
-                if (typeof root.dispatchEvent !== 'function' || typeof root.CustomEvent !== 'function')
-                    return false;
                 const remote = typeof b.remote === 'string' && b.remote !== ''
                     ? b.remote : this.remoteOf(repoId);
+                // Checked before the event plumbing, and reported: "there is
+                // nothing to sign in to" is an answer the user needs, and a button
+                // that silently does nothing is the failure mode this whole
+                // screen is written against.
                 if (!remote) {
                     // No remote means nothing to sign in to. Saying so beats
                     // opening a dialog about a destination this repository does
@@ -1164,6 +1170,8 @@
                         'sign-in to renew.'), { id: repoId, repoId: repoId }, 'repo');
                     return false;
                 }
+                if (typeof root.dispatchEvent !== 'function' || typeof root.CustomEvent !== 'function')
+                    return false;
                 const self = this;
                 root.dispatchEvent(new root.CustomEvent('hangar:rclone-remote', {
                     detail: {
@@ -1371,9 +1379,13 @@
         // that is inserted already-populated announces nothing at all. Assertive
         // rather than polite because this is a report of backups failing right
         // now, which is the one thing on this screen worth interrupting for.
+        // No role="alert" on the banner itself: an alert IS a live region, and one
+        // nested inside another is announced twice by several screen readers. The
+        // container is the region; inserting a banner into it is the change that
+        // gets announced.
         '  <div aria-live="assertive" aria-atomic="false">',
         '    <template x-for="b in banners" :key="b.id">',
-        '      <div class="alert" role="alert"',
+        '      <div class="alert"',
         '           :class="b.level === \'danger\' ? \'alert-danger\' : \'alert-warning\'">',
         '        <div class="d-flex align-items-start gap-3 flex-wrap">',
         '          <div class="flex-grow-1">',

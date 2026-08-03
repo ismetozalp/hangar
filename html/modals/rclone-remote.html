@@ -67,6 +67,14 @@
                     </div>
                 </template>
 
+                <!-- Repair mode, before rclone's configuration has said what this
+                     remote is. Neither possible step is shown yet, because the two
+                     are "paste a token" and "hangar cannot do this for you". -->
+                <div x-show="reconnecting() && !at('authorize') && !at('instructions') && !at('done')"
+                     class="text-secondary small" role="status" aria-live="polite">
+                    Reading this destination's settings…
+                </div>
+
                 <!-- STEP 1 — choose a destination --------------------------
                      Grouped by how you sign in, because that is the only thing
                      that changes what the next five minutes look like. -->

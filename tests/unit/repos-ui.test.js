@@ -1414,6 +1414,252 @@ test('the validation summary is announced', () => {
     assert.match(MODAL, /x-show="problems\.length" role="alert"/);
 });
 
+// ==========================================================================
+// An expired cloud destination: found by the Test button, fixed by a button.
+//
+// The point of testing this HERE is that "Test connection" has to find an
+// expired sign-in before the next scheduled run does. A destination that is
+// only discovered by a 03:00 unit is discovered by nobody.
+// ==========================================================================
+
+// An rclone repository, so the reclassification below has something to act on.
+function rcloneRow(id) {
+    return Ui.toRow({ id: id || 'gdrive-repo', kind: 'rclone', remote: 'gdrive', prefix: 'backups' });
+}
+
+// The wording rclone and the providers really produce, arriving inside restic's
+// stderr because restic SPAWNS rclone for an `rclone:` repository.
+const EXPIRY_STDERR =
+    'Fatal: unable to open repository at rclone:gdrive:backups: couldn\'t fetch token - ' +
+    'maybe it has expired? - refresh with "rclone config reconnect gdrive:"';
+
+test('remoteOf finds the rclone remote a repository writes through', () => {
+    assert.equal(Ui.remoteOf({ kind: 'rclone', remote: 'gdrive' }), 'gdrive');
+    assert.equal(Ui.remoteOf({ kind: 'rclone', remote: '  gdrive  ' }), 'gdrive');
+    // From the URL when the definition carries no remote field of its own.
+    assert.equal(Ui.remoteOf({ id: 'x', kind: 'rclone', prefix: 'b' }), '');
+    // Not an rclone repository: there is no sign-in to renew.
+    assert.equal(Ui.remoteOf({ kind: 'local', path: '/srv/b' }), '');
+    assert.equal(Ui.remoteOf({ kind: 'sftp', user: 'u', host: 'h', path: '/p' }), '');
+    assert.equal(Ui.remoteOf(null), '');
+    assert.equal(Ui.remoteOf('nonsense'), '');
+});
+
+test('classifyRepoFailure turns rclone\'s expiry wording into AUTH_EXPIRED', () => {
+    const repo = { id: 'g', kind: 'rclone', remote: 'gdrive' };
+    for (const text of [
+        'couldn\'t fetch token - maybe it has expired?',
+        'refresh with "rclone config reconnect gdrive:"',
+        'oauth2: token expired and refresh token is not set',
+        'invalid_grant: Token has been expired or revoked.',
+        'AADSTS700082: The refresh token has expired due to inactivity.'
+    ]) {
+        const e = Ui.classifyRepoFailure(Errors.create('GENERIC', text), repo);
+        assert.equal(e.kind, Errors.KIND.AUTH_EXPIRED, text);
+        assert.equal(e.remediation, 'reauthorize', text);
+        assert.equal(e.fatal, true, 'the backup did not happen');
+    }
+});
+
+test('a bare 401 or 403 is NOT reported as an expired sign-in', () => {
+    // The judgement the whole design turns on: those are also what an ordinary
+    // permission problem looks like, and a false "your login expired" sends the
+    // user through a pointless re-authorisation while hiding the real cause.
+    const repo = { id: 'g', kind: 'rclone', remote: 'gdrive' };
+    for (const text of [
+        'HTTP 403 Forbidden',
+        '401 Unauthorized',
+        'Fatal: permission denied',
+        'directory not found'
+    ]) {
+        const e = Ui.classifyRepoFailure(Errors.create('GENERIC', text), repo);
+        assert.equal(e.kind, Errors.KIND.GENERIC, text);
+    }
+});
+
+test('a repository that does not go through rclone is never reclassified', () => {
+    // An SFTP server that said "403" has a permission problem. Offering its owner
+    // a cloud sign-in would hide it.
+    const sftp = { id: 'nas', kind: 'sftp', user: 'u', host: 'h', path: '/p' };
+    const e = Ui.classifyRepoFailure(Errors.create('GENERIC', EXPIRY_STDERR), sftp);
+    assert.equal(e.kind, Errors.KIND.GENERIC);
+});
+
+test('an error that is already AUTH_EXPIRED is passed through untouched', () => {
+    const original = Errors.create(Errors.KIND.AUTH_EXPIRED, 'sign-in expired', { stderr: 'x' });
+    const e = Ui.classifyRepoFailure(original, { kind: 'rclone', remote: 'gdrive' });
+    assert.equal(e, original, 'it must not be rebuilt, and its detail must not be lost');
+});
+
+test('reclassifying keeps restic\'s own text for the log', () => {
+    const e = Ui.classifyRepoFailure(
+        Restic.classifyExit(1, EXPIRY_STDERR), { kind: 'rclone', remote: 'gdrive' });
+    assert.equal(e.kind, Errors.KIND.AUTH_EXPIRED);
+    assert.match(String(e.detail.stderr), /config reconnect/);
+    // …but says it in words a person can act on.
+    assert.match(e.message, /authorised again|sign-in has expired/i);
+});
+
+test('classifyRepoFailure survives hostile input', () => {
+    assert.equal(Ui.classifyRepoFailure(null, {}), null);
+    assert.equal(Ui.classifyRepoFailure(undefined, null), undefined);
+    const plain = new Error('boom');
+    assert.equal(Ui.classifyRepoFailure(plain, { kind: 'rclone', remote: 'gdrive' }), plain);
+});
+
+test('Test connection finds an expired sign-in before the next nightly run does', async () => {
+    const c = Ui.hangarReposUi();
+    const row = rcloneRow();
+    await withCockpit({ spawn: rejectsWith(1, EXPIRY_STDERR) }, () => c.testConnection(row));
+    assert.equal(row.alert.kind, Errors.KIND.AUTH_EXPIRED);
+    assert.equal(row.alert.remediation, 'reauthorize');
+    assert.equal(row.alert.actionLabel, 'Sign in again');
+    assert.notEqual(row.alert.actionLabel, 'Try again',
+        'retrying fails identically, every night, in silence');
+    assert.equal(row.busy, '');
+});
+
+test('a channel failure with no exit status still reaches the same action', async () => {
+    // The path classifyExit cannot cover on its own: no restic exit status ever
+    // arrived, but rclone's text did.
+    const c = Ui.hangarReposUi();
+    const row = rcloneRow();
+    await withCockpit({ spawn: () => Promise.reject({ problem: EXPIRY_STDERR }) },
+        () => c.testConnection(row));
+    assert.equal(row.alert.kind, Errors.KIND.AUTH_EXPIRED);
+    assert.equal(row.alert.remediation, 'reauthorize');
+});
+
+test('reading a repository\'s size hits the same classification', async () => {
+    const row = rcloneRow();
+    await withCockpit({ spawn: rejectsWith(1, EXPIRY_STDERR) },
+        () => Ui.hangarReposUi().loadStats(row));
+    assert.equal(row.alert.remediation, 'reauthorize');
+});
+
+test('the Sign in again button opens the wizard on THAT remote', async () => {
+    // The old bug this pins: hangarReposUi.remediate() dispatched to a method the
+    // list component did not have, so the one button that fixes an expired
+    // destination threw instead.
+    const c = Ui.hangarReposUi();
+    const row = rcloneRow();
+    row.alert = Ui.toAlert(Errors.create(Errors.KIND.AUTH_EXPIRED, 'expired'), 'Test', row.id);
+    const seen = [];
+    await withStubs([
+        [globalThis, 'CustomEvent', class { constructor(n, o) { this.type = n; this.detail = (o || {}).detail; } }],
+        [globalThis, 'dispatchEvent', (ev) => { seen.push(ev); return true; }]
+    ], async () => {
+        await c.remediate(row);
+    });
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].type, 'hangar:rclone-remote');
+    assert.equal(seen[0].detail.reauthorize, 'gdrive');
+    assert.equal(seen[0].detail.repoId, 'gdrive-repo');
+    assert.equal(typeof seen[0].detail.verify, 'function',
+        'the wizard must be able to prove the repair, not assert it');
+});
+
+test('the wizard\'s verification is this row\'s own connection test', async () => {
+    const c = Ui.hangarReposUi();
+    const row = rcloneRow();
+    let verify = null;
+    await withStubs([
+        [globalThis, 'CustomEvent', class { constructor(n, o) { this.type = n; this.detail = (o || {}).detail; } }],
+        [globalThis, 'dispatchEvent', (ev) => { verify = ev.detail.verify; return true; }]
+    ], async () => { c.reauthorize(row); });
+
+    // A repository that answers resolves, and leaves the row green.
+    await withCockpit({ spawn: () => Promise.resolve('[]') }, async () => {
+        const r = await verify();
+        assert.match(r.message, /Reachable/);
+    });
+    assert.equal(row.alert.level, 'success');
+
+    // One that still does not answer rejects, so the dialog says so rather than
+    // claiming the repair worked.
+    await withCockpit({ spawn: rejectsWith(1, EXPIRY_STDERR) }, async () => {
+        await assert.rejects(() => verify());
+    });
+    assert.equal(row.alert.remediation, 'reauthorize');
+});
+
+test('a repository with no rclone remote is not offered a sign-in it cannot do', async () => {
+    const c = Ui.hangarReposUi();
+    const row = repoRow();               // a local folder
+    row.alert = Ui.toAlert(Errors.create(Errors.KIND.AUTH_EXPIRED, 'expired'), 'Test', row.id);
+    const seen = [];
+    await withStubs([
+        [globalThis, 'CustomEvent', class { constructor(n, o) { this.type = n; this.detail = (o || {}).detail; } }],
+        [globalThis, 'dispatchEvent', (ev) => { seen.push(ev); return true; }]
+    ], async () => { assert.equal(c.reauthorize(row), false); });
+    assert.deepEqual(seen, [], 'no wizard about a destination this row does not use');
+    assert.equal(row.showFiles, true, 'the detail is opened instead');
+});
+
+test('reauthorize is a no-op, not a throw, where there is no event plumbing', () => {
+    const c = Ui.hangarReposUi();
+    assert.equal(c.reauthorize(rcloneRow()), false);
+    assert.equal(c.reauthorize(null), false);
+});
+
+test('the screen-level alert can honour a sign-in when it knows the row', async () => {
+    const c = Ui.hangarReposUi();
+    c.rows = [rcloneRow('gdrive-repo')];
+    c.alert = Ui.toAlert(Errors.create(Errors.KIND.AUTH_EXPIRED, 'expired'),
+        'Add repository', 'gdrive-repo');
+    assert.equal(c.alertActionLabel(), 'Sign in again');
+
+    const seen = [];
+    await withStubs([
+        [globalThis, 'CustomEvent', class { constructor(n, o) { this.type = n; this.detail = (o || {}).detail; } }],
+        [globalThis, 'dispatchEvent', (ev) => { seen.push(ev); return true; }]
+    ], async () => { await c.remediateAlert(); });
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].detail.reauthorize, 'gdrive');
+    assert.equal(c.alert, null, 'the alert moved to the row it is about');
+
+    // And with no such row on screen, the button is not offered at all.
+    c.rows = [];
+    c.alert = Ui.toAlert(Errors.create(Errors.KIND.AUTH_EXPIRED, 'expired'), 'Add repository', 'gone');
+    assert.equal(c.alertActionLabel(), '');
+});
+
+test('a destination repaired elsewhere stops being reported as broken here', async () => {
+    const c = Ui.hangarReposUi();
+    const row = rcloneRow('gdrive-repo');
+    row.alert = Ui.toAlert(Errors.create(Errors.KIND.AUTH_EXPIRED, 'expired'), 'Test', row.id);
+    c.rows = [row];
+    // The row is re-read rather than patched: whether the repair worked is the
+    // host's answer, not this screen's assumption.
+    await withCockpit({ spawn: () => Promise.resolve('[]') }, async () => {
+        assert.equal(await c.remoteReconnected({ repoId: 'gdrive-repo' }), 1);
+    });
+    assert.equal(row.alert, null);
+});
+
+test('the reconnected listener never rejects, whatever the re-read does', async () => {
+    const c = Ui.hangarReposUi();
+    const row = rcloneRow('gdrive-repo');
+    row.alert = Ui.toAlert(Errors.create(Errors.KIND.AUTH_EXPIRED, 'x'), 'Test', row.id);
+    c.rows = [row];
+    // No cockpit at all: loadStats reports it on the row, and the listener still
+    // resolves — a rejection from an event handler has nowhere to go.
+    assert.equal(await c.remoteReconnected({}), 1);
+    assert.ok(row.alert, 'the re-read failure is itself reported');
+});
+
+test('every remediation still reaches a real method on the list component', () => {
+    // The stronger form of the older test above: the method has to EXIST, which
+    // is exactly what "reauthorize" did not for the row that needed it most.
+    const c = Ui.hangarReposUi();
+    const method = { unlock: 'unlock', init: 'initRepo', reprompt: 'reprompt',
+        retry: 'loadStats', reauthorize: 'reauthorize' };
+    for (const r of new Set(Object.values(Errors.REMEDIATION))) {
+        if (r === 'list-unreadable' || r === 'free-space') continue;
+        assert.equal(typeof c[method[r]], 'function', 'no handler for ' + r);
+    }
+});
+
 test('the module still touches no DOM and no cockpit at load time', () => {
     // Re-asserted at the END of the file: every test above installs and removes its
     // own fakes, and a leak would make the first assertion in this file a lie.

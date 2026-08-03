@@ -11,7 +11,8 @@
         'html/modals/provision.html',
         'html/modals/recovery.html',
         'html/modals/password.html',
-        'html/modals/update.html'
+        'html/modals/update.html',
+        'html/modals/fspicker.html'
     ];
 
     function loadScript(src) {
