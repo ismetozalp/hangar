@@ -141,6 +141,12 @@
     // HangarRepos.REQUIRED; anything REQUIRED lists but ORDER forgot is appended
     // rather than dropped, so a new mandatory field can never become invisible and
     // unfillable in the form.
+    // Which fields name a path on THIS machine, per backend. Deliberately keyed by
+    // kind: 'path' means a local directory for a local repository and a directory
+    // on the far side of an SSH connection for an sftp one, and only the first can
+    // be browsed from here.
+    const BROWSABLE = { local: { path: 'dir' } };
+
     function fieldsFor(kind) {
         if (!isKind(kind)) return [];
         const required = Repos.REQUIRED[kind] || [];
@@ -156,6 +162,9 @@
                 placeholder: d.placeholder || '',
                 help: d.help || '',
                 secret: !!d.secret,
+                // Which picker mode this field wants, if any. Absent for every
+                // field that is not a filesystem path.
+                browse: (BROWSABLE[kind] && BROWSABLE[kind][name]) || null,
                 required: required.indexOf(name) >= 0
             };
         });
@@ -1059,6 +1068,22 @@
             // Hands off to features/rclone-ui.js. The current remote list travels
             // with the request so the wizard can refuse a name that would silently
             // overwrite an existing remote.
+            // Opens the shared folder picker for a field that declares `browse`, seeded
+            // with whatever is already typed so an edit starts where the user left off
+            // rather than at '/'. Cancelling leaves the field untouched.
+            async browseFor(field) {
+                if (!field || !field.browse) return false;
+                const D = root.HangarDialogs;
+                if (!D || typeof D.pickPath !== 'function') return false;
+                const picked = await D.pickPath({
+                    mode: field.browse,
+                    current: this.form[field.name] || '',
+                    title: 'Choose the ' + String(field.label || 'path').toLowerCase()
+                });
+                if (picked === null || picked === undefined) return false;
+                this.form[field.name] = picked;
+                return true;
+            },
             openRcloneWizard() {
                 if (typeof root.dispatchEvent !== 'function' || typeof CustomEvent !== 'function')
                     return false;

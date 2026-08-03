@@ -102,6 +102,16 @@
                                     </template>
                                 </div>
 
+                                <!-- Typing an absolute path by hand is where a typo
+                                     becomes "backed up the wrong folder for a month". -->
+                                <template x-if="f.browse">
+                                    <button type="button" class="btn btn-outline-secondary text-nowrap"
+                                            @click="browseFor(f)"
+                                            :aria-label="'Browse for the ' + f.label.toLowerCase()">
+                                        Browse…
+                                    </button>
+                                </template>
+
                                 <!-- Only the rclone remote can be created from here;
                                      every other field is a plain value. -->
                                 <template x-if="f.name === 'remote'">

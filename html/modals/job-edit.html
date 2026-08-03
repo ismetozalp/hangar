@@ -87,10 +87,16 @@
                     <div x-show="isKind('filesystem')">
                         <div class="mb-3">
                             <label class="form-label" for="hangar-job-paths">Paths to back up</label>
-                            <textarea id="hangar-job-paths" class="form-control hangar-mono" rows="4"
-                                      x-model="form.paths" :aria-invalid="invalid('paths')"
-                                      aria-describedby="hangar-job-paths-help"
-                                      spellcheck="false" placeholder="/home&#10;/etc"></textarea>
+                            <div class="d-flex gap-2 align-items-start">
+                                <div class="flex-grow-1">
+                                    <textarea id="hangar-job-paths" class="form-control hangar-mono" rows="4"
+                                          x-model="form.paths" :aria-invalid="invalid('paths')"
+                                          aria-describedby="hangar-job-paths-help"
+                                          spellcheck="false" placeholder="/home&#10;/etc"></textarea>
+                                </div>
+                                <button type="button" class="btn btn-outline-secondary text-nowrap align-self-start"
+                                        @click="browsePath('paths', { multi: true, mode: 'any', title: 'Add something to back up' })" aria-label="Browse for something to back up">Browse…</button>
+                            </div>
                             <div id="hangar-job-paths-help" class="form-text">
                                 <span x-show="!invalid('paths')">One absolute path per line.</span>
                                 <span class="text-danger" x-show="invalid('paths')"
@@ -418,11 +424,17 @@
                              the filesystem kind. -->
                         <div class="col-sm-6" x-show="isKind('filesystem')">
                             <label class="form-label" for="hangar-job-exclude-file">Exclude file</label>
-                            <input id="hangar-job-exclude-file" class="form-control hangar-mono"
-                                   x-model="form.excludeFile" autocomplete="off" spellcheck="false"
-                                   :aria-invalid="invalid('excludeFile')"
-                                   aria-describedby="hangar-job-exclude-file-help"
-                                   placeholder="/etc/hangar/excludes.txt">
+                            <div class="d-flex gap-2 align-items-start">
+                                <div class="flex-grow-1">
+                                    <input id="hangar-job-exclude-file" class="form-control hangar-mono"
+                                       x-model="form.excludeFile" autocomplete="off" spellcheck="false"
+                                       :aria-invalid="invalid('excludeFile')"
+                                       aria-describedby="hangar-job-exclude-file-help"
+                                       placeholder="/etc/hangar/excludes.txt">
+                                </div>
+                                <button type="button" class="btn btn-outline-secondary text-nowrap align-self-start"
+                                        @click="browsePath('excludeFile', { mode: 'file', title: 'Choose an exclude file' })" aria-label="Browse for an exclude file">Browse…</button>
+                            </div>
                             <div id="hangar-job-exclude-file-help" class="form-text text-danger"
                                  x-show="invalid('excludeFile')" x-text="messageFor('excludeFile')"></div>
                         </div>

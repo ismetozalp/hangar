@@ -570,6 +570,57 @@
 
             config() { return drFormToConfig(this.form); },
 
+            // The shared folder/file picker. Two behaviours, deliberately:
+
+            //   * a single-value field is REPLACED;
+
+            //   * a multi-line field (one path per line) gets the choice APPENDED, because
+
+            //     replacing a list of paths with one would quietly discard the rest.
+
+            // Cancelling changes nothing in either case.
+
+            async browsePath(fieldKey, opts) {
+
+                const D = root.HangarDialogs;
+
+                if (!D || typeof D.pickPath !== 'function') return false;
+
+                const o = opts || {};
+
+                const multi = !!o.multi;
+
+                const bag = o.bag ? this[o.bag] : this.form;
+
+                if (!bag) return false;
+
+                const currentRaw = String(bag[fieldKey] || '');
+
+                const lines = currentRaw.split('\n').map(function (l) { return l.trim(); }).filter(Boolean);
+
+                const picked = await D.pickPath({
+
+                    mode: o.mode || 'dir',
+
+                    title: o.title || '',
+
+                    current: multi ? (lines[lines.length - 1] || '') : currentRaw.trim()
+
+                });
+
+                if (picked === null || picked === undefined) return false;
+
+                if (!multi) { bag[fieldKey] = picked; return true; }
+
+                if (lines.indexOf(picked) < 0) lines.push(picked);
+
+                bag[fieldKey] = lines.join('\n');
+
+                return true;
+
+            },
+
+
             problems() { return Dr.validate(this.config()); },
 
             valid() { return this.problems().length === 0; },

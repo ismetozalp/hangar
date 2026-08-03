@@ -1670,3 +1670,71 @@ test('the module still touches no DOM and no cockpit at load time', () => {
     for (const l of topLevel)
         assert.ok(!/\bcockpit\b|\bdocument\b/.test(l), 'load-time access: ' + l.trim());
 });
+
+// --- Browse buttons ------------------------------------------------------
+
+test('only a local repository offers a folder picker', () => {
+    // 'path' means two different things: a directory on THIS machine for a local
+    // repository, and a directory on the far side of an SSH connection for an
+    // sftp one. Offering a local folder browser for the second would send the
+    // user browsing the wrong machine's filesystem and typing a path that does
+    // not exist there.
+    assert.equal(Ui.fieldsFor('local').find((f) => f.name === 'path').browse, 'dir');
+    assert.equal(Ui.fieldsFor('sftp').find((f) => f.name === 'path').browse, null);
+});
+
+test('no remote backend offers a local picker for any field', () => {
+    for (const kind of ['sftp', 'rest', 's3', 'b2', 'azure', 'gs', 'rclone']) {
+        const browsable = Ui.fieldsFor(kind).filter((f) => f.browse).map((f) => f.name);
+        assert.deepEqual(browsable, [], `${kind} offers a local picker for ${browsable.join(', ')}`);
+    }
+});
+
+test('browseFor sets the field when a path is chosen', async () => {
+    const c = Ui.hangarRepoEdit();
+    c.form = { path: '/srv' };
+    const prev = globalThis.HangarDialogs;
+    globalThis.HangarDialogs = { pickPath: async () => '/srv/backups/hangar' };
+    try {
+        assert.equal(await c.browseFor({ name: 'path', browse: 'dir', label: 'Path' }), true);
+        assert.equal(c.form.path, '/srv/backups/hangar');
+    } finally { globalThis.HangarDialogs = prev; }
+});
+
+test('cancelling the picker leaves the field exactly as it was', async () => {
+    const c = Ui.hangarRepoEdit();
+    c.form = { path: '/srv/original' };
+    const prev = globalThis.HangarDialogs;
+    globalThis.HangarDialogs = { pickPath: async () => null };
+    try {
+        assert.equal(await c.browseFor({ name: 'path', browse: 'dir', label: 'Path' }), false);
+        assert.equal(c.form.path, '/srv/original', 'cancelling cleared the field');
+    } finally { globalThis.HangarDialogs = prev; }
+});
+
+test('the picker opens where the field already points', async () => {
+    // Editing an existing repository should not start the browse at '/'.
+    const c = Ui.hangarRepoEdit();
+    c.form = { path: '/srv/backups/hangar' };
+    let seen = null;
+    const prev = globalThis.HangarDialogs;
+    globalThis.HangarDialogs = { pickPath: async (o) => { seen = o; return null; } };
+    try {
+        await c.browseFor({ name: 'path', browse: 'dir', label: 'Path' });
+        assert.equal(seen.current, '/srv/backups/hangar');
+        assert.equal(seen.mode, 'dir');
+    } finally { globalThis.HangarDialogs = prev; }
+});
+
+test('browseFor is a no-op for a field that does not declare browsing', async () => {
+    const c = Ui.hangarRepoEdit();
+    c.form = { host: 'nas.lan' };
+    let called = false;
+    const prev = globalThis.HangarDialogs;
+    globalThis.HangarDialogs = { pickPath: async () => { called = true; return '/x'; } };
+    try {
+        assert.equal(await c.browseFor({ name: 'host', label: 'Host' }), false);
+        assert.equal(called, false);
+        assert.equal(c.form.host, 'nas.lan');
+    } finally { globalThis.HangarDialogs = prev; }
+});

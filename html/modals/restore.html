@@ -55,9 +55,15 @@
 
                     <div class="mb-3" x-show="mode === 'alternate'">
                         <label class="form-label" for="hangar-restore-target">Restore into</label>
-                        <input id="hangar-restore-target" class="form-control hangar-mono"
-                               type="text" x-model="target" spellcheck="false"
-                               autocomplete="off" placeholder="/var/tmp/hangar-restore">
+                        <div class="d-flex gap-2 align-items-start">
+                            <div class="flex-grow-1">
+                                <input id="hangar-restore-target" class="form-control hangar-mono"
+                                   type="text" x-model="target" spellcheck="false"
+                                   autocomplete="off" placeholder="/var/tmp/hangar-restore">
+                            </div>
+                            <button type="button" class="btn btn-outline-secondary text-nowrap align-self-start"
+                                    @click="browseTarget()" aria-label="Browse for the restore destination">Browse…</button>
+                        </div>
                         <div class="form-text">
                             An absolute path. The snapshot's directory structure is recreated below it.
                         </div>

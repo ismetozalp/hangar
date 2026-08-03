@@ -83,8 +83,14 @@
 
             <div class="col-md-6">
                 <label class="form-label" for="hangar-dr-paths">Paths to back up</label>
-                <textarea id="hangar-dr-paths" class="form-control hangar-mono" rows="3"
-                          x-model="form.backupPaths" spellcheck="false"></textarea>
+                <div class="d-flex gap-2 align-items-start">
+                    <div class="flex-grow-1">
+                        <textarea id="hangar-dr-paths" class="form-control hangar-mono" rows="3"
+                              x-model="form.backupPaths" spellcheck="false"></textarea>
+                    </div>
+                    <button type="button" class="btn btn-outline-secondary text-nowrap align-self-start"
+                            @click="browsePath('backupPaths', { multi: true, mode: 'any', title: 'Add a path to back up' })" aria-label="Browse for a path to back up">Browse…</button>
+                </div>
                 <div class="form-text">One absolute path per line.</div>
             </div>
 
@@ -102,9 +108,15 @@
 
             <div class="col-md-6">
                 <label class="form-label" for="hangar-dr-output">ISO output location</label>
-                <input id="hangar-dr-output" class="form-control hangar-mono"
-                       x-model="form.outputUrl" spellcheck="false" autocomplete="off"
-                       placeholder="file:///var/lib/rear/output">
+                <div class="d-flex gap-2 align-items-start">
+                    <div class="flex-grow-1">
+                        <input id="hangar-dr-output" class="form-control hangar-mono"
+                           x-model="form.outputUrl" spellcheck="false" autocomplete="off"
+                           placeholder="file:///var/lib/rear/output">
+                    </div>
+                    <button type="button" class="btn btn-outline-secondary text-nowrap align-self-start"
+                            @click="browsePath('outputUrl', { mode: 'dir', title: 'Choose where to write the rescue image' })" aria-label="Browse for the rescue image output folder">Browse…</button>
+                </div>
             </div>
 
             <div class="col-md-3">

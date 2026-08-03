@@ -2060,6 +2060,53 @@
             invalid(field) {
                 return this.problemsFor(field).some((p) => p.severity === 'error');
             },
+            // The shared folder/file picker. Two behaviours, deliberately:
+
+            //   * a single-value field is REPLACED;
+
+            //   * a multi-line field (one path per line) gets the choice APPENDED, because
+
+            //     replacing a list of sources with one path would quietly discard the rest.
+
+            // Cancelling changes nothing in either case.
+
+            async browsePath(fieldKey, opts) {
+
+                const D = root.HangarDialogs;
+
+                if (!D || typeof D.pickPath !== 'function') return false;
+
+                const o = opts || {};
+
+                const multi = !!o.multi;
+
+                const currentRaw = String((this.form && this.form[fieldKey]) || '');
+
+                const lines = currentRaw.split('\n').map(function (l) { return l.trim(); }).filter(Boolean);
+
+                const picked = await D.pickPath({
+
+                    mode: o.mode || 'dir',
+
+                    title: o.title || '',
+
+                    current: multi ? (lines[lines.length - 1] || '') : currentRaw.trim()
+
+                });
+
+                if (picked === null || picked === undefined) return false;
+
+                if (!this.form) return false;
+
+                if (!multi) { this.form[fieldKey] = picked; return true; }
+
+                if (lines.indexOf(picked) < 0) lines.push(picked);
+
+                this.form[fieldKey] = lines.join('\n');
+
+                return true;
+
+            },
 
             canSave() {
                 return !hasErrors(this.revalidate());

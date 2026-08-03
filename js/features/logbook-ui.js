@@ -693,6 +693,34 @@
             // an idle one.
             // Empty means "use the built-in default"; core/logbook.js decides what
             // that is, so the default lives in exactly one place.
+            // The shared folder/file picker. Two behaviours, deliberately:
+            //   * a single-value field is REPLACED;
+            //   * a multi-line field (one path per line) gets the choice APPENDED, because
+            //     replacing a list of paths with one would quietly discard the rest.
+            // Cancelling changes nothing in either case.
+            async browsePath(fieldKey, opts) {
+                const D = root.HangarDialogs;
+                if (!D || typeof D.pickPath !== 'function') return false;
+                const o = opts || {};
+                const multi = !!o.multi;
+                // The restore dialog keeps its fields flat rather than under a
+                // `form` object, so callers there pass bag:'self'.
+                const bag = o.bag === 'self' ? this : (o.bag ? this[o.bag] : this.form);
+                if (!bag) return false;
+                const currentRaw = String(bag[fieldKey] || '');
+                const lines = currentRaw.split('\n').map(function (l) { return l.trim(); }).filter(Boolean);
+                const picked = await D.pickPath({
+                    mode: o.mode || 'dir',
+                    title: o.title || '',
+                    current: multi ? (lines[lines.length - 1] || '') : currentRaw.trim()
+                });
+                if (picked === null || picked === undefined) return false;
+                if (!multi) { bag[fieldKey] = picked; return true; }
+                if (lines.indexOf(picked) < 0) lines.push(picked);
+                bag[fieldKey] = lines.join('\n');
+                return true;
+            },
+
             mountRoot() { return this.mountRootSetting || ''; },
 
             idleMs() {
@@ -1219,6 +1247,23 @@
             // The list the modal shows is the list restic will be given, not the
             // raw selection: an entry that names nothing is dropped by the plan, so
             // showing it here would promise a file that is not going to be written.
+            // The restore destination is the one path in this dialog, and typing it by
+            // hand is how a restore lands somewhere unintended. Kept separate from the
+            // screen's browsePath because this dialog keeps its fields flat rather than
+            // under a `form` object.
+            async browseTarget() {
+                const D = dialogs();
+                if (typeof D.pickPath !== 'function') return false;
+                const picked = await D.pickPath({
+                    mode: 'dir',
+                    current: this.target || '',
+                    title: 'Choose where to restore to'
+                });
+                if (picked === null || picked === undefined) return false;
+                this.target = picked;
+                return true;
+            },
+
             selectionPaths() { return includePathsFrom(this.selection); },
 
             plan() {
