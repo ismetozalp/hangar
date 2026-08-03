@@ -482,6 +482,168 @@ test('describe covers every declared kind', () => {
     });
 });
 
+// ------------------------------------------------------------ the size limit
+//
+// `sizeLimit` (free text) and `minSnapshots` (the floor) are repository fields:
+// capacity belongs to the destination, not to a job. repos.js does not enforce
+// them — core/sizeguard.js does — it only has to carry them through validate()
+// and describe() without inventing a value or losing one.
+
+const Guard = require('../../js/core/sizeguard.js');
+
+test('a repository with no size limit is unchanged — that is the default', () => {
+    assert.deepEqual(Repos.validate({ id: 'nas', kind: 'local', path: '/srv/b' }), []);
+    assert.equal(Repos.describe({ kind: 'local', path: '/srv/b' }), 'Local folder at /srv/b.');
+});
+
+test('validate accepts every size spelling core/sizeguard.js can read', () => {
+    ['500 GB', '500GB', '1.5 TiB', '800M', '2T', '1000000000'].forEach((limit) => {
+        assert.deepEqual(Repos.validate({ id: 'nas', kind: 'local', path: '/srv/b', sizeLimit: limit }),
+            [], limit);
+    });
+});
+
+test('validate rejects a limit nobody can read rather than guessing at one', () => {
+    // A misparsed limit is not a cosmetic bug: it is a decision to delete backups.
+    ['lots', '500 GB extra', '1e3', '1,000 GB', '0x10', '500 GB\n1 TB'].forEach((limit) => {
+        const p = Repos.validate({ id: 'nas', kind: 'local', path: '/srv/b', sizeLimit: limit });
+        assert.equal(p.length, 1, 'accepted ' + JSON.stringify(limit));
+        assert.match(p[0], /not a size hangar can read/i);
+    });
+});
+
+test('a whitespace-only limit is no limit at all, not a broken one', () => {
+    ['   ', '\t', '\n\n'].forEach((limit) => {
+        assert.deepEqual(Repos.validate({ id: 'nas', kind: 'local', path: '/srv/b', sizeLimit: limit }),
+            [], JSON.stringify(limit));
+        assert.equal(Repos.describe({ kind: 'local', path: '/srv/b', sizeLimit: limit }),
+            'Local folder at /srv/b.');
+    });
+});
+
+test('validate rejects a limit of zero or less', () => {
+    ['0', '-5 GB', '0 GB'].forEach((limit) => {
+        assert.deepEqual(Repos.validate({ id: 'nas', kind: 'local', path: '/srv/b', sizeLimit: limit }),
+            ['A size limit must be greater than zero.'], limit);
+    });
+});
+
+test('a suspiciously small limit is a WARNING, so it still saves', () => {
+    // "500" means 500 bytes. That is almost certainly a missing unit — but a tiny
+    // repository of text files is a legitimate thing to cap, so validate() must
+    // not veto it. The editor says so beside the field instead.
+    assert.deepEqual(Repos.validate({ id: 'nas', kind: 'local', path: '/srv/b', sizeLimit: '500' }), []);
+    assert.ok(Guard.validateGuard({ limit: '500' }).some((p) => p.detail.severity === 'warning'));
+});
+
+test('validate rejects a floor that is not a whole number', () => {
+    [
+        '3', 2.5, -1, NaN, Number.MAX_SAFE_INTEGER + 2, {}, [], true
+    ].forEach((min) => {
+        const p = Repos.validate({ id: 'nas', kind: 'local', path: '/srv/b',
+            sizeLimit: '500 GB', minSnapshots: min });
+        assert.equal(p.length, 1, 'accepted floor ' + JSON.stringify(min));
+        assert.match(p[0], /whole number|at least 1/);
+    });
+});
+
+test('validate rejects a floor of 0 — the limit must never delete the last backup', () => {
+    const p = Repos.validate({ id: 'nas', kind: 'local', path: '/srv/b',
+        sizeLimit: '500 GB', minSnapshots: 0 });
+    assert.equal(p.length, 1);
+    assert.match(p[0], /at least 1/);
+});
+
+test('a floor of 1 is a WARNING, so it still saves', () => {
+    assert.deepEqual(Repos.validate({ id: 'nas', kind: 'local', path: '/srv/b',
+        sizeLimit: '500 GB', minSnapshots: 1 }), []);
+});
+
+test('a malformed floor is reported even when no limit is set', () => {
+    // The floor is inert without a limit, but a value nobody can read must not sit
+    // in the file waiting to surprise whoever adds the limit later.
+    const p = Repos.validate({ id: 'nas', kind: 'local', path: '/srv/b', minSnapshots: 'three' });
+    assert.equal(p.length, 1);
+    assert.match(p[0], /whole number/);
+});
+
+test('a missing limit is never reported as a fault — it is the default state', () => {
+    // sizeguard's own validateGuard says "Enter a size limit", which is right for a
+    // guard being configured and wrong for a repository that does not use one.
+    assert.ok(Guard.validateGuard({}).some((p) => p.detail.code === 'limit-missing'));
+    Repos.validate({ id: 'nas', kind: 'local', path: '/srv/b' })
+        .forEach((p) => assert.doesNotMatch(p, /Enter a size limit/));
+});
+
+test('size problems are reported alongside the ordinary field problems', () => {
+    const p = Repos.validate({ id: 'BAD ID', kind: 'local', path: 'relative', sizeLimit: 'lots' });
+    assert.equal(p.length, 3);
+});
+
+test('a size problem is reported even when the backend is unknown', () => {
+    // The limit belongs to the repository, not to a backend, so it cannot be
+    // hidden behind a kind that is also wrong.
+    const p = Repos.validate({ id: 'x', kind: 'dropbox', sizeLimit: '-1 GB' });
+    assert.equal(p.length, 2);
+    assert.match(p.join(' '), /greater than zero/);
+});
+
+test('validate still never throws on a hostile size limit', () => {
+    // Labelled by index, not by String(value): Object.create(null) cannot be
+    // stringified, and a test that throws while writing its own failure message
+    // hides the thing it was testing.
+    [Symbol('s'), {}, [], () => 1, Object.create(null), 5, true, NaN].forEach((limit, i) => {
+        const repo = { id: 'x', kind: 'local', path: '/srv', sizeLimit: limit };
+        assert.equal(survives(() => Repos.validate(repo)), null, 'threw for input ' + i);
+        assert.ok(Array.isArray(Repos.validate(repo)));
+    });
+});
+
+test('describe echoes the limit FORMATTED, so the units can be checked by eye', () => {
+    // "500G" is 500 GB and "500" is 500 bytes. Echoing the typed text back would
+    // prove nothing; echoing the parsed size proves it was understood.
+    assert.equal(Repos.describe({ kind: 'local', path: '/srv/b', sizeLimit: '500G' }),
+        'Local folder at /srv/b. Kept under 500 GB, never fewer than 3 snapshots.');
+    assert.equal(Repos.describe({ kind: 'local', path: '/srv/b', sizeLimit: '1 TiB' }),
+        'Local folder at /srv/b. Kept under 1.1 TB, never fewer than 3 snapshots.');
+});
+
+test('describe names the floor that will actually apply, default included', () => {
+    const at = (min) => Repos.describe({ kind: 'b2', bucket: 'hangar', sizeLimit: '2 TB', minSnapshots: min });
+    assert.match(at(undefined), /never fewer than 3 snapshots\.$/);
+    assert.match(at(10), /never fewer than 10 snapshots\.$/);
+    // Singular, because "1 snapshots" is how a sentence tells you it was generated.
+    assert.match(at(1), /never fewer than 1 snapshot\.$/);
+    // Whatever the file says, the floor can never be below 1.
+    assert.match(at(0), /never fewer than 1 snapshot\.$/);
+});
+
+test('describe echoes an unreadable limit verbatim rather than dropping it', () => {
+    // describe() is what the delete confirmation shows. A setting nobody could
+    // parse must not vanish from the one sentence the user reads.
+    assert.equal(Repos.describe({ kind: 'local', path: '/srv/b', sizeLimit: 'lots' }),
+        'Local folder at /srv/b. Kept under lots, never fewer than 3 snapshots.');
+});
+
+test('describe adds no size sentence to a repository it cannot locate', () => {
+    assert.equal(Repos.describe({ kind: 'dropbox', sizeLimit: '500 GB' }), 'Unknown repository.');
+});
+
+test('describe carries the limit through every backend', () => {
+    Repos.KINDS.forEach((kind) => {
+        assert.match(Repos.describe({ kind: kind, sizeLimit: '500 GB' }),
+            / Kept under 500 GB, never fewer than 3 snapshots\.$/, kind);
+    });
+});
+
+test('describe never throws on a hostile size limit', () => {
+    [Symbol('s'), {}, [], Object.create(null), NaN, -1].forEach((limit, i) => {
+        const repo = { kind: 'local', path: '/srv', sizeLimit: limit, minSnapshots: Symbol('m') };
+        assert.equal(survives(() => Repos.describe(repo)), null, 'threw for input ' + i);
+        assert.equal(typeof Repos.describe(repo), 'string');
+    });
+});
+
 // ---------------------------------------------------------------- rclone remotes
 
 test('parseRcloneRemotes reads the synthetic listremotes fixture', () => {

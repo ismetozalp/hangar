@@ -10,6 +10,16 @@
         ? require('./errors.js')
         : root.HangarErrors;
 
+    // core/sizeguard.js is loaded AFTER this module in index.html — it is grouped
+    // with retention.js, the other thinning policy — so it cannot be captured at
+    // load time. Resolved on first use instead, and a null result simply means the
+    // size fields go unchecked rather than the whole module failing to load.
+    function sizeGuard() {
+        if (root.HangarSizeGuard) return root.HangarSizeGuard;
+        if (typeof module !== 'undefined' && module.exports) return require('./sizeguard.js');
+        return null;
+    }
+
     const KINDS = ['local', 'sftp', 'rest', 's3', 'b2', 'azure', 'gs', 'rclone'];
 
     // Every scheme restic understands. Anything else in front of a colon is part
@@ -195,6 +205,32 @@
         return out;
     }
 
+    // The size limit (`sizeLimit`, free text such as "500 GB") and its floor
+    // (`minSnapshots`) belong to the REPOSITORY, not to a job: capacity is a
+    // property of the destination — a disk or a bucket has one, a job does not —
+    // and two jobs writing to one repository with per-job caps would each delete
+    // the other's snapshots chasing its own number.
+    //
+    // Returns only what must BLOCK a save. core/sizeguard.js also emits warnings
+    // ("500 with no unit is 500 bytes", "a floor of 1 leaves no margin"); those are
+    // advice the editor shows beside the field, and turning advice into a veto
+    // would make a legitimate small-repository cap unsaveable.
+    function guardProblems(repo) {
+        const G = sizeGuard();
+        if (!G) return [];
+        // An absent limit is the DEFAULT and means no size enforcement at all, so
+        // 'limit-missing' — correct when a guard is being configured — is the wrong
+        // answer for a repository that simply does not use one. Everything else
+        // validateGuard finds still applies, including a malformed floor typed
+        // before the limit it belongs to.
+        return G.validateGuard({
+            limit: blank(repo.sizeLimit) ? undefined : str(repo.sizeLimit),
+            minSnapshots: repo.minSnapshots
+        }).filter((p) => !!p && !!p.detail &&
+                p.detail.severity === 'error' && p.detail.code !== 'limit-missing')
+            .map((p) => str(p.message));
+    }
+
     function validate(repo) {
         const problems = [];
         if (!repo || typeof repo !== 'object') return ['Repository definition is missing.'];
@@ -203,6 +239,12 @@
         // str() first: RegExp.test does its own ToString, which throws on a Symbol —
         // and validate's contract is to return problems, never to throw.
         else if (!ID_RE.test(str(repo.id))) problems.push('Repository id may only contain lowercase letters, digits and hyphens.');
+
+        // Before the kind check, deliberately: the size limit and its floor are
+        // properties of the repository itself, not of a backend, so an unreadable
+        // one has to be reported even when the kind is the other thing that is
+        // wrong. It costs nothing on a repository that sets neither.
+        guardProblems(repo).forEach((p) => problems.push(p));
 
         const kind = str(repo.kind);
         if (KINDS.indexOf(kind) < 0) {
@@ -239,8 +281,39 @@
         return env;
     }
 
+    // The size limit read back as a sentence, or '' when the repository has none.
+    //
+    // The limit is echoed FORMATTED ("500 GB"), not as typed, because that is the
+    // only way to see that "500G" was understood as 500 GB and not as 500 bytes.
+    // An unreadable limit is echoed verbatim rather than dropped: describe() is
+    // what the delete confirmation and the repository list show, and silently
+    // omitting a setting nobody could parse is how it stays unnoticed.
+    //
+    // The floor is always named, even when the repository does not set one,
+    // because sizeguard's default (3) applies either way and the number that will
+    // actually stop the deleting is the one worth printing.
+    function guardSentence(repo) {
+        const G = sizeGuard();
+        if (!G || blank(repo.sizeLimit)) return '';
+        const bytes = G.parseSize(str(repo.sizeLimit));
+        const size = (typeof bytes === 'number' && bytes > 0)
+            ? G.formatSize(bytes)
+            : str(repo.sizeLimit);
+        const floor = G.effectiveFloor(repo.minSnapshots);
+        return ' Kept under ' + size + ', never fewer than ' + floor +
+            ' snapshot' + (floor === 1 ? '' : 's') + '.';
+    }
+
     function describe(repo) {
         if (!repo || typeof repo !== 'object') return 'Unknown repository.';
+        const where = locate(repo);
+        // A repository whose location we cannot even name gets no size sentence:
+        // "Unknown repository. Kept under 500 GB." reads as though hangar knows
+        // more about it than it does.
+        return where === 'Unknown repository.' ? where : where + guardSentence(repo);
+    }
+
+    function locate(repo) {
         const kind = str(repo.kind);
         const at = str(repo.prefix) === '' ? '' : ' under ' + str(repo.prefix);
         switch (kind) {

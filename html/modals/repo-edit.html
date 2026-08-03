@@ -132,6 +132,79 @@
                         </div>
                     </template>
 
+                    <!-- The size limit, and the floor that stops it.
+
+                         It lives on the REPOSITORY and not on a job because capacity
+                         is a property of the destination — a disk or a bucket has
+                         one, a job does not — and if two jobs write to one
+                         repository a per-job cap is incoherent: each would delete
+                         the other's snapshots trying to reach its own number.
+
+                         The floor sits immediately beside the limit, in the same
+                         row, because it is the thing that stops the limit deleting
+                         the last backup. Separating them would let someone set a cap
+                         without ever meeting the setting that makes it safe. -->
+                    <hr class="my-4">
+
+                    <h6 class="mb-1">Size limit</h6>
+                    <p class="small text-secondary">
+                        Optional, and empty by default. hangar only deletes snapshots to save
+                        space if you put a number here.
+                    </p>
+
+                    <div class="row g-3">
+                        <div class="col-sm-7">
+                            <label class="form-label" for="hangar-repo-size-limit">Keep this repository under</label>
+                            <!-- Free text, echoed back formatted below. A bare "500" is
+                                 500 BYTES and "500 GB" is 7% smaller than "500 GiB", so
+                                 the only honest interface is to show what was understood. -->
+                            <input id="hangar-repo-size-limit" class="form-control"
+                                   x-model="form.sizeLimit" autocomplete="off" spellcheck="false"
+                                   placeholder="500 GB"
+                                   aria-describedby="hangar-repo-size-limit-help">
+                            <div id="hangar-repo-size-limit-help" class="form-text"
+                                 x-text="limitNote()"></div>
+                        </div>
+
+                        <div class="col-sm-5">
+                            <label class="form-label" for="hangar-repo-min-snapshots">Never delete below</label>
+                            <div class="input-group">
+                                <input id="hangar-repo-min-snapshots" class="form-control"
+                                       type="number" min="1" step="1" inputmode="numeric"
+                                       x-model="form.minSnapshots" placeholder="3"
+                                       aria-describedby="hangar-repo-min-snapshots-help">
+                                <span class="input-group-text">snapshots</span>
+                            </div>
+                            <div id="hangar-repo-min-snapshots-help" class="form-text">
+                                The floor the size limit may never cross. Empty means 3.
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Advice, not a veto: a tiny cap and a floor of 1 are both
+                         legitimate on a small destination, so they are said out loud
+                         and saved anyway. Anything that must block the save arrives
+                         in `problems` at the bottom of the form instead. -->
+                    <div x-show="guardWarnings().length" role="alert"
+                         class="alert alert-warning small mt-3 mb-0">
+                        <ul class="mb-0">
+                            <template x-for="w in guardWarnings()" :key="w"><li x-text="w"></li></template>
+                        </ul>
+                    </div>
+
+                    <!-- The trade-off, stated where the choice is made rather than in
+                         documentation. Always visible: the cost is what someone needs
+                         in order to decide whether to set a limit at all, so hiding it
+                         until they already have is too late. -->
+                    <div class="small text-secondary mt-3">
+                        <p class="mb-1">What a size limit costs when it has to act:</p>
+                        <ul class="mb-0">
+                            <template x-for="t in guardTradeoffs()" :key="t"><li x-text="t"></li></template>
+                        </ul>
+                    </div>
+
+                    <hr class="my-4">
+
                     <!-- Backend credentials live in the repository definition because
                          restic reads them from the environment (HangarRepos.envFor).
                          The file is root-only; the repository password is the one secret

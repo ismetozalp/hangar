@@ -331,6 +331,274 @@ test('validateForm on an empty form still returns problems, not an exception', (
     assert.ok(problems.length >= 2);
 });
 
+// ====================================================================== size limit
+//
+// The limit belongs to the REPOSITORY, not to a job — capacity is a property of
+// the destination, and two jobs sharing one repository with per-job caps would
+// each delete the other's snapshots chasing its own number. So it lives in this
+// editor, and these tests are the proof that it survives the form round trip, is
+// echoed back understood, and cannot be saved in a state that would delete the
+// last backup.
+
+const Guard = require('../../js/core/sizeguard.js');
+
+test('the size fields are on every backend, because they are not a backend setting', () => {
+    for (const kind of Repos.KINDS) {
+        const f = Ui.blankForm(kind);
+        for (const n of Ui.GUARD_FIELDS) assert.equal(f[n], '', kind + '.' + n);
+    }
+});
+
+test('an empty limit is stored as nothing at all — no enforcement is the default', () => {
+    const repo = Ui.formStateToRepo('local', form('local'));
+    assert.equal('sizeLimit' in repo, false);
+    assert.equal('minSnapshots' in repo, false);
+    assert.deepEqual(Repos.validate(repo), []);
+});
+
+test('the limit is stored as the text that was typed, not as a byte count', () => {
+    // "500 GB" and "500 GiB" are different limits and both are things people type.
+    // Keeping the words is what lets the form show back what was entered, and
+    // keeps core/sizeguard.js the only place that turns text into bytes.
+    const repo = Ui.formStateToRepo('local', form('local', { sizeLimit: ' 500 GB ' }));
+    assert.equal(repo.sizeLimit, '500 GB');
+});
+
+test('the floor is stored as a NUMBER, because sizeguard refuses a string', () => {
+    // core/sizeguard.js will not coerce: a floor that quietly reads as NaN is a
+    // floor of zero, which is a floor that deletes the last backup.
+    const repo = Ui.formStateToRepo('local', form('local', { sizeLimit: '500 GB', minSnapshots: ' 5 ' }));
+    assert.equal(repo.minSnapshots, 5);
+    assert.equal(typeof repo.minSnapshots, 'number');
+    assert.deepEqual(Repos.validate(repo), []);
+});
+
+test('a floor that is not a whole number is kept verbatim so validate can report it', () => {
+    for (const bad of ['two', '2.5', '1e3', '٣']) {
+        const repo = Ui.formStateToRepo('local', form('local', { sizeLimit: '500 GB', minSnapshots: bad }));
+        assert.equal(repo.minSnapshots, bad, bad);
+        assert.ok(Ui.validateForm('local', form('local', { sizeLimit: '500 GB', minSnapshots: bad })).length >= 1, bad);
+    }
+});
+
+test('floorValue never guesses: empty is absent, digits are a number, the rest is kept', () => {
+    assert.equal(Ui.floorValue(''), null);
+    assert.equal(Ui.floorValue('   '), null);
+    assert.equal(Ui.floorValue(undefined), null);
+    assert.equal(Ui.floorValue('3'), 3);
+    assert.equal(Ui.floorValue('007'), 7);
+    assert.equal(Ui.floorValue('0'), 0);        // saveable-looking, refused by validate
+    assert.equal(Ui.floorValue('3.0'), '3.0');
+    assert.equal(Ui.floorValue(4), 4);
+    // A negative floor is a whole number that is merely too small, and it earns
+    // the message that explains the rule rather than "must be a whole number".
+    assert.equal(Ui.floorValue('-1'), -1);
+    assert.match(Ui.validateForm('local', form('local',
+        { sizeLimit: '500 GB', minSnapshots: '-1' }))[0], /at least 1/);
+});
+
+test('the floor survives even when the limit is cleared', () => {
+    // Clearing the limit for an afternoon must not silently discard the number
+    // that protects the history when it goes back on.
+    const repo = Ui.formStateToRepo('local', form('local', { sizeLimit: '', minSnapshots: '7' }));
+    assert.equal(repo.minSnapshots, 7);
+    assert.equal('sizeLimit' in repo, false);
+});
+
+test('the size fields round-trip through the form for every backend', () => {
+    for (const kind of Repos.KINDS) {
+        const start = form(kind, { sizeLimit: '1.5 TiB', minSnapshots: '4' });
+        const repo = Ui.formStateToRepo(kind, start);
+        assert.deepEqual(Ui.repoToFormState(repo), start, kind);
+    }
+});
+
+test('switching backend keeps the size limit — it is not a backend setting', () => {
+    const s3 = form('s3', { sizeLimit: '2 TB', minSnapshots: '5' });
+    const b2 = Ui.mergeKind(s3, 'b2');
+    assert.equal(b2.sizeLimit, '2 TB');
+    assert.equal(b2.minSnapshots, '5');
+});
+
+test('validateForm refuses a limit nobody can read', () => {
+    const p = Ui.validateForm('local', form('local', { sizeLimit: 'lots' }));
+    assert.equal(p.length, 1);
+    assert.match(p[0], /not a size hangar can read/i);
+});
+
+test('validateForm refuses a floor of zero — the last backup is not negotiable', () => {
+    const p = Ui.validateForm('local', form('local', { sizeLimit: '500 GB', minSnapshots: '0' }));
+    assert.equal(p.length, 1);
+    assert.match(p[0], /at least 1/);
+});
+
+test('validateForm allows the settings that are merely unusual', () => {
+    // A tiny cap and a floor of 1 are legitimate on a small destination. They are
+    // said out loud beside the field, not vetoed.
+    assert.deepEqual(Ui.validateForm('local', form('local', { sizeLimit: '500', minSnapshots: '1' })), []);
+});
+
+// --- the echo -------------------------------------------------------------
+
+test('limitEcho says what an empty limit means, rather than saying nothing', () => {
+    assert.match(Ui.limitEcho(''), /never delete a snapshot to save space/i);
+    assert.equal(Ui.limitEcho('   '), Ui.limitEcho(''));
+    assert.equal(Ui.limitEcho(undefined), Ui.limitEcho(''));
+});
+
+test('limitEcho echoes the parsed size, which is the point of the free-text box', () => {
+    // A bare number is BYTES and a bare letter is DECIMAL — neither is visible
+    // unless the form says which one it understood.
+    assert.equal(Ui.limitEcho('500 GB'), 'Understood as 500 GB.');
+    assert.equal(Ui.limitEcho('500G'), 'Understood as 500 GB.');
+    assert.equal(Ui.limitEcho('500'), 'Understood as 500 B.');
+    assert.equal(Ui.limitEcho('1 TiB'), 'Understood as 1.1 TB.');
+    assert.equal(Ui.limitEcho(' 800m '), 'Understood as 800 MB.');
+});
+
+test('limitEcho never pretends to understand', () => {
+    for (const bad of ['lots', '1,000 GB', '1e3', '500 GB or so', '0x10'])
+        assert.match(Ui.limitEcho(bad), /Not a size hangar can read/, bad);
+    assert.match(Ui.limitEcho('0'), /greater than zero/);
+    assert.match(Ui.limitEcho('-5 GB'), /greater than zero/);
+});
+
+test('limitEcho agrees with what validate will do about the same text', () => {
+    // The echo and the veto must not disagree: a box that says "Understood as …"
+    // above a form that then refuses to save is worse than either alone.
+    for (const text of ['500 GB', '1.5 TiB', '800M', 'lots', '0', '-5 GB', '500', '']) {
+        const blocked = Repos.validate({ id: 'x', kind: 'local', path: '/srv', sizeLimit: text }).length > 0;
+        assert.equal(/^Understood as|never delete a snapshot/.test(Ui.limitEcho(text)), !blocked, text);
+    }
+});
+
+// --- advice, not vetoes ---------------------------------------------------
+
+test('guardNotes warns that a bare number is bytes', () => {
+    const notes = Ui.guardNotes(form('local', { sizeLimit: '500' }));
+    assert.equal(notes.length, 1);
+    assert.match(notes[0], /500 is 500 bytes, not 500 GB/);
+});
+
+test('guardNotes warns that a floor of 1 is nearly no floor', () => {
+    const notes = Ui.guardNotes(form('local', { sizeLimit: '500 GB', minSnapshots: '1' }));
+    assert.equal(notes.length, 1);
+    assert.match(notes[0], /leaves no margin/);
+});
+
+test('guardNotes reports both at once rather than one at a time', () => {
+    assert.equal(Ui.guardNotes(form('local', { sizeLimit: '500', minSnapshots: '1' })).length, 2);
+});
+
+test('guardNotes is silent for a sensible limit and for no limit at all', () => {
+    assert.deepEqual(Ui.guardNotes(form('local', { sizeLimit: '500 GB', minSnapshots: '3' })), []);
+    assert.deepEqual(Ui.guardNotes(form('local', { sizeLimit: '', minSnapshots: '1' })), []);
+    assert.deepEqual(Ui.guardNotes(null), []);
+    assert.deepEqual(Ui.guardNotes('nonsense'), []);
+});
+
+test('guardNotes carries only warnings — errors are the form problems', () => {
+    // An unreadable limit is an ERROR: it must stop the save, not sit in a yellow
+    // box the user can ignore.
+    assert.deepEqual(Ui.guardNotes(form('local', { sizeLimit: 'lots' })), []);
+    assert.ok(Ui.validateForm('local', form('local', { sizeLimit: 'lots' })).length > 0);
+});
+
+test('every guard note is a sentence the user can act on, never an error code', () => {
+    for (const n of Ui.guardNotes(form('local', { sizeLimit: '500', minSnapshots: '1' }))) {
+        assert.ok(n.length > 20, n);
+        assert.match(n, /\.$/);
+        assert.doesNotMatch(n, /\[object|undefined|NaN/);
+    }
+});
+
+// --- the trade-off, stated where the choice is made -----------------------
+
+test('the form states all three costs of a size limit', () => {
+    const text = Ui.GUARD_TRADEOFFS.join(' ');
+    // prune is slow, especially remotely
+    assert.match(text, /prune/);
+    assert.match(text, /rewrites/);
+    assert.match(text, /slow|minutes/);
+    assert.match(text, /remote/);
+    // deduplication makes each deletion free an unpredictable amount
+    assert.match(text, /[Dd]eduplication/);
+    assert.match(text, /unpredictable/);
+    assert.match(text, /one snapshot at a time/);
+    assert.match(text, /measures/);
+    // the source alone exceeding the limit stops at the floor and says so
+    assert.match(text, /larger than the limit/);
+    assert.match(text, /stops at the minimum/);
+});
+
+test('the trade-off list is frozen and handed out as a copy', () => {
+    // It is rendered by x-for on every keystroke; a component that could mutate
+    // the shared list would rewrite the warning for every other repository.
+    assert.ok(Object.isFrozen(Ui.GUARD_TRADEOFFS));
+    const e = Ui.hangarRepoEdit();
+    const first = e.guardTradeoffs();
+    first.push('injected');
+    assert.deepEqual(e.guardTradeoffs(), Ui.GUARD_TRADEOFFS.slice());
+});
+
+test('the edit component echoes and warns from its own form state', () => {
+    const e = Ui.hangarRepoEdit();
+    e.receive({ mode: 'add', form: Ui.blankForm('local') });
+    assert.match(e.limitNote(), /never delete a snapshot/);
+    assert.deepEqual(e.guardWarnings(), []);
+
+    e.form.sizeLimit = '500';
+    assert.equal(e.limitNote(), 'Understood as 500 B.');
+    assert.equal(e.guardWarnings().length, 1);
+});
+
+test('an edited repository opens with its size limit already in the form', () => {
+    const f = Ui.repoToFormState({ id: 'nas', kind: 'local', path: '/srv/b',
+        sizeLimit: '500 GB', minSnapshots: 4 });
+    assert.equal(f.sizeLimit, '500 GB');
+    assert.equal(f.minSnapshots, '4', 'x-model on a number misbehaves invisibly');
+});
+
+test('the size limit reaches the repository the dialog resolves with', () => {
+    const e = Ui.hangarRepoEdit();
+    let saved = null;
+    e.receive({ mode: 'add', form: Ui.blankForm('local'), resolve: (r) => { saved = r; } });
+    e.form.id = 'nas';
+    e.form.path = '/srv/b';
+    e.form.sizeLimit = '2 TB';
+    e.form.minSnapshots = '5';
+    e.submit();
+    assert.deepEqual(saved, { id: 'nas', kind: 'local', path: '/srv/b',
+        sizeLimit: '2 TB', minSnapshots: 5 });
+});
+
+test('a repository that would delete its last backup cannot be submitted', () => {
+    const e = Ui.hangarRepoEdit();
+    let saved = null;
+    e.receive({ mode: 'add', form: Ui.blankForm('local'), resolve: (r) => { saved = r; } });
+    e.form.id = 'nas';
+    e.form.path = '/srv/b';
+    e.form.sizeLimit = '500 GB';
+    e.form.minSnapshots = '0';
+    e.submit();
+    assert.equal(saved, null, 'a floor of 0 was saved');
+    assert.equal(e.problems.length, 1);
+});
+
+test('the size guard the editor writes is one core/sizeguard.js can act on', () => {
+    // The end-to-end shape: what the form saves must be what planTrim consumes,
+    // or the setting is decoration.
+    const repo = Ui.formStateToRepo('local', form('local', { sizeLimit: '500 GB', minSnapshots: '4' }));
+    const limitBytes = Guard.parseSize(repo.sizeLimit);
+    assert.equal(limitBytes, 500e9);
+    assert.equal(Guard.effectiveFloor(repo.minSnapshots), 4);
+    const snaps = [1, 2, 3, 4, 5].map((n) => ({ id: 'id' + n, time: '2026-0' + n + '-01T00:00:00Z' }));
+    assert.equal(Guard.planTrim({ currentBytes: 600e9, limitBytes, snapshots: snaps,
+        minSnapshots: repo.minSnapshots }).action, 'forget');
+    assert.equal(Guard.planTrim({ currentBytes: 600e9, limitBytes, snapshots: snaps.slice(0, 4),
+        minSnapshots: repo.minSnapshots }).action, 'floor-reached');
+});
+
 // -------------------------------------------------------------- display
 
 test('formatSize renders binary units', () => {
@@ -1412,6 +1680,41 @@ test('the id field is readonly rather than disabled when it is locked', () => {
 
 test('the validation summary is announced', () => {
     assert.match(MODAL, /x-show="problems\.length" role="alert"/);
+});
+
+test('the size limit and its floor are both in the editor, and labelled', () => {
+    assert.match(MODAL, /<label class="form-label" for="hangar-repo-size-limit">/);
+    assert.match(MODAL, /<label class="form-label" for="hangar-repo-min-snapshots">/);
+    assert.match(MODAL, /x-model="form\.sizeLimit"/);
+    assert.match(MODAL, /x-model="form\.minSnapshots"/);
+});
+
+test('the floor sits in the same row as the limit it protects', () => {
+    // It is the thing that stops the limit deleting the last backup. Put it
+    // anywhere else and someone sets a cap without ever meeting the setting that
+    // makes it safe.
+    const row = /<div class="row g-3">[\s\S]*?hangar-repo-size-limit[\s\S]*?hangar-repo-min-snapshots[\s\S]*?<\/div>\s*<\/div>/;
+    assert.match(MODAL, row);
+});
+
+test('the editor echoes the parsed limit back and shows the guard warnings', () => {
+    assert.match(MODAL, /x-text="limitNote\(\)"/);
+    assert.match(MODAL, /guardWarnings\(\)/);
+    assert.match(MODAL, /guardTradeoffs\(\)/);
+});
+
+test('the trade-off is stated in the form, not left to documentation', () => {
+    // Not behind an x-show either: the cost is what someone needs in order to
+    // decide whether to set a limit at all, so revealing it only after they have
+    // is too late.
+    const block = MODAL.slice(MODAL.indexOf('guardTradeoffs()') - 400, MODAL.indexOf('guardTradeoffs()'));
+    assert.doesNotMatch(block, /x-show/);
+    assert.match(MODAL, /costs when it has to act/);
+});
+
+test('the editor says that leaving the limit empty is the default', () => {
+    assert.match(MODAL, /Optional, and empty by default/);
+    assert.match(Ui.limitEcho(''), /No size limit/);
 });
 
 // ==========================================================================

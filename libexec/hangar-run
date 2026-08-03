@@ -20,8 +20,15 @@
 # Reporting that as a unit failure trains users to ignore real failures, so the unit
 # succeeds and the run is recorded with status "partial". The UI surfaces it, and the
 # state file below is what makes it visible after the journal rotates.
+#
+# The size guard (below) obeys the same rule for the same reason and adds NO exit
+# code: a snapshot that was written stays a success even when the cleanup after it
+# could not reach the size target. It is recorded with status "size-limit-exceeded"
+# and a journal warning naming the shortfall instead.
 
+import datetime
 import json
+import math
 import os
 import re
 import signal
@@ -840,6 +847,375 @@ def retention_args(policy):
     return args
 
 
+# ---- the size guard ---------------------------------------------------------
+#
+# A mirror of js/core/sizeguard.js, duplicated for the same reason repo_url and
+# auth_expired are: this helper runs from a systemd timer with no Cockpit session
+# and no node present. tests/integration/hangar-run-sizeguard.test.js drives both
+# implementations over one corpus, which is what stops the copies drifting.
+#
+# Three facts fix the shape, and none of them can be re-derived by reading restic's
+# --help (see the header of js/core/sizeguard.js):
+#
+#   1. restic has NO size or quota option. `forget` offers counts and durations.
+#      Everything here is hangar's own logic on top.
+#   2. `stats` DEFAULTS to --mode restore-size, which sums the sizes of restored
+#      FILES, not the bytes the repository occupies. Measured on a real 2.0 MB
+#      repository the default reported 5.9 MB. A guard fed that number believes the
+#      repository is several times its real size and deletes snapshots that were
+#      never the problem, so --mode raw-data is not a refinement, it is the whole
+#      measurement.
+#   3. Deduplication makes freed space unpredictable — neighbouring snapshots share
+#      blobs — so how many snapshots to delete CANNOT be computed up front. One
+#      snapshot per pass, then prune, then measure again.
+
+# Decimal for a bare letter ("500G"), binary only when spelled with the 'i'.
+# Mirrors UNIT_BYTES in js/core/sizeguard.js; the two are pinned by the tests.
+GUARD_UNIT_BYTES = {
+    "": 1,
+    "b": 1,
+    "k": 10 ** 3, "kb": 10 ** 3, "kib": 1024,
+    "m": 10 ** 6, "mb": 10 ** 6, "mib": 1024 ** 2,
+    "g": 10 ** 9, "gb": 10 ** 9, "gib": 1024 ** 3,
+    "t": 10 ** 12, "tb": 10 ** 12, "tib": 1024 ** 4,
+    "p": 10 ** 15, "pb": 10 ** 15, "pib": 1024 ** 5,
+}
+
+# \Z rather than $ for the reason NAME_RE gives: in Python '$' also matches before a
+# trailing newline, so "500 GB\n" would pass a '$'-anchored pattern that the
+# JavaScript refuses. The two halves must not disagree about what a size is, least
+# of all in the permissive direction.
+#
+# re.ASCII for the same reason, found by the corpus rather than by review: Python's
+# \d matches EVERY Unicode decimal digit, JavaScript's matches 0-9 only. Without it
+# a limit typed in Arabic-Indic digits is refused by the editor and silently obeyed
+# by the runner — a size limit only one half of the product can see.
+GUARD_SIZE_RE = re.compile(r"^(-?)(\d+(?:\.\d+)?)[ \t]*([A-Za-z]{0,3})\Z", re.ASCII)
+
+GUARD_DISPLAY_UNITS = ("B", "kB", "MB", "GB", "TB", "PB")
+
+# JavaScript numbers stop being exact here, and a limit that does not survive a
+# JSON round trip is no longer the number the user typed.
+MAX_SAFE_INT = 2 ** 53 - 1
+
+DEFAULT_MIN_SNAPSHOTS = 3
+DEFAULT_MAX_ITERATIONS = 20
+
+EPOCH_DATE = datetime.date(1970, 1, 1)
+
+GUARD_TIME_RE = re.compile(
+    r"^(\d{4})-(\d{2})-(\d{2})"
+    r"(?:[Tt ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?"
+    r"(?:([Zz])|([+-])(\d{2}):?(\d{2}))?)?\Z", re.ASCII)
+
+
+def js_round(x):
+    """Math.round: half rounds towards +infinity.
+
+    Python's round() is banker's rounding — round(2.5) is 2, Math.round(2.5) is 3 —
+    and a limit that differs between the editor and the runner is a limit nobody
+    can reason about.
+    """
+    return int(math.floor(x + 0.5))
+
+
+def is_number(v):
+    """A finite JSON number. bool is excluded first: it is an int in Python, so an
+    unguarded True would become a one-byte limit."""
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def is_safe_int(v):
+    """Number.isSafeInteger, for a value that arrived from JSON."""
+    if not is_number(v):
+        return False
+    if isinstance(v, float) and not v.is_integer():
+        return False
+    return abs(int(v)) <= MAX_SAFE_INT
+
+
+def parse_size(value):
+    """Bytes, or None when the text is not a size. Mirrors parseSize.
+
+    NEVER a guess: a misparsed limit is not a cosmetic bug, it is a decision to
+    delete backups. Zero and negatives DO parse — they are readable sizes that are
+    merely unusable as a limit — and are refused later, where the refusal can say
+    which of the two it was.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        if not math.isfinite(value):
+            return None
+        n = js_round(value)
+        return n if abs(n) <= MAX_SAFE_INT else None
+    if not isinstance(value, str):
+        return None
+
+    t = value.strip()
+    if not t:
+        return None
+    m = GUARD_SIZE_RE.match(t)
+    if not m:
+        return None
+
+    unit = m.group(3).lower()
+    if unit not in GUARD_UNIT_BYTES:
+        return None
+    try:
+        magnitude = float(m.group(2))
+    except (ValueError, OverflowError):
+        return None
+    # 400 digits of "9" parse to inf. A limit nobody can represent is not a limit.
+    if not math.isfinite(magnitude):
+        return None
+    product = magnitude * GUARD_UNIT_BYTES[unit]
+    if not math.isfinite(product):
+        return None
+    n = js_round(product)
+    if m.group(1) == "-":
+        n = -n
+    return n if abs(n) <= MAX_SAFE_INT else None
+
+
+def format_size(n):
+    """Decimal, matching formatSize in js/core/sizeguard.js and the UI."""
+    if not is_number(n) or n <= 0:
+        return "0 B"
+    value = min(float(n), float(MAX_SAFE_INT))
+    if value < 1000:
+        return "%d B" % js_round(value)
+    unit = 0
+    while value >= 1000 and unit < len(GUARD_DISPLAY_UNITS) - 1:
+        value /= 1000.0
+        unit += 1
+    rounded = js_round(value * 10) / 10.0
+    text = "%d" % rounded if float(rounded).is_integer() else "%.1f" % rounded
+    return "%s %s" % (text, GUARD_DISPLAY_UNITS[unit])
+
+
+def guard_over_by(current_bytes, limit_bytes):
+    """Bytes over the limit, or 0. Anything unreadable is "not over", which is the
+    answer that deletes nothing."""
+    if not is_number(current_bytes) or not is_number(limit_bytes):
+        return 0
+    over = current_bytes - limit_bytes
+    return over if over > 0 else 0
+
+
+def effective_floor(min_snapshots):
+    """The floor actually applied, which is not simply what the config asked for:
+    no value may push it below 1, so this helper cannot plan the deletion of the
+    last remaining backup whatever a hand-edited file says."""
+    if min_snapshots is None or not is_safe_int(min_snapshots):
+        return DEFAULT_MIN_SNAPSHOTS
+    n = int(min_snapshots)
+    return 1 if n < 1 else n
+
+
+def effective_budget(max_iterations):
+    if max_iterations is None or not is_safe_int(max_iterations):
+        return DEFAULT_MAX_ITERATIONS
+    n = int(max_iterations)
+    return 0 if n < 0 else n
+
+
+def iterations_done(v):
+    return int(v) if is_safe_int(v) and v >= 0 else 0
+
+
+def snapshot_time_ms(snapshot):
+    """Epoch milliseconds for a snapshot, or None when it cannot be dated.
+
+    A bare NUMBER is refused on purpose, exactly as timeOf() refuses it: restic
+    emits RFC 3339 strings, and a raw number could be epoch seconds or epoch
+    milliseconds. A factor of 1000 between those two silently reorders the whole
+    list and picks the newest snapshot as the oldest.
+    """
+    t = snapshot.get("time")
+    if not isinstance(t, str):
+        return None
+    t = t.strip()
+    if not t:
+        return None
+    m = GUARD_TIME_RE.match(t)
+    if not m:
+        return None
+
+    year, month, day = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    has_time = m.group(4) is not None
+    hour = int(m.group(4) or 0)
+    minute = int(m.group(5) or 0)
+    second = int(m.group(6) or 0)
+    frac = m.group(7) or ""
+    millis = int((frac + "000")[:3]) if frac else 0
+
+    if minute > 59 or second > 59:
+        return None
+    # 24:00:00 is midnight at the end of the day — legal in ISO 8601 and accepted
+    # by Date.parse, so accepted here rather than left as a silent disagreement.
+    day_carry = 0
+    if hour == 24:
+        if minute or second or millis:
+            return None
+        hour, day_carry = 0, 1
+    elif hour > 23:
+        return None
+
+    # The month is validated, the day is RANGE-checked and then allowed to roll
+    # over, because that is what Date.parse does: "2026-02-30" is 2 March, not an
+    # error. Refusing it here would make the same snapshot datable in the browser
+    # and undatable in the runner, and an undatable snapshot is one the guard
+    # refuses to delete.
+    if not 1 <= month <= 12 or not 1 <= day <= 31:
+        return None
+    try:
+        date = (datetime.date(year, month, 1)
+                + datetime.timedelta(days=day - 1 + day_carry))
+    except (ValueError, OverflowError):
+        return None
+
+    if m.group(8):                                  # Z
+        offset_ms = 0
+    elif m.group(9):                                # +HH:MM / -HH:MM
+        oh, om = int(m.group(10)), int(m.group(11))
+        if oh > 23 or om > 59:
+            return None
+        offset_ms = (oh * 3600 + om * 60) * 1000
+        if m.group(9) == "-":
+            offset_ms = -offset_ms
+    elif has_time:
+        # A date-time with no offset is LOCAL time, as Date.parse reads it. Wrong
+        # by an hour at worst, and never wrong about which snapshot is older.
+        try:
+            naive = datetime.datetime(date.year, date.month, date.day, hour, minute, second)
+            return js_round(naive.timestamp() * 1000) + millis
+        except (ValueError, OverflowError, OSError):
+            return None
+    else:
+        # A date with no time at all is UTC midnight, again as Date.parse reads it.
+        offset_ms = 0
+
+    days = (date - EPOCH_DATE).days
+    total = (days * 86400 + hour * 3600 + minute * 60 + second) * 1000 + millis
+    return total - offset_ms
+
+
+def trim_decision(action, snapshot, reason, remaining):
+    return {"action": action, "snapshot": snapshot, "reason": reason, "remaining": remaining}
+
+
+def plan_trim(cfg):
+    """The SINGLE next step of a trim loop. Mirrors planTrim in js/core/sizeguard.js.
+
+      {currentBytes, limitBytes, snapshots, minSnapshots, iterations, maxIterations}
+        -> {action, snapshot, reason, remaining}
+
+    Exactly one snapshot per call. A batch is tempting and wrong: deduplication
+    means the space a forget frees cannot be known in advance, so a batch overshoots
+    by an unknowable amount — and an overshoot here is destroyed history.
+
+    Every uncertain input resolves to "delete nothing", never to a guess.
+    """
+    if not isinstance(cfg, dict):
+        cfg = {}
+
+    limit_bytes = cfg.get("limitBytes")
+    if not is_number(limit_bytes) or limit_bytes <= 0:
+        return trim_decision("none", None, "no-limit", 0)
+
+    # An unmeasurable size is the input most likely to be wrong in the dangerous
+    # direction, so a caller handing over a failed `stats` gets "nothing deleted".
+    current_bytes = cfg.get("currentBytes")
+    if not is_number(current_bytes) or current_bytes < 0:
+        return trim_decision("none", None, "unknown-size", 0)
+
+    remaining = guard_over_by(current_bytes, limit_bytes)
+    if remaining == 0:
+        return trim_decision("none", None, "under-limit", 0)
+
+    snapshots = cfg.get("snapshots")
+    present = [s for s in snapshots if isinstance(s, dict)] if isinstance(snapshots, list) else []
+    if not present:
+        return trim_decision("floor-reached", None, "no-snapshots", remaining)
+
+    # Counted against every snapshot that EXISTS, not only the ones we could name:
+    # the floor is about how much history survives, and an entry we cannot read is
+    # still surviving history.
+    floor = effective_floor(cfg.get("minSnapshots"))
+    if len(present) <= floor:
+        return trim_decision("floor-reached", None, "floor", remaining)
+
+    # After the floor, deliberately: when both apply the floor is the durable
+    # condition, and "budget spent" would invite an operator to raise the budget and
+    # re-run, which cannot help.
+    if iterations_done(cfg.get("iterations")) >= effective_budget(cfg.get("maxIterations")):
+        return trim_decision("exhausted", None, "budget", remaining)
+
+    # A candidate must be nameable (restic forgets by id) and datable (we must know
+    # it is the oldest). Input ORDER is never a fallback: callers sort and filter,
+    # and trusting an assumed order is how a guard deletes the newest snapshot.
+    best = None
+    for s in present:
+        sid = s.get("id")
+        if not isinstance(sid, str) or not sid:
+            continue
+        ms = snapshot_time_ms(s)
+        if ms is None:
+            continue
+        # Ties break on id so a shuffled list cannot change the outcome.
+        if best is None or ms < best[1] or (ms == best[1] and sid < best[2]):
+            best = (s, ms, sid)
+
+    if best is None:
+        return trim_decision("floor-reached", None, "undatable", remaining)
+    return trim_decision("forget", best[0], "oldest", remaining)
+
+
+def guard_config(repo, warnings):
+    """The repository's size guard, or None when it has none.
+
+    An unusable limit is a WARNING, not a die(): refusing to run would turn a typo
+    in one optional field into a host with no backups at all, and the guard's own
+    rule is that every uncertain input resolves to deleting nothing. So the backup
+    still happens, nothing is deleted for size, and the reason is in the plan and in
+    the journal where an operator can see it.
+    """
+    cfg = repo.get("sizeGuard")
+    if cfg is None or cfg == "" or cfg == {}:
+        return None
+    if not isinstance(cfg, dict):
+        warn(warnings, "size-guard", "guard-not-object",
+             "the repository's size guard is not an object, so no size limit is "
+             "enforced and no snapshots will be deleted for size")
+        return None
+
+    raw = cfg.get("limit")
+    if raw is None or raw == "":
+        return None
+
+    limit_bytes = parse_size(raw)
+    if limit_bytes is None:
+        warn(warnings, "size-guard", "limit-unparseable",
+             "the repository's size limit %r cannot be read as a size, so no size "
+             "limit is enforced and no snapshots will be deleted for size" % (raw,),
+             limit=str(raw))
+        return None
+    if limit_bytes <= 0:
+        warn(warnings, "size-guard", "limit-not-positive",
+             "the repository's size limit %r is not greater than zero, so no size "
+             "limit is enforced and no snapshots will be deleted for size" % (raw,),
+             limit=str(raw))
+        return None
+
+    return {
+        "limit": str(raw),
+        "limitBytes": limit_bytes,
+        "minSnapshots": effective_floor(cfg.get("minSnapshots")),
+        "maxIterations": effective_budget(cfg.get("maxIterations")),
+    }
+
+
 def build_plan(job, repo):
     try:
         url = repo_url(repo)
@@ -872,12 +1248,25 @@ def build_plan(job, repo):
         backup.extend(["--tag", tag])
 
     plan = {
-        "backup": backup, "forget": None, "env": backend_env(repo),
+        "backup": backup, "forget": None, "guard": None, "env": backend_env(repo),
         "sources": sources, "pre": pre, "post": post, "warnings": warnings,
     }
     ret = retention_args(job.get("retention"))
     if ret:
         plan["forget"] = base + ["forget", "--json", "--prune"] + ret
+
+    guard = guard_config(repo, warnings)
+    if guard:
+        # --mode raw-data, always. The default (restore-size) sums the sizes of
+        # restored files: a real 2.0 MB repository measures 5.9 MB that way, and a
+        # guard reading that number deletes snapshots that were never the problem.
+        guard["stats"] = base + ["stats", "--json", "--mode", "raw-data"]
+        guard["snapshots"] = base + ["snapshots", "--json"]
+        # The snapshot id is appended at run time — which one it is cannot be known
+        # before the previous pass has been measured. --prune because forgetting
+        # alone frees nothing: it only unlinks the snapshot from its data.
+        guard["forget"] = base + ["forget", "--json", "--prune"]
+        plan["guard"] = guard
 
     # Last gate before anything is executed. Every volume name, container name,
     # domain name, dump command and discovered path has arrived here through a
@@ -885,6 +1274,9 @@ def build_plan(job, repo):
     check_argv(plan["backup"], "backup")
     if plan["forget"]:
         check_argv(plan["forget"], "forget")
+    if plan["guard"]:
+        for key in ("stats", "snapshots", "forget"):
+            check_argv(plan["guard"][key], "guard-" + key)
     for st in pre + post:
         check_argv(st["argv"], "step", source=st.get("source"))
         if st.get("capture") is not None:
@@ -1102,6 +1494,252 @@ def stream_restic(argv, env, label):
     return code, summary, errors, stderr_text
 
 
+# ---- running the size guard -------------------------------------------------
+
+
+def run_reader(argv, env):
+    """Run a restic command that answers with one JSON document; return (code, stdout, stderr).
+
+    Deliberately NOT bounded by CMD_TIMEOUT. That deadline exists for `volume
+    inspect` and `virsh`, which answer in milliseconds or are wedged; `stats` and
+    `snapshots` legitimately take minutes on a large remote repository — exactly the
+    repositories a size limit is set on — and killing them at 20s would report
+    "size could not be measured" on every one of them.
+
+    Popen rather than subprocess.run so a signal arriving mid-read still takes
+    restic with it, as stream_restic does: a restic left running against the
+    repository would hold the lock after we have gone.
+    """
+    try:
+        proc = subprocess.Popen(argv, env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+    except FileNotFoundError:
+        return 127, "", "%s: command not found" % argv[0]
+    except (OSError, ValueError, TypeError) as e:
+        return 126, "", str(e)
+    try:
+        out, err = proc.communicate()
+    except BaseException:
+        proc.kill()
+        proc.wait()
+        raise
+    return proc.returncode, out or "", err or ""
+
+
+def json_document(text):
+    """The single JSON document restic answered with, or None.
+
+    Tolerant of a stray non-JSON line in front of it (a backend notice, a progress
+    line on a terminal) for the reason parse_volume_inspect is tolerant: absorbing
+    that costs three lines, and failing on it would read as "size unmeasurable" and
+    silently disable the guard.
+    """
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        pass
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or line[0] not in "[{":
+            continue
+        try:
+            return json.loads(line)
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def measure_repo(guard, env):
+    """Bytes the repository occupies, or None when it cannot be measured.
+
+    None is a real answer here and must stay distinct from 0: plan_trim reads an
+    unknown size as "delete nothing", and a 0 would read as "wildly under the
+    limit" — the same outcome by luck rather than by rule.
+    """
+    code, out, err = run_reader(guard["stats"], env)
+    if code != 0:
+        log("warning", "could not measure the repository size",
+            exit_code=code, error=last_line(err))
+        return None
+    doc = json_document(out)
+    if not isinstance(doc, dict):
+        log("warning", "restic stats did not answer with a JSON document",
+            text=last_line(out))
+        return None
+    total = doc.get("total_size")
+    if not is_number(total) or total < 0:
+        log("warning", "restic stats answered with no usable total_size")
+        return None
+    return total
+
+
+def list_snapshots(guard, env):
+    """Every snapshot in the repository, or None when the list could not be read.
+
+    None, again, is not []: an empty list is "there is nothing left to delete",
+    which is a conclusion, while a failed listing is the absence of one.
+    """
+    code, out, err = run_reader(guard["snapshots"], env)
+    if code != 0:
+        log("warning", "could not list snapshots for the size guard",
+            exit_code=code, error=last_line(err))
+        return None
+    doc = json_document(out)
+    if not isinstance(doc, list):
+        log("warning", "restic snapshots did not answer with a JSON array",
+            text=last_line(out))
+        return None
+    return [s for s in doc if isinstance(s, dict)]
+
+
+def short_id_of(snapshot):
+    sid = snapshot.get("short_id")
+    if isinstance(sid, str) and sid:
+        return sid
+    sid = snapshot.get("id")
+    return sid[:8] if isinstance(sid, str) else ""
+
+
+def guard_stop(reason, remaining, error):
+    """A stop this helper invented rather than one plan_trim returned.
+
+    Always spelled 'unknown-size', never a reason of our own: describeOutcome in
+    js/core/sizeguard.js is the only thing that turns this record into a sentence,
+    and its fallthrough for an unrecognised 'none' reason is "the repository is
+    within its size limit" — a success sentence for a run that failed to measure or
+    failed to delete. 'unknown-size' renders as "nothing was changed", which is
+    true of every one of these stops. The precise cause travels in `error` and in
+    the journal warning beside it.
+    """
+    out = trim_decision("none", None, "unknown-size", remaining)
+    out["error"] = error
+    return out
+
+
+def run_size_guard(guard, env):
+    """Keep the repository under its size limit; return the record, or None.
+
+    The shape is forced by deduplication: forget the oldest -> prune -> measure ->
+    ask again. How much a forget frees cannot be known before it is done, so the
+    loop measures instead of predicting.
+
+    The normal path — a repository under its limit — costs exactly one `stats` call
+    and says nothing at all. Nothing else runs, not even the snapshot listing.
+
+    This function never raises and never fails the run. The snapshot was already
+    written; failing the unit because a later cleanup could not reach a target would
+    train the operator to ignore red.
+    """
+    if not guard:
+        return None
+
+    limit = guard["limitBytes"]
+    started = time.time()
+    start_bytes = None
+    current = None
+    iterations = 0
+    forgotten = []
+
+    # Interrupted is caught around the WHOLE loop, not only around the forget: a
+    # `stats` or `snapshots` on a large remote repository takes long enough for an
+    # operator to give up on it, and letting the exception out here would end a
+    # SUCCESSFUL backup with a traceback and exit 1. The unwind has already
+    # happened — the post steps ran before the guard started — so there is nothing
+    # left to undo, only something to record.
+    try:
+        start_bytes = measure_repo(guard, env)
+        current = start_bytes
+        if start_bytes is None:
+            outcome = guard_stop("unknown-size", 0, "the repository size could not be measured")
+        else:
+            while True:
+                if guard_over_by(current, limit) == 0:
+                    outcome = trim_decision("none", None, "under-limit", 0)
+                    break
+
+                # Only a repository that is OVER ever pays for this call.
+                snapshots = list_snapshots(guard, env)
+                if snapshots is None:
+                    outcome = guard_stop("unknown-size", guard_over_by(current, limit),
+                                         "the snapshots could not be listed")
+                    break
+
+                outcome = plan_trim({
+                    "currentBytes": current,
+                    "limitBytes": limit,
+                    "snapshots": snapshots,
+                    "minSnapshots": guard["minSnapshots"],
+                    "iterations": iterations,
+                    "maxIterations": guard["maxIterations"],
+                })
+                if outcome["action"] != "forget":
+                    break
+
+                snapshot = outcome["snapshot"]
+                short = short_id_of(snapshot)
+                log("info", "over the size limit, forgetting the oldest snapshot",
+                    snapshot=short, size=format_size(current), limit=guard["limit"],
+                    over=format_size(outcome["remaining"]), pass_number=iterations + 1)
+
+                code, _summary, _errors, _stderr = stream_restic(
+                    guard["forget"] + [snapshot["id"]], env, "size guard forget")
+                iterations += 1
+                if code != 0:
+                    outcome = guard_stop(
+                        "unknown-size", guard_over_by(current, limit),
+                        "forgetting %s failed with exit %d" % (short or "a snapshot", code))
+                    break
+                forgotten.append(short)
+
+                measured = measure_repo(guard, env)
+                if measured is None:
+                    outcome = guard_stop("unknown-size", guard_over_by(current, limit),
+                                         "the repository size could not be measured after pruning")
+                    break
+                current = measured
+    except Interrupted as e:
+        outcome = guard_stop("unknown-size", guard_over_by(current, limit),
+                             "interrupted by signal %d" % e.signum)
+
+    remaining = outcome.get("remaining") or 0
+    record = {
+        # These three are spelled exactly as describeOutcome() in
+        # js/core/sizeguard.js reads them, so the UI renders the sentence straight
+        # from this record instead of translating it first.
+        "action": outcome["action"],
+        "reason": outcome["reason"],
+        "remaining": remaining,
+        "limit": guard["limit"],
+        "limit_bytes": limit,
+        "start_bytes": start_bytes,
+        "size_bytes": current,
+        "forgotten": forgotten,
+        "iterations": iterations,
+        "min_snapshots": guard["minSnapshots"],
+        "max_iterations": guard["maxIterations"],
+        "seconds": round(time.time() - started, 3),
+    }
+    if outcome.get("error"):
+        record["error"] = outcome["error"]
+
+    if remaining > 0:
+        # The load-bearing report. A run that stopped while still over the limit is
+        # not a success, and the operator has to be told in words how far short it
+        # is — a status code in a state file nobody opens is not a warning.
+        log("warning", "the repository is still %s over its size limit" % format_size(remaining),
+            reason=record["reason"], action=record["action"], limit=guard["limit"],
+            size=format_size(current), over_bytes=remaining,
+            deleted=len(forgotten), passes=iterations,
+            min_snapshots=guard["minSnapshots"], max_iterations=guard["maxIterations"],
+            error=record.get("error"))
+    elif forgotten:
+        log("info", "the repository is within its size limit again",
+            size=format_size(current), limit=guard["limit"],
+            deleted=len(forgotten), passes=iterations)
+
+    return record
+
+
 def write_state(job_id, record):
     try:
         os.makedirs(STATE_DIR, mode=0o755, exist_ok=True)
@@ -1230,6 +1868,22 @@ def main(argv):
             run_hook("post", hooks.get("post"), env)
             die(3, "retention/prune failed after a successful backup", exit_code=fcode)
 
+    # After the retention forget, deliberately: retention is the policy the user
+    # asked for, and the guard only exists to catch what that policy did not keep
+    # small enough. Running it first would delete snapshots retention would have
+    # removed for free.
+    guard_record = run_size_guard(plan.get("guard"), env)
+    if guard_record:
+        record["size_guard"] = guard_record
+        if guard_record["remaining"] > 0:
+            # A distinct status, not "ok" and not "failed". The snapshot was
+            # written, so the unit succeeds — but a repository still over its limit
+            # after the guard has done all it may is a state the operator has to be
+            # able to see in the morning without reading the journal. It replaces
+            # "partial" as well; the read errors are still in `kind` and
+            # `unreadable`, while the shortfall has no other field the UI reads.
+            record["status"] = "size-limit-exceeded"
+
     write_state(job_id, record)
     run_hook("post", hooks.get("post"), env)
     if post_failures:
@@ -1238,7 +1892,7 @@ def main(argv):
         # clean run, or nobody will look until the service is missed.
         die(4, "source post-command failed", count=post_failures,
             snapshot=record.get("snapshot"))
-    log("info", "backup complete", status=status, snapshot=record.get("snapshot"))
+    log("info", "backup complete", status=record["status"], snapshot=record.get("snapshot"))
     return 0
 
 

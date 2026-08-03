@@ -80,7 +80,11 @@ const DEFAULT_STUB = {
         'unzip -v': 'UnZip 6.00 of 20 April 2009',
         'curl --version': 'curl 8.9.1 (x86_64-redhat-linux-gnu)',
         'ls -1 /etc/hangar/repos': '',
-        'ls -1 /etc/hangar/jobs': ''
+        'ls -1 /etc/hangar/jobs': '',
+        // Every config write now creates its parent directory first, because
+        // /etc/hangar does not exist on a symlink install and the first save of
+        // anything used to fail with a bare "not-found".
+        'install -d': ''
     },
     files: {
         '/etc/hangar/config.json': JSON.stringify({ mountRoot: '/run/hangar/mnt' }),

@@ -131,3 +131,57 @@ test('ID_RE is anchored — no partial matches', () => {
     assert.equal(C.ID_RE.test('good\nbad'), false);
     assert.equal(C.ID_RE.test('good bad'), false);
 });
+
+// --- the config directory may not exist yet ------------------------------
+//
+// Reported from real use: picking a theme said "The theme was applied, but could
+// not be saved: not-found". /etc/hangar is created by `make install`, and a
+// symlink into ~/.local/share/cockpit — a perfectly normal way to run a Cockpit
+// plugin — never runs it. So on that install EVERY save failed, not just the
+// theme: repositories, jobs, settings and the DR config too.
+
+test('directory modes mirror what make install creates', () => {
+    // repos/ holds repository passwords alongside the definitions, so it is 0700
+    // while the rest is ordinary world-readable configuration.
+    assert.equal(C.dirModeFor('/etc/hangar'), '0755');
+    assert.equal(C.dirModeFor('/etc/hangar/jobs'), '0755');
+    assert.equal(C.dirModeFor('/etc/hangar/repos'), '0700');
+});
+
+test('an unknown directory gets the conservative default, not repos mode', () => {
+    assert.equal(C.dirModeFor('/etc/hangar/something-new'), '0755');
+    assert.equal(C.dirModeFor(''), '0755');
+    assert.equal(C.dirModeFor('__proto__'), '0755');
+});
+
+test('a raw cockpit problem code becomes something a user can act on', () => {
+    // "not-found" on its own reads as a bug in hangar rather than as a missing
+    // directory, which is what sent this report in.
+    const notFound = C.writeFailureText({ problem: 'not-found' }, '/etc/hangar/config.json');
+    assert.match(notFound, /\/etc\/hangar\/config\.json/);
+    assert.ok(!/^not-found$/.test(notFound));
+    assert.match(notFound, /folder/i);
+
+    assert.match(C.writeFailureText({ problem: 'access-denied' }, '/x'), /[Pp]ermission/);
+    assert.match(C.writeFailureText({ problem: 'no-space-left' }, '/x'), /space/i);
+});
+
+test('writeFailureText always names the path and never returns empty', () => {
+    for (const e of [null, undefined, {}, new Error(''), { problem: '' }, 'a string']) {
+        const text = C.writeFailureText(e, '/etc/hangar/config.json');
+        assert.ok(text && text.trim() !== '', 'empty failure text for ' + JSON.stringify(e));
+        assert.match(text, /\/etc\/hangar\/config\.json/);
+    }
+});
+
+test('ensureDirFor derives the directory from the file path', async () => {
+    // No cockpit under node, so it must reject with a typed error rather than
+    // throwing an untyped one — the same contract as every other I/O entry point.
+    await assert.rejects(() => C.ensureDirFor('/etc/hangar/config.json'),
+        (e) => e.kind === 'GENERIC');
+});
+
+test('writeJson refuses cleanly with no cockpit rather than half-writing', async () => {
+    await assert.rejects(() => C.writeJson('/etc/hangar/config.json', { a: 1 }),
+        (e) => e.kind === 'GENERIC');
+});

@@ -566,7 +566,10 @@
                 } catch (e) {
                     // The palette is already applied, so say plainly that only the
                     // saving failed rather than reverting the colour under the user.
-                    this.themeError = 'The theme was applied, but could not be saved: ' +
+                    // Two sentences, not a colon: core/config.js now returns a full
+                    // sentence rather than a raw cockpit problem code, and gluing one
+                    // onto a clause reads as broken output.
+                    this.themeError = 'The theme was applied, but could not be saved. ' +
                         errorText(e);
                     this.theme = id;
                     void previous;

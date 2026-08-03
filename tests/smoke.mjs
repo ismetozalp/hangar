@@ -149,6 +149,12 @@ if (!exists('libexec/hangar-run')) {
     // everything.
     if (!helper.includes('refusing to prune'))
         fail('hangar-run lost its empty-retention guard');
+    // The size guard's measurement. `restic stats` DEFAULTS to --mode restore-size,
+    // which counts restored file sizes: a real 2.0 MB repository reported 5.9 MB
+    // that way. A guard reading that number deletes snapshots that were never the
+    // problem, so the mode is not an option here.
+    if (helper.includes('"stats"') && !helper.includes('raw-data'))
+        fail('hangar-run measures the repository without --mode raw-data');
     ok('hangar-run structural checks pass');
 }
 

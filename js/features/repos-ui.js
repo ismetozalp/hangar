@@ -22,6 +22,7 @@
     const Config = root.HangarConfig || (req ? req('../core/config.js') : null);
     const Restic = root.HangarRestic || (req ? req('../engine/restic.js') : null);
     const Rclone = root.HangarRclone || (req ? req('../core/rclone.js') : null);
+    const SizeGuard = root.HangarSizeGuard || (req ? req('../core/sizeguard.js') : null);
 
     // app.js loads AFTER the feature scripts, so HangarDialogs cannot be captured
     // at load time — it is resolved on first use instead.
@@ -90,6 +91,37 @@
         b2: ['accountId', 'accountKey'],
         azure: ['accountName', 'accountKey']
     };
+
+    // ---------------------------------------------------------- pure: size limit
+    //
+    // The size limit and the floor beneath it are NOT in FIELD/ORDER: those are
+    // keyed by backend, and these two belong to the repository whatever it is
+    // stored on. They are a section of their own in the form.
+    //
+    // On the repository rather than on a job, because capacity is a property of
+    // the destination — a disk or a bucket has one, a job does not — and if two
+    // jobs write to one repository a per-job cap is incoherent: each would delete
+    // the other's snapshots trying to reach its own number.
+    const GUARD_FIELDS = ['sizeLimit', 'minSnapshots'];
+
+    // What a size limit costs when it actually has to act. Stated here, in the
+    // form, rather than in documentation: the moment someone types "500 GB" is the
+    // only moment they are thinking about it.
+    //
+    // Kept as data so the wording is unit tested rather than buried in markup —
+    // the modal loops over this list.
+    const GUARD_TRADEOFFS = Object.freeze([
+        'Deleting to reach a size target runs restic prune, which rewrites ' +
+            'repository data. On a remote destination that is slow — minutes at ' +
+            'best, and it happens while the backup window is open.',
+        'Deduplication means snapshots share data, so each deletion frees an ' +
+            'unpredictable amount: forgetting a snapshot that "contains" 40 GB can ' +
+            'free almost nothing. hangar therefore removes one snapshot at a time ' +
+            'and measures the repository again after every prune.',
+        'If the source data alone is larger than the limit, the limit cannot be ' +
+            'met by deleting backups. hangar stops at the minimum below and says ' +
+            'so, rather than deleting everything chasing a number it cannot reach.'
+    ]);
 
     const REMEDIATION_LABEL = {
         'unlock': 'Unlock repository',
@@ -176,7 +208,26 @@
         const k = isKind(kind) ? str(kind) : 'local';
         const form = { id: '', label: '', kind: k };
         fieldsFor(k).forEach(function (f) { form[f.name] = ''; });
+        // Present on every backend, and empty by default: no size limit is the
+        // default state and means hangar never deletes anything to save space.
+        GUARD_FIELDS.forEach(function (n) { form[n] = ''; });
         return form;
+    }
+
+    // The floor as it should be STORED. core/sizeguard.js refuses a non-number
+    // outright rather than coercing one, because a floor that quietly reads as NaN
+    // is a floor of zero — so a clean whole number becomes a number here, and
+    // anything else is kept exactly as typed for validate() to report. Nothing is
+    // guessed at: '' means "not set", where sizeguard's own default (3) applies.
+    // A leading minus is accepted into a NUMBER on purpose. -1 is a whole number
+    // that is simply too small, and sizeguard can then say "the minimum must be at
+    // least 1 — a size limit must never delete the last backup", which is the
+    // sentence that teaches the rule. Left as a string it would get the useless
+    // "must be a whole number" instead.
+    function floorValue(raw) {
+        const t = trimmed(raw);
+        if (t === '') return null;
+        return /^-?\d+$/.test(t) ? Number(t) : t;
     }
 
     function repoToFormState(repo) {
@@ -186,6 +237,10 @@
         form.id = str(r.id);
         form.label = str(r.label);
         fieldsFor(kind).forEach(function (f) { form[f.name] = str(r[f.name]); });
+        // str(), like every other field: minSnapshots is stored as a number, and
+        // x-model on a number produces a form that misbehaves in ways nobody can
+        // see. It becomes a number again in formStateToRepo.
+        GUARD_FIELDS.forEach(function (n) { form[n] = str(r[n]); });
         return form;
     }
 
@@ -207,7 +262,57 @@
             const v = trimmed(f[d.name]);
             if (v !== '') repo[d.name] = v;
         });
+
+        // The limit is stored as the TEXT that was typed, not as a byte count.
+        // "500 GB" and "500 GiB" are different limits and both are things people
+        // type; keeping the words means the form shows back what was entered and
+        // core/sizeguard.js stays the one place that turns text into bytes.
+        const limit = trimmed(f.sizeLimit);
+        if (limit !== '') repo.sizeLimit = limit;
+
+        // Kept even when there is no limit. The floor is inert without one, but a
+        // user who clears the limit for an afternoon should not silently lose the
+        // number that protects their history when they put it back.
+        const floor = floorValue(f.minSnapshots);
+        if (floor !== null) repo.minSnapshots = floor;
+
         return repo;
+    }
+
+    // What the user typed, read back to them. This echo is the entire reason the
+    // limit is free text rather than a number and a unit dropdown: a bare "500"
+    // means 500 BYTES, "500 GB" and "500 GiB" differ by 7% (37 GB on a 500 GB
+    // cap), and none of that is visible unless hangar says which one it understood.
+    function limitEcho(value) {
+        const raw = trimmed(value);
+        if (raw === '')
+            return 'No size limit: hangar will never delete a snapshot to save space.';
+        if (!SizeGuard) return '';
+        const bytes = SizeGuard.parseSize(raw);
+        if (bytes === null)
+            return 'Not a size hangar can read. Use a number and a unit, like ' +
+                '500 GB, 1.5 TiB or 800M.';
+        if (bytes <= 0) return 'A size limit must be greater than zero.';
+        return 'Understood as ' + SizeGuard.formatSize(bytes) + '.';
+    }
+
+    // The non-blocking half of core/sizeguard.js's validation: the two ways a
+    // setting that saves cleanly is still probably not what was meant — a limit so
+    // small it must be a missing unit, and a floor of 1, which is nearly no floor.
+    // Errors travel the other way, through Repos.validate into `problems`, where
+    // they stop the save.
+    function guardNotes(form) {
+        if (!SizeGuard) return [];
+        const f = form && typeof form === 'object' ? form : {};
+        // No limit, no advice: the section is inert and saying anything about it
+        // would be noise on the majority of repositories, which never set one.
+        if (trimmed(f.sizeLimit) === '') return [];
+        return SizeGuard.validateGuard({
+            limit: trimmed(f.sizeLimit),
+            minSnapshots: floorValue(f.minSnapshots)
+        }).filter(function (p) {
+            return !!p && !!p.detail && p.detail.severity === 'warning';
+        }).map(function (p) { return str(p.message); });
     }
 
     // Switching backend keeps whatever the user already typed under a name the new
@@ -1041,6 +1146,12 @@
                 return fieldsFor(this.kind);
             },
 
+            // --- the size limit --------------------------------------------
+
+            limitNote() { return limitEcho(this.form.sizeLimit); },
+            guardWarnings() { return guardNotes(this.form); },
+            guardTradeoffs() { return GUARD_TRADEOFFS.slice(); },
+
             setKind(kind) {
                 // <select> can only offer the kinds we listed, but the method is also
                 // the programmatic entry point — coerce rather than render an empty
@@ -1316,8 +1427,10 @@
 
     const HangarReposUi = {
         KIND_LABEL, FIELD, ORDER, CREDENTIAL_PAIRS, REMEDIATION_LABEL, TEMPLATE,
+        GUARD_FIELDS, GUARD_TRADEOFFS,
         kindLabel, kindChoices, remediationLabel, busyLabelFor, BUSY_LABEL,
         fieldsFor, blankForm, repoToFormState, formStateToRepo, mergeKind, validateForm,
+        floorValue, limitEcho, guardNotes,
         formatSize, formatCount, toRow, unreadableFrom, toAlert, okAlert, resultAlert,
         isAlreadyInitialised, deleteMessage, resticOptions, remoteOf, classifyRepoFailure,
         mount, repoEditDialog, hangarReposUi, hangarRepoEdit

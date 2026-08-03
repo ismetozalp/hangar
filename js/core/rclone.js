@@ -1006,6 +1006,29 @@ const AUTH = { OAUTH: 'oauth', CREDENTIALS: 'credentials', EXTERNAL: 'external',
         return line.indexOf('_') < 0 ? null : line.replace(/_+/g, ' ');
     }
 
+    // A file NAME is not a diagnosis.
+    //
+    // Both tools report the path they failed on, and a path is allowed to contain
+    // the very words that decide here — /home/u/.config/gcloud/token,
+    // secrets/token.json, /srv/oauth2/data, bearer.key, invalid_grant.json,
+    // /var/log/token_expired.log. Read as signal, every one of those turns an
+    // ordinary "permission denied" or "403 Forbidden" into "your sign-in
+    // expired": the operator re-authorises a destination that was never the
+    // problem, and the real cause — a folder permission, a bucket policy — is
+    // hidden behind a green button. That is the exact false positive this whole
+    // section exists to prevent, so anything shaped like a path or a URL is
+    // blanked out before the line is judged, leaving only the words the tool
+    // wrote ABOUT the failure.
+    //
+    // A run ends at a quote or a brace, so a JSON error body is not swallowed
+    // whole: Dropbox's {"error_summary":"expired_access_token/..."} keeps the
+    // `.tag` copy of the code, which is the one that decides.
+    const PATHISH_RE = /[^\s"'{}<>|]*\/[^\s"'{}<>|]*/g;
+
+    function maskPaths(line) {
+        return line.indexOf('/') < 0 ? line : line.replace(PATHISH_RE, ' ');
+    }
+
     function lineIsExpiry(line) {
         for (let j = 0; j < EXPIRED_RE.length; j++)
             if (EXPIRED_RE[j].test(line)) return true;
@@ -1016,13 +1039,26 @@ const AUTH = { OAUTH: 'oauth', CREDENTIALS: 'credentials', EXTERNAL: 'external',
         return AMBIGUOUS_RE.test(line) && AUTH_SIGNAL_RE.test(line);
     }
 
+    // Exactly the set Python's str.splitlines() breaks on, which is what
+    // auth_expired() in libexec/hangar-run uses. The list is spelled out rather
+    // than left as /\r?\n/ because the two implementations must agree: a bare
+    // CARRIAGE RETURN is a line break to Python and an ordinary character to
+    // JavaScript, and rclone's progress output is full of them. On one side that
+    // made "403 Forbidden\rTransferred: 1 token" a single line carrying both a
+    // status code and a token word — a false expiry the other side did not see.
+    // Splitting on more is also the safe direction: fewer lines joined means
+    // fewer accidental pairings.
+    const LINE_SPLIT_RE = /\r\n|[\n\r\v\f\x1c\x1d\x1e\x85  ]/;
+
     function isAuthExpired(text) {
         const s = str(text);
         if (s === '') return false;
 
-        const lines = s.split(/\r?\n/);
+        const lines = s.split(LINE_SPLIT_RE);
         for (let i = 0; i < lines.length; i++) {
-            const line = lines[i];
+            // Masked FIRST, then loosened: opening out the underscores of a path
+            // that is about to be discarded only invents phrases to match on.
+            const line = maskPaths(lines[i]);
             if (line === '') continue;
             if (lineIsExpiry(line)) return true;
             const loose = loosen(line);

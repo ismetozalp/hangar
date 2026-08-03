@@ -91,11 +91,60 @@
         }
     }
 
+    // Directory modes, mirroring `make install`. repos/ is 0700 because it holds
+    // repository passwords alongside the definitions; the rest is world-readable
+    // configuration.
+    const DIR_MODE = { [CONF_DIR + '/repos']: '0700' };
+
+    function dirModeFor(dir) {
+        return Object.prototype.hasOwnProperty.call(DIR_MODE, dir) ? DIR_MODE[dir] : '0755';
+    }
+
+    // hangar may never have been installed with `make install` — a symlink into
+    // ~/.local/share/cockpit is a perfectly normal way to run it, and that path
+    // never creates /etc/hangar. Without this, the FIRST save of anything at all —
+    // a theme, a repository, a job — fails with a bare "not-found" and the plugin
+    // looks broken out of the box.
+    //
+    // Created before the write rather than after a failure, and with an explicit
+    // mode, because the file lands under the bridge's umask: a repository
+    // definition must not be world-readable for the window between create and
+    // chmod. js/core/secrets.js does the same for the key itself.
+    async function ensureDirFor(path) {
+        const dir = String(path).slice(0, String(path).lastIndexOf('/')) || CONF_DIR;
+        if (!hasCockpit()) throw E.create('GENERIC', 'cockpit is not available in this context.');
+        await cockpit.spawn(
+            ['install', '-d', '-m', dirModeFor(dir), '-o', 'root', '-g', 'root', dir],
+            { superuser: 'require', err: 'message' });
+        return dir;
+    }
+
     async function writeJson(path, value, mode) {
+        await ensureDirFor(path);
         // replace() is atomic in cockpit.file, so a half-written config is never
         // visible to hangar-run or another browser tab.
         const opts = mode ? { superuser: 'require', mode: mode } : { superuser: 'require' };
-        await cockpit.file(path, opts).replace(JSON.stringify(value, null, 2) + '\n');
+        try {
+            await cockpit.file(path, opts).replace(JSON.stringify(value, null, 2) + '\n');
+        } catch (e) {
+            // cockpit surfaces raw problem codes like "not-found" and "access-denied".
+            // On their own they read as a bug in hangar rather than as something the
+            // operator can act on.
+            throw E.create('GENERIC', writeFailureText(e, path), { path: path, cause: String(e) });
+        }
+    }
+
+    // Turns a cockpit problem code into a sentence that says what to do.
+    function writeFailureText(e, path) {
+        const problem = (e && (e.problem || e.message)) ? String(e.problem || e.message) : '';
+        if (/access-denied|permission/i.test(problem))
+            return 'Permission denied writing ' + path + '. Administrative access is required.';
+        if (/not-found/i.test(problem))
+            return 'Could not create ' + path + '. The folder it belongs in does not exist ' +
+                'and could not be created.';
+        if (/no-space|space/i.test(problem))
+            return 'There is no space left to write ' + path + '.';
+        return 'Could not write ' + path + (problem ? ': ' + problem : '.');
     }
 
     async function listIds(dir) {
@@ -118,7 +167,7 @@
         validateId, repoPath, jobPath, statePath, globalPath, drPath,
         mergeGlobal, validateJob,
         // I/O
-        readJson, writeJson, listIds,
+        readJson, writeJson, listIds, ensureDirFor, dirModeFor, writeFailureText,
         listRepos:  function () { return listIds(CONF_DIR + '/repos'); },
         listJobs:   function () { return listIds(CONF_DIR + '/jobs'); },
         readRepo:   function (id) { return readJson(repoPath(id)); },
