@@ -25,12 +25,18 @@ IOSchedulingClass=idle
 # filesystem, so ProtectSystem=strict, ProtectHome and PrivateTmp are all
 # unusable here - they would make the backup capture the wrong content
 # instead of failing loudly.
+#
+# ProtectKernelModules is missing for the same reason, and it was here
+# once. It makes /usr/lib/modules INACCESSIBLE to the service, so restic
+# recorded that directory as empty, mode 0000, in every snapshot - and a
+# system restored from one has no kernel modules, cannot build an initrd,
+# and may not boot. Found by a recovery drill: dracut failed in 190ms and
+# the backups had looked perfect for weeks.
 NoNewPrivileges=yes
 ProtectClock=yes
 ProtectControlGroups=yes
 ProtectHostname=yes
 ProtectKernelLogs=yes
-ProtectKernelModules=yes
 ProtectKernelTunables=yes
 RestrictNamespaces=yes
 RestrictRealtime=yes
