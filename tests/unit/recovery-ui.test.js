@@ -2300,3 +2300,54 @@ test('a drill clears its own leftovers before starting', async () => {
     assert.equal(order[0], 'undefine', 'the stale domain goes before the new one arrives');
     assert.ok(order.includes('launch'));
 });
+
+// systemd appends to the unit's log, so without a reset the verdict would be
+// read from every drill ever run — one stale "Recovery is not possible" would
+// condemn every healthy restore that followed it.
+test('each drill starts with an empty log of its own', async () => {
+    const c = hangarRecoveryUi();
+    c.iso = '/x.iso';
+    c.libvirt = { checked: true, available: true, reason: '' };
+    const plan = c.plan();
+    const order = [];
+    const fake = drillCockpit({
+        files: { [plan.consolePath]: "'rear recover' finished successfully\n" },
+        spawn: (argv) => {
+            if (argv[0] === 'rm' && argv.includes(plan.toolLogPath)) order.push('cleared');
+            if (argv[0] === 'systemd-run') order.push('launch');
+            return undefined;
+        }
+    });
+    await withCockpit(fake, () => c.runDrill());
+    assert.deepEqual(order, ['cleared', 'launch'],
+        'the log is emptied before the unit can append to it');
+});
+
+test('a stale failure in an old log cannot condemn the next drill', async () => {
+    const c = hangarRecoveryUi();
+    c.iso = '/x.iso';
+    c.libvirt = { checked: true, available: true, reason: '' };
+    const plan = c.plan();
+    // The file still holds the previous drill's words when the run begins; only
+    // what this drill writes may count.
+    let cleared = false;
+    const fake = drillCockpit({
+        files: {
+            [plan.toolLogPath]: 'Recovery is not possible here\n',
+            [plan.consolePath]: "'rear recover' finished successfully\n"
+        },
+        spawn: (argv) => {
+            if (argv[0] === 'rm' && argv.includes(plan.toolLogPath)) {
+                cleared = true;
+                fake.file = (path) => ({
+                    read: () => Promise.resolve(
+                        path === plan.consolePath ? "'rear recover' finished successfully\n" : '')
+                });
+            }
+            return undefined;
+        }
+    });
+    const r = await withCockpit(fake, () => c.runDrill());
+    assert.equal(cleared, true);
+    assert.equal(r.outcome, 'recovered', 'the old failure must not follow it around');
+});

@@ -1304,6 +1304,16 @@
                     await this.cleanupDrill(plan);
                     this.drillCleaned = false;
 
+                    // And start this drill's log empty. systemd APPENDS to it, so
+                    // without this the verdict would be computed from every drill
+                    // ever run: one old "Recovery is not possible" line would
+                    // condemn a healthy restore for ever after. The finished log
+                    // is kept — it is only cleared when a new drill replaces it.
+                    try {
+                        await cockpit.spawn(['rm', '-f', plan.toolLogPath],
+                            { superuser: 'require', err: 'message' });
+                    } catch (e) { /* a log that will not go is not worth failing over */ }
+
                     // systemd-run returns as soon as the unit has started; the
                     // drill itself now belongs to systemd, not to this page.
                     const launch = (staged && staged !== plan.iso)
