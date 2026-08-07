@@ -81,6 +81,22 @@ plainly rather than hiding it.*
 strong one you can still type at a rescue console — and will not let you past it
 without noticing you must store it.*
 
+![The Add repository dialog, showing the destination kinds hangar can talk to](screenshots/repository-add.png)
+
+*Adding a destination — a local folder, an SFTP server, or one of sixteen cloud
+providers, in one form.*
+
+![The folder picker, browsing the filesystem to choose a path](screenshots/folder-picker.png)
+
+*Every path in hangar can be browsed instead of typed, as root, without leaving
+the page.*
+
+![The Verify recovery dialog, configured for a 1000 GB drill disk](screenshots/drill.png)
+
+*Verify recovery — the drill. It boots the rescue image you just built in a
+throwaway VM and reports whether recovery actually completed. The numbers in
+this dialog matter more than they look; the section below explains why.*
+
 ![The Settings screen: eleven themes, mount options and update settings](screenshots/settings.png)
 
 *Settings — themes, how long a browsed snapshot stays mounted, and where updates
@@ -147,6 +163,143 @@ at the point where you choose:
 | **Dropbox, Yandex** | Shared-key rate limits and per-application quotas. Your own app registration avoids them; the built-in one is usually fine for modest backups. |
 | **Jottacloud** | Works as a destination, but **Hangar cannot create the remote.** rclone has no `authorize` flow for it — verified, not assumed: `rclone authorize jottacloud` answers *"not supported by this backend"*. Generate a personal login token in Jottacloud's web interface, run **interactive** `rclone config` once, and Hangar will pick the remote up. Note that the non-interactive `rclone config create <name> jottacloud` **appears to succeed but leaves a remote with no token** — it will show up in Hangar's list and fail at backup time. Use interactive `rclone config`. |
 
+
+## Recovering a whole machine, in practice
+
+Everything below was learned by running the drill against real hardware until it
+worked — a 1 TB NVMe machine restored from an SFTP repository on a NAS. None of
+it is theory, and most of it is not in ReaR's documentation in one place.
+
+### Size the drill disk like the original disk, not like the data
+
+The single most surprising lesson. ReaR recreates the **recorded partition
+table**, so a machine whose disk was 1 TB needs a 1 TB target — even if only
+45 GB is actually used. Give it less and recovery stops early:
+
+```
+Last partition /dev/sda3 must shrink by 935780679680 bytes to still fit on device
+ERROR: Last partition /dev/sda3 cannot shrink (new device more than 2% smaller,
+       see AUTOSHRINK_DISK_SIZE_LIMIT_PERCENTAGE)
+```
+
+The drill disk is sparse, so a 1000 GB disk costs only what the restore writes.
+In our run: **1000 GB requested, 47 GB actually consumed.**
+
+Set **System size (GB)** to roughly what a restore will write, and hangar warns
+you before the drill starts rather than twenty minutes in.
+
+### Raising the shrink limit is not the fix it appears to be
+
+`AUTOSHRINK_DISK_SIZE_LIMIT_PERCENTAGE` (in *Advanced rescue-system options*)
+lets ReaR shrink **only the last partition**. If that partition holds LVM, the
+volumes inside are still recreated at their recorded sizes. A layout with a
+70 GiB root LV cannot be restored onto a 60 GB disk however high you set it:
+ReaR retries the first oversized volume with `-l 100%FREE` and every volume
+after it then fails. ReaR's own documentation is blunt — a substantially smaller
+disk needs a hand-adapted `disklayout.conf`.
+
+It earns its place for the real case it was designed for: a replacement disk a
+few percent smaller than the original, which two vendors' "1 TB" drives usually
+are, and which ReaR's 2% default is enough to refuse.
+
+### Put the drill disk somewhere with room
+
+The libvirt default pool lives on `/`, which is usually the filesystem you are
+testing — and by definition too small to hold a copy of itself. Point **Disk
+location** at something roomier. hangar passes `--check disk_size=off` because
+libvirt judges a sparse disk as if fully allocated, which for a drill measures
+the wrong thing.
+
+### UEFI: Secure Boot off, and q35
+
+A ReaR rescue image is not signed by any key your firmware trusts. Boot it with
+Secure Boot on and it dies at the bootloader with `Access Denied`. hangar asks
+for the firmware feature explicitly rather than the `uefi` shorthand, which
+quietly selects a secure-boot firmware — and asks for the `q35` machine type,
+because every EFI firmware descriptor is q35-only.
+
+### The rescue menu reads different settings on BIOS and UEFI
+
+`ISO_DEFAULT` and `USER_INPUT_TIMEOUT` steer the **syslinux** menu, which is what
+a BIOS machine boots. A UEFI machine boots **GRUB2**, which reads
+`GRUB2_DEFAULT_BOOT` and `GRUB2_TIMEOUT` instead. A config carrying only the
+first pair boots a UEFI machine straight past the rescue system and into the
+disk it was meant to rebuild. hangar writes both.
+
+Likewise `auto_recover`, the option that actually starts an unattended restore,
+is added by ReaR only while writing the syslinux menu. On UEFI it has to be put
+on the kernel command line by hand, or the rescue system boots to a login prompt
+and waits forever.
+
+### Restoring over SSH: ReaR removes the key you need
+
+This one costs two drills to find. For an SFTP repository the rescue system
+needs root's private key, and ReaR removes it **twice over**:
+
+- `SSH_FILES` defaults to `avoid_sensitive_files`, which copies `authorized_keys`
+  and `known_hosts` and no private keys at all.
+- Even when the key is copied, `build/default/501_check_ssh_keys.sh` deletes any
+  private key that has **no passphrase**, because `SSH_UNPROTECTED_PRIVATE_KEYS`
+  defaults to `no`.
+
+Both defaults are sensible for an image someone might leave in a drawer, and
+neither can be satisfied by an unattended restore — which cannot type a
+passphrase, so the key it needs is necessarily unprotected. hangar sets both for
+SFTP repositories. Without them the recovery stops at a prompt no one can answer:
+
+```
+Running external restore command
+sshd@nas's password:
+```
+
+**The finished rescue image is a credential.** It contains your repository
+password and, for SFTP, a key that can log into your backup server. Treat the
+ISO like the password it carries.
+
+### What a successful drill looks like
+
+```
+Running external restore command
+Finished external restore command
+...
+Finished 'recover'. The target system is mounted at '/mnt/local'.
+'rear recover' finished successfully
+```
+
+Some noise along the way is normal and not failure:
+
+- `/mnt/local/etc/rear/local.conf: FAILED` — ReaR comparing restored files
+  against the rescue system. If you changed the config after your last backup,
+  the restored copy genuinely differs. It is an accurate observation, not an error.
+- `Warning: Unmaintained driver is detected`, `Error: Driver 'pcspkr' is already
+  registered` — virtual hardware noise from the guest.
+
+One warning **is** worth chasing:
+
+```
+WARNING: Failed to create initrd for kernel version '...'
+```
+
+Dracut could not build an initrd for a kernel that came out of the backup but is
+newer than the one in the rescue system. The data is restored and the bootloader
+entry exists, but the machine may not boot unattended. Rebuild the rescue image
+after a kernel upgrade so the two stay in step.
+
+### How long it takes
+
+Restoring ~47 GB over SFTP on a home network ran at about **75 MB/s**, roughly
+ten minutes, inside a 120-minute limit. The layout recreation before it — GPT,
+LVM, four filesystems — takes two to three minutes. Set **Give up after** with
+your own link speed in mind; a timeout mid-restore tells you nothing.
+
+### Run the drill after every change
+
+A rescue image is only as good as its last test, and the settings that break it
+are exactly the ones that look harmless. Every failure above produced a working
+`local.conf` and an image that booted; the difference only showed up in a VM
+that tried to use them.
+
+---
 
 ## Requirements
 
@@ -316,6 +469,27 @@ happily carried them. It needs credentials and skips (exit 2) without them:
 ```sh
 COCKPIT_PASS=… npm run test:ui        # or COCKPIT_URL / COCKPIT_USER
 ```
+
+Rather than passing a password on every command line, point
+`COCKPIT_CREDENTIALS_FILE` at a JSON file **outside the repository**, so it can
+never be committed:
+
+```sh
+export COCKPIT_CREDENTIALS_FILE="$HOME/cockpit-credentials.json"
+```
+
+```json
+{
+  "host": "https://localhost:9090",
+  "user": "your-login",
+  "password": "your-password"
+}
+```
+
+`chmod 600` it. When the variable is unset, `~/cockpit-credentials.json` is used
+if it exists. Environment variables win over the file, so `COCKPIT_PASS=…` still
+overrides it for a one-off run. With neither, the suite **skips** rather than
+fails — a missing password is not a broken plugin.
 
 ---
 

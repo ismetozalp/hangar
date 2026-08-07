@@ -196,6 +196,19 @@ function stub() {
 
 // --- capture -------------------------------------------------------------
 
+// Fill a field if it is there. These shots are documentation, not tests: a
+// renamed input should change a picture, not break the build.
+// Click only if it is really there and visible, and give up quickly. A
+// screenshot script must not hang for 30 seconds on a button that moved.
+async function clickVisible(page, selector, timeout = 5000) {
+    try { await page.click(selector, { timeout }); return true; } catch (e) { return false; }
+}
+
+async function fill(page, selector, value) {
+    const el = await page.$(selector);
+    if (el) await el.fill(value);
+}
+
 async function shot(page, name, note) {
     await page.waitForTimeout(650);
     const file = path.join(OUT, name + '.png');
@@ -254,6 +267,87 @@ async function main() {
             if (c) { c.genMode = 'memorable'; c.generatePassword(); }
         });
         await shot(page, 'password-generator', 'a password you can type at a rescue console');
+
+        // Close it before anything else is clicked: an open modal swallows every
+        // pointer event behind it, which is exactly how the first attempt at
+        // these shots failed.
+        await page.keyboard.press('Escape');
+        await page.waitForTimeout(400);
+
+        // The dialogs below are where the decisions live. A README that shows
+        // only the six main screens tells you what hangar displays; these show
+        // what it actually asks you.
+
+        // Adding a destination.
+        await page.click('.nav-pills .nav-link:text-is("Repositories")');
+        await page.waitForTimeout(400);
+        await page.click('button:has-text("Add repository")');
+        await page.waitForTimeout(600);
+        await fill(page, '#hangar-repo-id', 'offsite');
+        await fill(page, '#hangar-repo-name', 'Backblaze off-site');
+        await shot(page, 'repository-add', 'sixteen destinations, one form');
+        await page.keyboard.press('Escape');
+        await page.waitForTimeout(400);
+
+        // Editing a job: sources, schedule and retention in one place.
+        await page.click('.nav-pills .nav-link:text-is("Jobs")');
+        await page.waitForTimeout(400);
+        if (await clickVisible(page, 'button:has-text("Edit")')) {
+            await page.waitForTimeout(700);
+            await shot(page, 'job-edit', 'what to back up, when, and for how long');
+            await page.keyboard.press('Escape');
+            await page.waitForTimeout(400);
+        }
+
+        // The drill: the numbers here are the whole lesson of the recovery
+        // section — the disk must match the ORIGINAL disk, and must be created
+        // somewhere with room for a full restore.
+        //
+        // Its button is disabled until an image exists and libvirt answers,
+        // neither of which is true for a stub, so both are seeded the same way
+        // the password dialog is.
+        await page.click('.nav-pills .nav-link:text-is("Recovery")');
+        await page.waitForTimeout(500);
+        await page.evaluate(() => {
+            const el = [...document.querySelectorAll('[x-data]')]
+                .find((e) => /hangarRecoveryUi/.test(e.getAttribute('x-data') || ''));
+            const d = el && window.Alpine && window.Alpine.$data(el);
+            if (d) {
+                d.iso = '/var/lib/rear/output/rear-db01.iso';
+                d.libvirt = { checked: true, available: true };
+            }
+        });
+        await page.waitForTimeout(400);
+        if (await clickVisible(page, 'button:has-text("Verify recovery")')) {
+            await page.waitForTimeout(700);
+            await fill(page, '#hangar-drill-disk', '1000');
+            await fill(page, '#hangar-drill-diskdir', '/srv/drill');
+            await fill(page, '#hangar-drill-sysgb', '45');
+            await fill(page, '#hangar-drill-wait', '120');
+            const fw = await page.$('#hangar-drill-fw');
+            if (fw) await fw.selectOption('uefi');
+            await shot(page, 'drill', 'the throwaway VM that proves recovery works');
+            await page.keyboard.press('Escape');
+            await page.waitForTimeout(400);
+        }
+
+        // The folder picker, which is how every path in hangar gets chosen.
+        if (await clickVisible(page, 'button:has-text("Browse")')) {
+            await page.waitForTimeout(800);
+            await shot(page, 'folder-picker', 'choosing a path without typing it');
+            await page.keyboard.press('Escape');
+            await page.waitForTimeout(400);
+        }
+
+        // Restoring files from a moment in the Logbook.
+        await page.click('.nav-pills .nav-link:text-is("Logbook")');
+        await page.waitForTimeout(700);
+        if (await clickVisible(page, 'button:has-text("Restore")')) {
+            await page.waitForTimeout(700);
+            await shot(page, 'restore', 'putting files back, with the overwrite rule stated');
+            await page.keyboard.press('Escape');
+            await page.waitForTimeout(400);
+        }
     } finally {
         await ctx.close();
         await browser.close();
