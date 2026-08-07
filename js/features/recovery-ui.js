@@ -1292,6 +1292,18 @@
                     // copy replaces it in place so the command that runs is the
                     // command the dialog showed, bar the path.
                     staged = await this.stageIso(plan);
+                    // Clear the way first. A drill that was interrupted — killed
+                    // with its browser, or stopped by hand — leaves its domain
+                    // DEFINED, and libvirt then refuses the next one outright:
+                    //
+                    //   ERROR Disk ... is already in use by other guests
+                    //         ['hangar-drill']
+                    //
+                    // Observed on a real retry. Every step is allowed to fail:
+                    // "nothing to clean" is the state we are trying to reach.
+                    await this.cleanupDrill(plan);
+                    this.drillCleaned = false;
+
                     // systemd-run returns as soon as the unit has started; the
                     // drill itself now belongs to systemd, not to this page.
                     const launch = (staged && staged !== plan.iso)

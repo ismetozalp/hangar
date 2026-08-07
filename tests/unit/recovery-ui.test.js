@@ -2278,3 +2278,25 @@ test('nothing is adopted when no drill is running', async () => {
     assert.equal(adopted, false);
     assert.equal(c.drillRunning, false);
 });
+
+// An interrupted drill leaves its domain defined, and libvirt then refuses the
+// next one: "Disk ... is already in use by other guests ['hangar-drill']".
+// Seen on a real retry after a drill was killed by a dropped connection.
+test('a drill clears its own leftovers before starting', async () => {
+    const c = hangarRecoveryUi();
+    c.iso = '/x.iso';
+    c.libvirt = { checked: true, available: true, reason: '' };
+    const plan = c.plan();
+    const order = [];
+    const fake = drillCockpit({
+        files: { [plan.consolePath]: "'rear recover' finished successfully\n" },
+        spawn: (argv) => {
+            if (argv[0] === 'virsh' && argv[1] === 'undefine') order.push('undefine');
+            if (argv[0] === 'systemd-run') order.push('launch');
+            return undefined;
+        }
+    });
+    await withCockpit(fake, () => c.runDrill());
+    assert.equal(order[0], 'undefine', 'the stale domain goes before the new one arrives');
+    assert.ok(order.includes('launch'));
+});
