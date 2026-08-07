@@ -8,6 +8,25 @@ deduplicated, encrypted backups with automatic retention thinning, a
 point-in-time file browser, and bare-metal disaster recovery to the Cockpit web
 console.
 
+> **🗂️ Another Cockpit plugin of mine:** [**Explorer**](https://github.com/ismetozalp/explorer)
+> (`ismetozalp/explorer`) — a file browser for the Cockpit console, with a two-pane
+> mode, an editor and an integrated terminal. Hangar's folder pickers and restores
+> land where Explorer can pick them up.
+>
+> **📺 And another:** [**InFlight TV**](https://github.com/ismetozalp/iftv)
+> (`ismetozalp/iftv`) — an IPTV / live-TV player for the Cockpit console.
+>
+> **📊 And another:** [**ctop**](https://github.com/ismetozalp/ctop) (`ismetozalp/ctop`) —
+> a live system/process monitor for the Cockpit console.
+>
+> **⬇️ And another:** [**Manifest**](https://github.com/ismetozalp/manifest) (`ismetozalp/manifest`) —
+> a download manager for the Cockpit console (torrents, magnets, HTTP/FTP/Metalink via a
+> per-user `aria2c`).
+>
+> **🖥️ And another:** [**Pilot**](https://github.com/ismetozalp/pilot) (`ismetozalp/pilot`) —
+> installs and manages a self-hosted [RustDesk](https://rustdesk.com/) remote-desktop server
+> (`hbbs`/`hbbr` plus an API control plane) from the Cockpit console.
+
 Cockpit has never shipped a backup UI. Upstream has
 [said as much](https://github.com/cockpit-project/cockpit/discussions/16302):
 *"It's not like we'd say 'no' to a backup UI (in fact, I think it'd be great to
