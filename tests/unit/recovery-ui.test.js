@@ -2351,3 +2351,56 @@ test('a stale failure in an old log cannot condemn the next drill', async () => 
     assert.equal(cleared, true);
     assert.equal(r.outcome, 'recovered', 'the old failure must not follow it around');
 });
+
+// ------------------------------------------------- ending a guest politely
+//
+// `virsh destroy` is a power cut. Stopping a drill the instant its verdict
+// appeared discarded whatever the guest had not flushed — on a real drill the
+// restored system kept ReaR's late finalize writes but lost the recovery log
+// ReaR copies in as its very last act.
+
+test('the guest is asked to shut down before its power is cut', async () => {
+    const c = hangarRecoveryUi();
+    const seen = [];
+    const fake = {
+        spawn: (argv) => {
+            if (argv[0] === 'virsh') seen.push(argv[1]);
+            if (argv[1] === 'domstate') return Promise.resolve('shut off\n');
+            return Promise.resolve('');
+        }
+    };
+    await withCockpit(fake, () => c.stopDrillGuest({ name: 'hangar-drill' }));
+    assert.equal(seen[0], 'shutdown', 'ACPI first');
+    assert.ok(!seen.includes('destroy'), 'a guest that stops on its own is never killed');
+});
+
+test('a guest that ignores the request is eventually cut off', async () => {
+    const c = hangarRecoveryUi();
+    const seen = [];
+    const fake = {
+        spawn: (argv) => {
+            if (argv[0] === 'virsh') seen.push(argv[1]);
+            if (argv[1] === 'domstate') return Promise.resolve('running\n');
+            return Promise.resolve('');
+        }
+    };
+    // Its own clock, so the test does not wait a minute for the real one.
+    const realSleep = globalThis.setTimeout;
+    globalThis.setTimeout = (fn) => realSleep(fn, 0);
+    await withCockpit(fake, () => c.stopDrillGuest({ name: 'hangar-drill' }));
+    globalThis.setTimeout = realSleep;
+    assert.equal(seen[0], 'shutdown');
+    assert.equal(seen[seen.length - 1], 'destroy', 'but it does not get to stall for ever');
+});
+
+test('stopping twice does not fight itself', async () => {
+    const c = hangarRecoveryUi();
+    let calls = 0;
+    const fake = { spawn: () => { calls++; return Promise.resolve('shut off\n'); } };
+    await withCockpit(fake, async () => {
+        await c.stopDrillGuest({ name: 'hangar-drill' });
+        const before = calls;
+        await c.stopDrillGuest({ name: 'hangar-drill' });
+        assert.equal(calls, before, 'the second call is a no-op');
+    });
+});

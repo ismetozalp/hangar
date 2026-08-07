@@ -578,6 +578,11 @@
     // alive rather than hung.
     const GUEST_POLL_MS = 2000;
 
+    // How long to let a guest close its files before the power goes off:
+    // 30 x 2s. Generous, because the alternative is losing whatever it had not
+    // written yet, and stingy enough that a wedged guest cannot stall a drill.
+    const GUEST_SHUTDOWN_TRIES = 30;
+
     // The drill no longer has a process to await, so waiting is explicit.
     function sleep(ms) {
         return new Promise(function (resolve) {
@@ -1788,13 +1793,49 @@
             // only ends the wait: `virt-install --wait` returns as soon as the
             // domain is gone, so the normal finish-and-clean path runs exactly
             // as it would have on a timeout.
+            // Ask the guest to shut down, and only cut its power if it will not.
+            //
+            // `virsh destroy` is a power cut. Stopping a drill the moment its
+            // verdict appears therefore threw away whatever the guest had not
+            // yet flushed — measured on a real drill: the restored system had
+            // ReaR's late finalize writes but NOT the recovery log ReaR copies
+            // in as its very last act. Everything older than the writeback
+            // interval survived; the last few seconds did not.
+            //
+            // A drill that ends this way also never shows whether the restored
+            // filesystems unmount cleanly, which is part of what it is meant to
+            // be testing.
             async stopDrillGuest(plan) {
                 if (this.drillStopping) return false;
                 this.drillStopping = true;
                 if (typeof cockpit === 'undefined' || !cockpit.spawn) return false;
+                const name = drillName(plan.name);
+                const run = (argv) => cockpit.spawn(argv,
+                    { superuser: 'require', err: 'message' });
+
                 try {
-                    await cockpit.spawn(['virsh', 'destroy', drillName(plan.name)],
-                        { superuser: 'require', err: 'message' });
+                    await run(['virsh', 'shutdown', name]);
+                } catch (e) {
+                    // No domain to shut down, or ACPI refused. Fall through: the
+                    // destroy below is the answer to both.
+                }
+
+                // The rescue system is idle at its menu by now, so this is quick
+                // when it works at all. It is bounded because a guest that
+                // ignores ACPI must not hold the drill open for ever.
+                for (let i = 0; i < GUEST_SHUTDOWN_TRIES; i++) {
+                    let state = '';
+                    try {
+                        state = str(await run(['virsh', 'domstate', name])).trim();
+                    } catch (e) {
+                        return true;                    // domain is gone: done
+                    }
+                    if (state === 'shut off' || state === '') return true;
+                    await sleep(GUEST_POLL_MS);
+                }
+
+                try {
+                    await run(['virsh', 'destroy', name]);
                     return true;
                 } catch (e) {
                     // Already gone, or libvirt refused: the timeout is still there
