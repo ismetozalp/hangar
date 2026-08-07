@@ -261,10 +261,22 @@ ISO like the password it carries.
 ```
 Running external restore command
 Finished external restore command
-...
+Running dracut...
+Updated initrd with new drivers for kernel 6.12.0-….x86_64.
+Creating EFI Boot Manager entries...
 Finished 'recover'. The target system is mounted at '/mnt/local'.
 'rear recover' finished successfully
 ```
+
+hangar reports **Recovery completed in the drill VM**, quoting the line it
+found, then shuts the guest down and removes it.
+
+`Updated initrd with new drivers` is the line worth looking for. A restore can
+put every file back and still leave a machine that will not boot on its own; an
+initrd rebuilt inside the restored system is what tells you the difference. If
+dracut fails there instead, check that your snapshot really contains
+`/usr/lib/modules` — a restore cannot build an initrd out of modules the backup
+never captured.
 
 Some noise along the way is normal and not failure:
 
@@ -296,6 +308,26 @@ Restoring ~47 GB over SFTP on a home network ran at about **75 MB/s**, roughly
 ten minutes, inside a 120-minute limit. The layout recreation before it — GPT,
 LVM, four filesystems — takes two to three minutes. Set **Give up after** with
 your own link speed in mind; a timeout mid-restore tells you nothing.
+
+### What has actually been tested
+
+The drill above is not a design. Every step of it has been run end to end on
+real hardware:
+
+| | |
+|---|---|
+| Source machine | 1 TB NVMe, GPT + LVM, XFS on root, /home and /boot, UEFI |
+| Repository | restic over SFTP, on a NAS across a home network |
+| Restored | 48 GB into a rebuilt partition table and volume group |
+| Restore rate | ~86 MB/s to disk, about six minutes |
+| Initrd | rebuilt inside the restored system, for every installed kernel |
+| Bootloader | GRUB2 installed, EFI boot entry created |
+| Verdict | reported automatically, guest shut down, disk removed |
+
+What that does **not** prove: that the restored disk boots on physical hardware
+of a different shape, or that a machine with a layout unlike the one above
+recovers cleanly. Run your own drill. That is the entire point of the feature —
+the only rescue image worth having is one you have watched work.
 
 ### Run the drill after every change
 
