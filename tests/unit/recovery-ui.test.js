@@ -2085,3 +2085,35 @@ test('the drill dialog cannot be dismissed behind hangar\'s back', () => {
     assert.match(drill, /@click="abortDrill\(\)"[\s\S]*?:disabled="!drillRunning"/,
         'the stop button must be disabled when there is nothing to stop');
 });
+
+// ------------------------------------------------------- keeping the disk
+//
+// ReaR copies its recovery log into the RESTORED system, so the only account of
+// what went wrong during a recovery is inside the disk the drill deletes. A
+// warning we could not investigate — dracut failing to build an initrd — is
+// what this option exists for.
+
+test('keeping the disk leaves the storage alone', () => {
+    const p = drillPlan('/x/rear.iso', { libvirt: true, keepDisk: true });
+    const undefine = p.cleanup.find((a) => a.includes('undefine'));
+    assert.ok(!undefine.includes('--remove-all-storage'),
+        'the disk is the evidence: ' + JSON.stringify(undefine));
+    assert.ok(p.cleanup.some((a) => a[0] === 'virsh' && a[1] === 'destroy'),
+        'the VM is still destroyed');
+    assert.equal(p.keepDisk, true);
+});
+
+test('by default the drill still cleans up after itself', () => {
+    const p = drillPlan('/x/rear.iso', { libvirt: true });
+    const undefine = p.cleanup.find((a) => a.includes('undefine'));
+    assert.ok(undefine.includes('--remove-all-storage'),
+        'a drill that leaves a 47 GB disk behind by default is a mess');
+    assert.equal(p.keepDisk, false);
+});
+
+test('the console log is removed either way', () => {
+    [true, false].forEach((keep) => {
+        const p = drillPlan('/x/rear.iso', { libvirt: true, keepDisk: keep });
+        assert.ok(p.cleanup.some((a) => a[0] === 'rm' && a.includes(p.consolePath)));
+    });
+});

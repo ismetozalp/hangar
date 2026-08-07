@@ -252,7 +252,8 @@
         timeoutMin: 30,
         remoteRepo: false,
         systemGb: 0,
-        libvirt: true
+        libvirt: true,
+        keepDisk: false
     };
 
     const MIN_MEMORY_MB = 1024;
@@ -381,6 +382,7 @@
         const consolePath = DRILL_DIR + '/' + name + '-console.log';
 
         const firmware = o.firmware === 'uefi' ? 'uefi' : 'bios';
+        const keepDisk = o.keepDisk === true;
         const timeoutMin = Math.min(MAX_TIMEOUT_MIN,
             Math.max(1, intOr(o.timeoutMin, DRILL_DEFAULTS.timeoutMin)));
 
@@ -482,13 +484,27 @@
             timeoutMin: timeoutMin,
             argv: argv,
             // Throwaway means throwaway: the disk goes with the domain, always.
-            cleanup: [
-                ['virsh', 'destroy', name],
-                ['virsh', 'undefine', '--nvram', '--remove-all-storage', name],
-                // --remove-all-storage takes the disk; the console log is an
-                // ordinary file beside it and has to be named.
-                ['rm', '-f', consolePath]
-            ],
+            // Keeping the disk is a post-mortem tool, not a convenience. ReaR
+            // copies its own recovery log into the RESTORED system
+            // (wrapup/default/990_copy_logfile.sh), so the only copy of what
+            // went wrong during a recovery is inside the disk hangar deletes.
+            // A drill that reported a warning and then destroyed the evidence
+            // is a drill you cannot act on.
+            cleanup: keepDisk
+                ? [
+                    ['virsh', 'destroy', name],
+                    // No --remove-all-storage: that is the whole point.
+                    ['virsh', 'undefine', '--nvram', name],
+                    ['rm', '-f', consolePath]
+                ]
+                : [
+                    ['virsh', 'destroy', name],
+                    ['virsh', 'undefine', '--nvram', '--remove-all-storage', name],
+                    // --remove-all-storage takes the disk; the console log is an
+                    // ordinary file beside it and has to be named.
+                    ['rm', '-f', consolePath]
+                ],
+            keepDisk: keepDisk,
             warnings: warnings,
             ok: !warnings.some(function (w) { return w.level === 'error'; })
         };
@@ -1550,7 +1566,7 @@
                     danger: true,
                     confirmLabel: 'Stop the drill'
                 });
-                await this.stopDrillGuest(this.runningPlan || { name: this.drill.name });
+                await this.stopDrillGuest(this.runningPlan || { name: this.drillOpts.name });
                 return true;
             },
 
@@ -1577,7 +1593,7 @@
                     confirmLabel: 'Stop the drill',
                     cancelLabel: 'Leave it running'
                 });
-                await this.stopDrillGuest(this.runningPlan || { name: this.drill.name });
+                await this.stopDrillGuest(this.runningPlan || { name: this.drillOpts.name });
                 return true;
             },
 

@@ -606,6 +606,22 @@
 
             </div>
 
+            <div class="modal-body pt-0" x-show="!drillRunning">
+                <div class="form-check">
+                    <input class="form-check-input" type="checkbox"
+                           id="hangar-drill-keepdisk" x-model="drillOpts.keepDisk">
+                    <label class="form-check-label" for="hangar-drill-keepdisk">
+                        Keep the drill disk afterwards
+                    </label>
+                    <div class="form-text">
+                        ReaR copies its recovery log into the restored system, so the
+                        only record of what went wrong lives on this disk — which is
+                        normally deleted with the VM. Keep it to investigate a warning,
+                        and remove it yourself when you are done.
+                    </div>
+                </div>
+            </div>
+
             <div class="modal-footer">
                 <!-- me-auto: this is the destructive action, so it sits away from
                      the two buttons a person reaches for by habit. Disabled when
