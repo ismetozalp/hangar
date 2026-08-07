@@ -233,8 +233,8 @@ and waits forever.
 
 ### Restoring over SSH: ReaR removes the key you need
 
-This one costs two drills to find. For an SFTP repository the rescue system
-needs root's private key, and ReaR removes it **twice over**:
+For an SFTP repository the rescue system needs root's private key, and ReaR
+removes it **twice over**:
 
 - `SSH_FILES` defaults to `avoid_sensitive_files`, which copies `authorized_keys`
   and `known_hosts` and no private keys at all.
@@ -273,47 +273,6 @@ Some noise along the way is normal and not failure:
   the restored copy genuinely differs. It is an accurate observation, not an error.
 - `Warning: Unmaintained driver is detected`, `Error: Driver 'pcspkr' is already
   registered` — virtual hardware noise from the guest.
-
-One warning **is** worth chasing, and chasing it found the worst bug this
-project has had:
-
-```
-WARNING: Failed to create initrd for kernel version '...'
-```
-
-Dracut could not build an initrd. The data was restored and the bootloader entry
-existed, but the machine would not have booted on its own.
-
-The cause was hangar's own backup unit. It carried
-`ProtectKernelModules=yes` — a line from every systemd hardening guide — which
-makes `/usr/lib/modules` **inaccessible to the service**. restic therefore
-recorded that directory as empty, mode `0000`, in every snapshot ever taken.
-Backups reported success for weeks. A machine restored from one had no kernel
-modules at all.
-
-Measured on the host afterwards, which is the whole story in four lines:
-
-```
-$ systemd-run --pipe --wait --property=ProtectKernelModules=yes ls /usr/lib/modules
-(nothing, exit 0)
-$ systemd-run --pipe --wait ls /usr/lib/modules
-6.12.0-211.16.1.el10_2.x86_64 …
-```
-
-Empty *and successful*, which is why nothing ever complained.
-
-Two things follow from it. The first is fixed here: nothing that hides part of
-the filesystem belongs in a backup's unit, and there is now a test that rejects
-`ProtectKernelModules`, `ProtectSystem`, `ProtectHome`, `PrivateTmp` and their
-relatives by name. The second is for you: **if you run backups under your own
-systemd unit, check what it hides.** A sandbox that makes a directory look empty
-rather than unreadable will not fail a backup — it will quietly reduce what the
-backup is worth, and you will find out during a recovery.
-
-It is also the clearest argument for drills that this project can offer. Nothing
-in the backup logs, the snapshot sizes, the file counts or the restore itself
-showed a problem. Only booting the result did, and only because dracut said so —
-after failing in 190 milliseconds, which is far too fast to have tried.
 
 ### A quiet restore is not a stuck restore
 
