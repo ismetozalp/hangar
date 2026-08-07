@@ -380,6 +380,10 @@
         // its own directory for this, group-owned by whichever group the local
         // libvirt runs qemu as.
         const consolePath = DRILL_DIR + '/' + name + '-console.log';
+        // The drill name is already sanitised for a domain name, and the same
+        // characters are legal in a unit name.
+        const unitName = name;
+        const toolLogPath = DRILL_DIR + '/' + name + '.log';
 
         const firmware = o.firmware === 'uefi' ? 'uefi' : 'bios';
         const keepDisk = o.keepDisk === true;
@@ -471,7 +475,30 @@
                 + 'firmware.feature0.enabled=no');
         }
 
+        // virt-install is launched through systemd-run, not directly.
+        //
+        // cockpit.spawn ties a process to the BROWSER: when the page reloads or
+        // the connection drops, cockpit kills what it started. A drill is a
+        // quarter of an hour of restoring, and it was dying with the tab —
+        // observed on a real run, killed 19 GB into a 47 GB restore by a
+        // disconnect. A transient unit belongs to systemd instead, so the drill
+        // survives the session that asked for it.
+        //
+        // Its output goes to a file for the same reason: a log that only exists
+        // in a browser tab is lost exactly when it is most wanted.
+        // No --collect: the unit has to outlive its own exit long enough for
+        // hangar to read the status virt-install returned. Without that, a
+        // virt-install that refused outright ("pool space exceeded", "cannot
+        // access storage file") would leave the drill reporting nothing at all.
+        // cleanup runs `systemctl reset-failed`, which is what --collect would
+        // otherwise have done.
+        const launch = ['systemd-run', '--unit', unitName,
+            '--service-type=exec',
+            '--property=StandardOutput=append:' + toolLogPath,
+            '--property=StandardError=append:' + toolLogPath].concat(argv);
+
         return {
+            launch: launch,
             name: name,
             iso: isoPath,
             diskPath: diskPath,
@@ -495,16 +522,20 @@
                     ['virsh', 'destroy', name],
                     // No --remove-all-storage: that is the whole point.
                     ['virsh', 'undefine', '--nvram', name],
-                    ['rm', '-f', consolePath]
+                    ['rm', '-f', consolePath],
+                    ['systemctl', 'reset-failed', unitName]
                 ]
                 : [
                     ['virsh', 'destroy', name],
                     ['virsh', 'undefine', '--nvram', '--remove-all-storage', name],
                     // --remove-all-storage takes the disk; the console log is an
                     // ordinary file beside it and has to be named.
-                    ['rm', '-f', consolePath]
+                    ['rm', '-f', consolePath],
+                    ['systemctl', 'reset-failed', unitName]
                 ],
             keepDisk: keepDisk,
+            unit: unitName,
+            toolLogPath: toolLogPath,
             warnings: warnings,
             ok: !warnings.some(function (w) { return w.level === 'error'; })
         };
@@ -546,6 +577,14 @@
     // not to hammer a privileged channel, fast enough that the box on screen looks
     // alive rather than hung.
     const GUEST_POLL_MS = 2000;
+
+    // The drill no longer has a process to await, so waiting is explicit.
+    function sleep(ms) {
+        return new Promise(function (resolve) {
+            if (root.setTimeout) root.setTimeout(resolve, ms);
+            else resolve();
+        });
+    }
 
     // A serial console is a terminal, not a log file. What arrives is the byte
     // stream a VT100 would have drawn: cursor moves, colour changes, screen
@@ -797,6 +836,9 @@
                 // must not be able to reject either.
                 try {
                     await this.probeLibvirt();
+                    // Deliberately not awaited: a drill can have hours left to run,
+                    // and the screen must finish loading either way.
+                    this.adoptRunningDrill();
                 } catch (e) {
                     this.libvirt = { checked: true, available: false,
                         reason: 'hangar could not determine whether libvirt is usable here.' };
@@ -1226,7 +1268,6 @@
                 // domain to destroy: the form can be edited while it runs.
                 this.runningPlan = plan;
                 this.guestLog = '';
-                let watch = null;
                 let toolLog = '';
                 let staged = null;
                 this.drillStopping = false;
@@ -1251,50 +1292,28 @@
                     // copy replaces it in place so the command that runs is the
                     // command the dialog showed, bar the path.
                     staged = await this.stageIso(plan);
-                    const argv = (staged && staged !== plan.iso)
-                        ? plan.argv.map((a) => (a === plan.iso ? staged : a))
-                        : plan.argv;
-                    const proc = cockpit.spawn(argv, { superuser: 'require', err: 'out' });
-                    if (proc && typeof proc.stream === 'function') {
-                        proc.stream((chunk) => {
-                            // str(), not +=: a channel can hand back a Uint8Array, and
-                            // "[object Uint8Array]" in the console log is worse than
-                            // nothing because it looks like output.
-                            toolLog += str(chunk);
-                            this.drillLog = joinLogs(toolLog, this.guestLog);
-                            this.drillResult = drillOutcome(this.drillLog);
-                        });
-                    }
+                    // systemd-run returns as soon as the unit has started; the
+                    // drill itself now belongs to systemd, not to this page.
+                    const launch = (staged && staged !== plan.iso)
+                        ? plan.launch.map((a) => (a === plan.iso ? staged : a))
+                        : plan.launch;
+                    await cockpit.spawn(launch, { superuser: 'require', err: 'out' });
                     // The guest writes to a file now, so it has to be read WHILE the
                     // drill runs — otherwise the console box stays empty for the whole
                     // wait and the user cannot tell a working drill from a hung one.
-                    if (root.setInterval) {
-                        watch = root.setInterval(() => {
-                            this.readGuestConsole(plan).then((text) => {
-                                if (text === null) return;
-                                this.guestLog = text;
-                                this.drillLog = joinLogs(toolLog, this.guestLog);
-                                this.drillResult = drillOutcome(this.drillLog);
-                                // The rescue system does not power off when it is
-                                // finished: it prints its verdict and offers a menu.
-                                // Waiting for virt-install to return therefore means
-                                // waiting out the ENTIRE timeout after the question
-                                // has already been answered — an hour of a machine
-                                // held for nothing. Once the log is decisive, stop.
-                                if (this.drillResult && this.drillResult.decisive)
-                                    this.stopDrillGuest(plan);
-                            });
-                        }, GUEST_POLL_MS);
-                    }
 
-                    const out = await proc;
-                    toolLog = str(out) || toolLog;
-                    // One last read: the guest's final words land after virt-install
-                    // has already returned.
-                    const last = await this.readGuestConsole(plan);
-                    if (last !== null) this.guestLog = last;
-                    this.drillLog = joinLogs(toolLog, this.guestLog);
+                    toolLog = await this.watchDrill(plan);
                     this.drillResult = drillOutcome(this.drillLog);
+                    // A unit that exited non-zero is an error even when the guest
+                    // never said anything: virt-install refusing to start at all
+                    // is the commonest way a drill goes wrong, and silence about
+                    // it reads as "nothing happened".
+                    const status = await this.unitExitStatus(plan);
+                    if (status) {
+                        this.drillError = Errors.create(Errors.KIND.GENERIC,
+                            'The drill VM could not be run.',
+                            { error: tailOf(splitLines(toolLog), 5) || ('exit status ' + status) });
+                    }
                     return this.drillResult;
                 } catch (e) {
                     // virt-install exiting non-zero is itself part of the answer, so
@@ -1311,7 +1330,6 @@
                             { error: str(e && e.message ? e.message : e) });
                     return this.drillResult;
                 } finally {
-                    if (watch && root.clearInterval) root.clearInterval(watch);
                     // A staged copy is 900 MB of somebody's disk; it goes with the VM.
                     if (staged && staged !== plan.iso) {
                         try {
@@ -1636,6 +1654,103 @@
                 } catch (e) {
                     this.setError(e);
                     return false;
+                }
+            },
+
+            // Is the drill's unit still there? --collect removes it once it has
+            // exited, so "not active" and "gone" are the same answer.
+            async unitRunning(plan) {
+                if (!hasCockpit() || typeof cockpit.spawn !== 'function') return false;
+                try {
+                    const out = await cockpit.spawn(
+                        ['systemctl', 'is-active', str(plan && plan.unit)],
+                        { superuser: 'require', err: 'message' });
+                    return str(out).trim() === 'active';
+                } catch (e) {
+                    // is-active exits non-zero for inactive, failed and unknown.
+                    return false;
+                }
+            },
+
+            // Watch a drill until it answers, ends, or runs out of time. Used
+            // both by the run that started it and by a page that found one
+            // already running — which is the whole point of it being a unit.
+            // Returns whatever the unit has written so far.
+            async watchDrill(plan) {
+                let toolLog = '';
+                const deadline = Date.now() + plan.timeoutMin * 60000;
+                // Read first, sleep after: the screen shows the guest's first words
+                // immediately rather than two seconds late, and a drill that is
+                // already over is noticed at once.
+                while (Date.now() < deadline) {
+                    toolLog = str(await this.readFileOrEmpty(plan.toolLogPath));
+                    const text = await this.readGuestConsole(plan);
+                    if (text !== null) this.guestLog = text;
+                    this.drillLog = joinLogs(toolLog, this.guestLog);
+                    this.drillResult = drillOutcome(this.drillLog);
+                    if (this.drillResult && this.drillResult.decisive) {
+                        await this.stopDrillGuest(plan);
+                        break;
+                    }
+                    if (!(await this.unitRunning(plan))) break;
+                    await sleep(GUEST_POLL_MS);
+                }
+                // One last read: the guest's final words land after the unit has
+                // already gone.
+                toolLog = str(await this.readFileOrEmpty(plan.toolLogPath));
+                const last = await this.readGuestConsole(plan);
+                if (last !== null) this.guestLog = last;
+                this.drillLog = joinLogs(toolLog, this.guestLog);
+                return toolLog;
+            },
+
+            // A drill outlives the page that started it, so a page that opens
+            // while one is running has to say so — otherwise the operator sees an
+            // idle screen and starts a second drill on top of the first.
+            async adoptRunningDrill() {
+                if (this.drillRunning) return false;
+                const plan = this.plan();
+                if (!(await this.unitRunning(plan))) return false;
+                this.drillRunning = true;
+                this.runningPlan = plan;
+                this.drillError = null;
+                this.drillCleaned = false;
+                try {
+                    await this.watchDrill(plan);
+                } finally {
+                    this.drillRunning = false;
+                    try {
+                        await this.cleanupDrill(plan);
+                    } catch (e) { /* reported by drillCleaned staying false */ }
+                    this.keptDisk = plan.keepDisk ? str(plan.diskPath) : '';
+                }
+                return true;
+            },
+
+            // systemd keeps the exit status of a finished unit until it is reset.
+            // Anything unreadable counts as "no complaint": a missing status must
+            // never invent a failure.
+            async unitExitStatus(plan) {
+                if (!hasCockpit() || typeof cockpit.spawn !== 'function') return 0;
+                try {
+                    const out = await cockpit.spawn(
+                        ['systemctl', 'show', '--value', '-p', 'ExecMainStatus',
+                            str(plan && plan.unit)],
+                        { superuser: 'require', err: 'message' });
+                    const n = parseInt(str(out).trim(), 10);
+                    return Number.isFinite(n) ? n : 0;
+                } catch (e) {
+                    return 0;
+                }
+            },
+
+            async readFileOrEmpty(path) {
+                if (!path || typeof cockpit === 'undefined' || !cockpit.file) return '';
+                try {
+                    const text = await cockpit.file(path, { superuser: 'require' }).read();
+                    return text === null || text === undefined ? '' : str(text);
+                } catch (e) {
+                    return '';
                 }
             },
 

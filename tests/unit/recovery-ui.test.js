@@ -742,6 +742,31 @@ function stub(obj, name, impl, body) {
 
 // A cockpit that only exists for the duration of one test. Always removed, so the
 // "no cockpit global" tests above stay true whatever order the runner picks.
+// The drill is launched detached and observed through files, so a stub has to
+// answer three things: the launch, whether the unit is still up, and what the
+// logs say. `files` maps a path to its contents.
+function drillCockpit(opts) {
+    const o = opts || {};
+    const files = o.files || {};
+    return {
+        spawn: (argv) => {
+            if (o.spawn) {
+                const custom = o.spawn(argv);
+                if (custom !== undefined) return custom;
+            }
+            if (argv[0] === 'systemctl' && argv[1] === 'is-active')
+                return Promise.resolve(o.active ? 'active\n' : 'inactive\n');
+            if (argv[0] === 'systemctl' && argv[1] === 'show')
+                return Promise.resolve(String(o.exitStatus || 0) + '\n');
+            return Promise.resolve('');
+        },
+        file: (path) => ({
+            read: () => Promise.resolve(
+                Object.prototype.hasOwnProperty.call(files, path) ? files[path] : null)
+        })
+    };
+}
+
 function withCockpit(fake, body) {
     globalThis.cockpit = fake;
     return Promise.resolve()
@@ -1160,19 +1185,17 @@ test('init never rejects, even when the probe blows up', async () => {
 
 // ------------------------------------------------------------------ the drill
 
-test('runDrill parses the console as it streams and again at the end', async () => {
+test('runDrill reads the guest console and reports what it found', async () => {
     const c = hangarRecoveryUi();
     c.iso = '/var/lib/rear/output/rear.iso';
     c.libvirt = { checked: true, available: true, reason: '' };
-    const chunks = ['Welcome to Relax-and-Recover rescue system\n', 'Finished recovering your system\n'];
-    const fake = {
-        spawn: (argv) => {
-            if (argv[0] !== 'virt-install') return Promise.resolve('');
-            const p = Promise.resolve(chunks.join(''));
-            p.stream = (fn) => { chunks.forEach(fn); return p; };
-            return p;
+    const plan = c.plan();
+    const fake = drillCockpit({
+        files: {
+            [plan.consolePath]: 'Welcome to Relax-and-Recover rescue system\n'
+                + "'rear recover' finished successfully\n"
         }
-    };
+    });
     const r = await withCockpit(fake, () => c.runDrill());
     assert.equal(r.outcome, 'recovered');
     assert.equal(c.drillRunning, false);
@@ -1184,11 +1207,12 @@ test('a non-zero virt-install still yields the verdict its console contained', a
     const c = hangarRecoveryUi();
     c.iso = '/var/lib/rear/output/rear.iso';
     c.libvirt = { checked: true, available: true, reason: '' };
-    const fake = {
-        spawn: (argv) => argv[0] === 'virt-install'
-            ? Promise.reject(Object.assign(new Error('Recovery is not possible here'), { exit_status: 1 }))
-            : Promise.resolve('')
-    };
+    const plan = c.plan();
+    // The unit exits non-zero; what it printed is in the log file it appended to.
+    const fake = drillCockpit({
+        files: { [plan.toolLogPath]: 'Recovery is not possible here\n' },
+        exitStatus: 1
+    });
     const r = await withCockpit(fake, () => c.runDrill());
     assert.equal(r.outcome, 'failed');
     assert.ok(Errors.isHangarError(c.drillError));
@@ -1199,8 +1223,8 @@ test('an untyped drill failure is wrapped rather than shown raw', async () => {
     const c = hangarRecoveryUi();
     c.iso = '/x.iso';
     c.libvirt = { checked: true, available: true, reason: '' };
-    await withCockpit({ spawn: (argv) => argv[0] === 'virt-install'
-        ? Promise.reject('a bare string') : Promise.resolve('') }, () => c.runDrill());
+    await withCockpit(drillCockpit({ spawn: (argv) => argv[0] === 'systemd-run'
+        ? Promise.reject('a bare string') : undefined }), () => c.runDrill());
     assert.ok(Errors.isHangarError(c.drillError));
     assert.match(c.drillError.message, /could not be run/i);
 });
@@ -1225,11 +1249,13 @@ test('a cleanup that fails does not replace the drill verdict with a plumbing er
     const c = hangarRecoveryUi();
     c.iso = '/x.iso';
     c.libvirt = { checked: true, available: true, reason: '' };
-    const fake = {
-        spawn: (argv) => argv[0] === 'virt-install'
-            ? Promise.resolve('Finished recovering your system\n')
-            : Promise.reject(new Error('domain not found'))
-    };
+    const plan = c.plan();
+    const fake = drillCockpit({
+        files: { [plan.consolePath]: 'Finished recovering your system\n' },
+        // Every tidying-up step fails; the verdict must survive it.
+        spawn: (argv) => (argv[0] === 'virsh' || argv[1] === 'reset-failed')
+            ? Promise.reject(new Error('domain not found')) : undefined
+    });
     const r = await withCockpit(fake, () => c.runDrill());
     assert.equal(r.outcome, 'recovered');
     assert.equal(c.drillCleaned, true, 'individual cleanup failures are expected and ignored');
@@ -1250,9 +1276,11 @@ test('a typed drill failure gets an action button of its own', async () => {
     assert.match(c.drillRemediationLabel(), /Try again/);
 
     let runs = 0;
-    await withCockpit({ spawn: (argv) => { if (argv[0] === 'virt-install') runs++;
-        return Promise.resolve('Finished recovering your system\n'); } },
-        () => c.applyDrillRemediation());
+    const plan = c.plan();
+    await withCockpit(drillCockpit({
+        files: { [plan.consolePath]: 'Finished recovering your system\n' },
+        spawn: (argv) => { if (argv[0] === 'systemd-run') runs++; return undefined; }
+    }), () => c.applyDrillRemediation());
     assert.equal(runs, 1);
     assert.equal(c.drillError, null);
     assert.equal(c.drillResult.outcome, 'recovered');
@@ -2156,4 +2184,97 @@ test('the kept disk is remembered only when it was actually kept', () => {
     assert.equal(kept.keepDisk, true);
     assert.equal(gone.keepDisk, false);
     assert.ok(kept.diskPath, 'the path is what the screen shows afterwards');
+});
+
+// ------------------------------------------------- surviving the browser
+//
+// cockpit.spawn ties a process to the page: a reload or a dropped connection
+// kills it. A drill is fifteen minutes of restoring, and one was killed 19 GB
+// into a 47 GB restore by a disconnect. It runs as a transient systemd unit so
+// it belongs to the machine rather than to a browser tab.
+
+test('the drill is launched as a systemd unit, not as a child of the page', () => {
+    const p = drillPlan('/x/rear.iso', { libvirt: true });
+    assert.equal(p.launch[0], 'systemd-run');
+    assert.ok(p.launch.includes('--unit'));
+    assert.ok(p.launch.includes('virt-install'), 'it still runs virt-install');
+    assert.equal(p.argv[0], 'virt-install',
+        'and the preview still shows the command a person would type');
+});
+
+test('the unit appends its output to a file on the machine', () => {
+    const p = drillPlan('/x/rear.iso', { libvirt: true });
+    assert.match(p.toolLogPath, /^\/var\/lib\/hangar\/drill\/.*\.log$/);
+    assert.ok(p.launch.some((a) => a === '--property=StandardOutput=append:' + p.toolLogPath));
+    assert.ok(p.launch.some((a) => a === '--property=StandardError=append:' + p.toolLogPath),
+        'errors are the half worth keeping');
+});
+
+// --collect would remove the unit the instant it exits, taking the exit status
+// with it — and virt-install refusing to start at all is the commonest failure.
+test('the unit survives its own exit long enough to be asked how it went', () => {
+    const p = drillPlan('/x/rear.iso', { libvirt: true });
+    assert.ok(!p.launch.includes('--collect'));
+    assert.ok(p.cleanup.some((a) => a[0] === 'systemctl' && a[1] === 'reset-failed'),
+        'so cleanup has to do what --collect would have done');
+});
+
+test('a unit that failed to start is reported even when the guest said nothing', async () => {
+    const c = hangarRecoveryUi();
+    c.iso = '/x.iso';
+    c.libvirt = { checked: true, available: true, reason: '' };
+    const plan = c.plan();
+    const fake = drillCockpit({
+        files: { [plan.toolLogPath]: 'ERROR    Cannot access storage file\n' },
+        exitStatus: 1
+    });
+    await withCockpit(fake, () => c.runDrill());
+    assert.ok(Errors.isHangarError(c.drillError), 'silence about a refusal reads as success');
+    assert.match(c.drillError.detail.error, /Cannot access storage file/);
+});
+
+test('a unit that exited cleanly raises no error', async () => {
+    const c = hangarRecoveryUi();
+    c.iso = '/x.iso';
+    c.libvirt = { checked: true, available: true, reason: '' };
+    const plan = c.plan();
+    const fake = drillCockpit({
+        files: { [plan.consolePath]: "'rear recover' finished successfully\n" },
+        exitStatus: 0
+    });
+    const r = await withCockpit(fake, () => c.runDrill());
+    assert.equal(r.outcome, 'recovered');
+    assert.equal(c.drillError, null);
+});
+
+// A drill that survives the browser is only useful if the browser can find it
+// again. Otherwise the operator returns to an idle-looking screen and starts a
+// second drill on top of the first.
+test('a page that opens during a drill picks it up', async () => {
+    const c = hangarRecoveryUi();
+    c.iso = '/x.iso';
+    c.libvirt = { checked: true, available: true, reason: '' };
+    const plan = c.plan();
+    let calls = 0;
+    const fake = drillCockpit({
+        files: { [plan.consolePath]: "'rear recover' finished successfully\n" },
+        spawn: (argv) => {
+            if (argv[0] === 'systemctl' && argv[1] === 'is-active')
+                return Promise.resolve(++calls === 1 ? 'active\n' : 'inactive\n');
+            return undefined;
+        }
+    });
+    const adopted = await withCockpit(fake, () => c.adoptRunningDrill());
+    assert.equal(adopted, true);
+    assert.equal(c.drillResult.outcome, 'recovered', 'and reports what it found');
+    assert.equal(c.drillRunning, false, 'and stops running when the drill ends');
+});
+
+test('nothing is adopted when no drill is running', async () => {
+    const c = hangarRecoveryUi();
+    c.iso = '/x.iso';
+    c.libvirt = { checked: true, available: true, reason: '' };
+    const adopted = await withCockpit(drillCockpit({}), () => c.adoptRunningDrill());
+    assert.equal(adopted, false);
+    assert.equal(c.drillRunning, false);
 });
