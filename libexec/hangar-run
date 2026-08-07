@@ -38,6 +38,11 @@ import time
 
 CONF_DIR = os.environ.get("HANGAR_CONF_DIR", "/etc/hangar")
 STATE_DIR = os.environ.get("HANGAR_STATE_DIR", "/var/lib/hangar/state")
+# Must equal CACHE_DIR in js/engine/restic.js; tests/smoke.mjs asserts they agree.
+# restic finds its cache from $XDG_CACHE_HOME or $HOME, and a systemd unit has
+# neither — so the path is passed explicitly on every command rather than left
+# to whatever environment happens to be around.
+RESTIC_CACHE_DIR = os.environ.get("HANGAR_CACHE_DIR", "/var/cache/hangar/restic")
 
 # Where dumped libvirt domain XML is staged before restic picks it up. Under
 # /var/lib rather than /etc because it is regenerated on every run and is not
@@ -939,7 +944,11 @@ GUARD_UNIT_BYTES = {
 # by the runner — a size limit only one half of the product can see.
 GUARD_SIZE_RE = re.compile(r"^(-?)(\d+(?:\.\d+)?)[ \t]*([A-Za-z]{0,3})\Z", re.ASCII)
 
-GUARD_DISPLAY_UNITS = ("B", "kB", "MB", "GB", "TB", "PB")
+# Must match DISPLAY_UNITS in js/core/sizeguard.js and UNITS in the three
+# feature modules; tests/integration cross-checks this formatter against the
+# JavaScript one, value for value.
+GUARD_DISPLAY_UNITS = ("B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB")
+GUARD_DISPLAY_STEP = 1024
 
 # JavaScript numbers stop being exact here, and a limit that does not survive a
 # JSON round trip is no longer the number the user typed.
@@ -1039,15 +1048,20 @@ def parse_size(value):
 
 
 def format_size(n):
-    """Decimal, matching formatSize in js/core/sizeguard.js and the UI."""
+    """Binary, matching formatSize in js/core/sizeguard.js and every screen.
+
+    hangar showed the same repository in GiB on two screens and GB on a third,
+    which made three correct-but-different measurements look like a
+    contradiction. One convention everywhere, and it is restic's own.
+    """
     if not is_number(n) or n <= 0:
         return "0 B"
     value = min(float(n), float(MAX_SAFE_INT))
-    if value < 1000:
+    if value < GUARD_DISPLAY_STEP:
         return "%d B" % js_round(value)
     unit = 0
-    while value >= 1000 and unit < len(GUARD_DISPLAY_UNITS) - 1:
-        value /= 1000.0
+    while value >= GUARD_DISPLAY_STEP and unit < len(GUARD_DISPLAY_UNITS) - 1:
+        value /= float(GUARD_DISPLAY_STEP)
         unit += 1
     rounded = js_round(value * 10) / 10.0
     text = "%d" % rounded if float(rounded).is_integer() else "%.1f" % rounded
@@ -1327,7 +1341,14 @@ def build_plan(job, repo):
     if not paths:
         die(1, "job has no paths to back up")
 
-    base = ["restic", "-r", url, "--password-file", pwfile]
+    # --cache-dir on every invocation, matching js/engine/restic.js CACHE_DIR.
+    # This runs from a systemd unit, which has neither $HOME nor $XDG_CACHE_HOME,
+    # and restic refuses to start without somewhere to put its cache:
+    #   unable to locate cache directory: neither $XDG_CACHE_HOME nor $HOME
+    # It exits 1 before reading a byte of the repository, so a scheduled backup
+    # would fail every night while the same command typed at a shell worked.
+    base = ["restic", "-r", url, "--password-file", pwfile,
+            "--cache-dir", RESTIC_CACHE_DIR]
 
     backup = base + ["backup", "--json"] + flags + paths
     for tag in str_list(job.get("tags"), "tags", job.get("id")):

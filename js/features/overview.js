@@ -100,6 +100,10 @@
         // Not 'Try again'. The next run fails identically until someone signs
         // in again, and offering a retry is what lets that repeat unnoticed.
         reauthorize: 'Sign in again',
+        // Nothing hangar can do from inside the page: Cockpit's own header owns
+        // the switch. The button explains where to look rather than pretending
+        // to perform an escalation this page cannot perform.
+        'grant-access': 'How to grant access',
         retry: 'Try again'
     };
 
@@ -183,6 +187,7 @@
 
     // ------------------------------------------------------------- formatting
 
+    // Identical to jobs-ui.js and logbook-ui.js; tests/smoke.mjs checks that.
     const UNITS = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB', 'EiB'];
 
     function isNum(v) { return typeof v === 'number' && isFinite(v); }
@@ -907,6 +912,46 @@
                 });
             },
 
+            // The button behind ADMIN_REQUIRED. hangar cannot flip Cockpit's own
+            // switch from inside the page, so this asks the shell to re-check —
+            // the user turns access on in the header, presses this, and the screen
+            // reloads rather than the whole page.
+            async grantAccess() {
+                if (typeof root.dispatchEvent === 'function' && typeof root.CustomEvent === 'function')
+                    root.dispatchEvent(new root.CustomEvent('hangar:recheck-access'));
+                return this.refresh();
+            },
+
+            // A dashboard that is a photograph of page-load time is worse than no
+            // dashboard: a backup ran for ten minutes while this screen said
+            // "Not run yet". Polling is deliberately conditional — it runs only
+            // while something IS running, and stops as soon as nothing is, so an
+            // idle page makes no periodic calls at all. The final poll after a run
+            // ends is what replaces "Running now" with the actual result.
+            _watch: null,
+            WATCH_MS: 5000,
+
+            anyRunning() {
+                return (this.jobs || []).some(function (j) {
+                    const svc = j && j.unit && j.unit.service;
+                    return !!(svc && svc.active);
+                });
+            },
+
+            // Called after every refresh: starts watching when a run appears and
+            // stops when the last one ends. Idempotent, so repeated refreshes do
+            // not stack timers.
+            syncWatch() {
+                const running = this.anyRunning();
+                if (running && !this._watch && root.setInterval) {
+                    this._watch = root.setInterval(() => { this.refresh(); }, this.WATCH_MS);
+                } else if (!running && this._watch && root.clearInterval) {
+                    root.clearInterval(this._watch);
+                    this._watch = null;
+                }
+                return !!this._watch;
+            },
+
             async refresh() {
                 this.loading = true;
                 this.error = null;
@@ -930,6 +975,7 @@
                     this.overall = overallStatus(jobs);
                     this.banners = authBanners(jobs, repos, this.now);
                     this.loading = false;
+                    this.syncWatch();
                 }
             },
 
@@ -1344,7 +1390,11 @@
     // It is a first-party constant string, injected before Alpine walks the DOM.
 
     const TEMPLATE = [
-        '<div x-data="hangarOverview()" x-init="init()">',
+        // No x-init="init()": Alpine 3 calls init() itself when the x-data object
+        // defines one. Writing it out ran init TWICE — every listener registered
+        // twice, and a dialog that received its own open event twice resolved the
+        // caller's promise with null before the user had pressed anything.
+        '<div x-data="hangarOverview()">',
         '  <div class="d-flex align-items-center gap-2 mb-3">',
         '    <h2 class="h6 mb-0">Backup status</h2>',
         '    <span class="badge" :class="statusBadgeClass(overall)" x-text="overallText()"',

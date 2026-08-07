@@ -595,6 +595,503 @@ async function main() {
             await ctx.close();
         }
 
+        // ---- creating a folder from the picker
+        //
+        // Reported from real use: "i can not create folder here". Not a permission
+        // problem — the Create button was disabled and could never enable, because
+        // its binding ended in `newFolderProblems().length` and Alpine sets a
+        // boolean attribute for any value that is not null/undefined/false. A valid
+        // name produced an empty array, whose .length is 0, so typing a GOOD name
+        // is precisely what disabled the button.
+        {
+            const NUL = String.fromCharCode(30);
+            const { ctx, page } = await open(browser, {
+                spawn: Object.assign({}, DEFAULT_STUB.spawn, {
+                    'ls -1 /etc/hangar/repos': '',
+                    'find /': ['d\tetc', 'd\thome', 'd\tsrv'].join(NUL) + NUL,
+                    'find /srv': '',
+                    'mkdir': ''
+                })
+            });
+
+            await check('a valid folder name enables Create rather than disabling it', async () => {
+                await page.click('.nav-pills .nav-link:text-is("Repositories")');
+                await page.click('button:text-is("Add repository")');
+                await page.waitForSelector('#hangar-repo-edit.show', { timeout: 5000 });
+                await page.click('#hangar-repo-edit button:has-text("Browse")');
+                await page.waitForSelector('#hangar-fspicker.show', { timeout: 5000 });
+                await page.waitForTimeout(500);
+
+                await page.click('#hangar-fspicker button:has-text("New folder")');
+                await page.waitForTimeout(300);
+
+                const disabled = async () => await page.evaluate(() => {
+                    const btn = Array.from(document.querySelectorAll('#hangar-fspicker button'))
+                        .find((b) => b.textContent.trim() === 'Create');
+                    return btn ? btn.disabled : 'no Create button';
+                });
+
+                assertEqual(await disabled(), true, 'Create is offered with no name typed');
+
+                await page.fill('#hangar-fspicker-new', 'backups');
+                await page.waitForTimeout(400);
+                assertEqual(await disabled(), false,
+                    'Create stayed disabled for a perfectly valid folder name');
+
+                // And an invalid one disables it again, with the reason shown.
+                await page.fill('#hangar-fspicker-new', 'a/b');
+                await page.waitForTimeout(400);
+                assertEqual(await disabled(), true, 'Create is offered for a name with a slash in it');
+                const warned = await page.evaluate(() =>
+                    document.getElementById('hangar-fspicker').innerText);
+                assert(/cannot contain/.test(warned), `no reason shown: ${warned.slice(0, 120)}`);
+            });
+
+            await check('creating the folder runs mkdir and moves into it', async () => {
+                await page.fill('#hangar-fspicker-new', 'backups');
+                await page.waitForTimeout(300);
+                await page.evaluate(() => { window.__hangarStub.calls.length = 0; });
+                await page.click('#hangar-fspicker button:text-is("Create")');
+                await page.waitForTimeout(1200);
+
+                const calls = await page.evaluate(() => (window.__hangarStub.calls || [])
+                    .filter((c) => c.kind === 'spawn').map((c) => (c.argv || []).join(' ')));
+                const mkdir = calls.find((c) => /^mkdir /.test(c));
+                assert(!!mkdir, `mkdir never ran: ${JSON.stringify(calls)}`);
+                assert(/\/backups$/.test(mkdir), `mkdir made the wrong path: ${mkdir}`);
+                // -- terminates options so a leading-dash name cannot become a flag.
+                assert(/ -- /.test(mkdir), `no option terminator: ${mkdir}`);
+            });
+
+            await ctx.close();
+        }
+
+        // ---- deleting a snapshot from the Logbook
+        //
+        // restic separates unlinking a snapshot from reclaiming its space, and a
+        // live Logbook mount holds a shared lock that prune cannot work around —
+        // so this checks the whole shape: confirmed, unmounted, forgotten AND
+        // pruned, then the timeline re-read.
+        {
+            const REPO = { id: 'attic', kind: 'local', name: 'Attic', path: '/srv/backups/attic' };
+            const SNAPS = [
+                { id: 'aa11bb22cc33', short_id: 'aa11bb22', time: new Date(Date.now() - 7200e3).toISOString(),
+                    hostname: 'db01', paths: ['/home'] },
+                { id: 'dd44ee55ff66', short_id: 'dd44ee55', time: new Date(Date.now() - 3600e3).toISOString(),
+                    hostname: 'db01', paths: ['/home'] }
+            ];
+            const { ctx, page } = await open(browser, {
+                spawn: Object.assign({}, DEFAULT_STUB.spawn, {
+                    'ls -1 /etc/hangar/repos': 'attic.json',
+                    'find /run/hangar/mnt': 'f\t2048\t1700000000\tnotes.md\u001e',
+                    'snapshots': JSON.stringify(SNAPS),
+                    'stats': JSON.stringify({ total_size: 1024, snapshots_count: 2 }),
+                    'forget': '[]', 'diff': '', 'test -d': '',
+                    'systemd-run': '', 'systemctl': '', 'install -d': ''
+                }),
+                files: Object.assign({}, DEFAULT_STUB.files, {
+                    '/etc/hangar/repos/attic.json': JSON.stringify(REPO)
+                }),
+                dbus: {
+                    'org.freedesktop.systemd1:LoadUnit': ['/org/freedesktop/systemd1/unit/hangar'],
+                    'org.freedesktop.systemd1:GetAll': [{
+                        ActiveState: { v: 'inactive' }, SubState: { v: 'dead' },
+                        LoadState: { v: 'loaded' }, Id: { v: 'hangar.service' }
+                    }]
+                }
+            });
+
+            await check('the Logbook offers to delete the snapshot being viewed', async () => {
+                await page.click('.nav-pills .nav-link:text-is("Logbook")');
+                await page.waitForSelector('#hangar-logbook', { timeout: 5000 });
+                await page.waitForTimeout(2500);
+                const btn = await page.$('#hangar-logbook button:has-text("Delete snapshot")');
+                assert(!!btn, 'no delete control on the Logbook');
+                const label = await btn.getAttribute('aria-label');
+                assert(/Delete the snapshot from .+/.test(label || ''),
+                    `the button does not name what it destroys: ${label}`);
+            });
+
+            await check('deleting asks first, and does nothing when refused', async () => {
+                await page.click('#hangar-logbook button:has-text("Delete snapshot")');
+                await page.waitForSelector('#hangar-confirm.show', { timeout: 5000 });
+                const text = await page.evaluate(() =>
+                    document.getElementById('hangar-confirm').innerText);
+                assert(/cannot be undone/i.test(text), `the dialog does not say it is final: ${text}`);
+                await page.click('#hangar-confirm button:text-is("Cancel")');
+                await page.waitForTimeout(600);
+                const ran = await page.evaluate(() => (window.__hangarStub.calls || [])
+                    .some((c) => c.kind === 'spawn' && (c.argv || []).includes('forget')));
+                assert(!ran, 'restic forget ran even though the user cancelled');
+            });
+
+            await check('confirming forgets AND prunes, after dropping the mount', async () => {
+                await page.evaluate(() => { window.__hangarStub.calls.length = 0; });
+                await page.click('#hangar-logbook button:has-text("Delete snapshot")');
+                await page.waitForSelector('#hangar-confirm.show', { timeout: 5000 });
+                await page.click('#hangar-confirm button:text-is("Delete snapshot")');
+                await page.waitForTimeout(2500);
+
+                const calls = await page.evaluate(() => (window.__hangarStub.calls || [])
+                    .filter((c) => c.kind === 'spawn').map((c) => (c.argv || []).join(' ')));
+                const forget = calls.find((c) => / forget /.test(c + ' '));
+                assert(!!forget, `no forget was run: ${JSON.stringify(calls)}`);
+                assert(/--prune/.test(forget), `space is never reclaimed: ${forget}`);
+                assert(/dd44ee55ff66|aa11bb22cc33/.test(forget),
+                    `no snapshot id was passed — that is a different command entirely: ${forget}`);
+
+                // The mount holds a shared lock; prune needs an exclusive one.
+                // The unit is stopped over systemd's D-Bus API, not by spawning
+                // systemctl, so the ordering has to be read from the whole call
+                // log rather than from the spawns alone.
+                const ordered = await page.evaluate(() => (window.__hangarStub.calls || [])
+                    .map((c) => c.kind === 'dbus'
+                        ? `dbus:${c.method}:${JSON.stringify(c.args)}`
+                        : `spawn:${(c.argv || []).join(' ')}`));
+                const stopped = ordered.findIndex((c) => /dbus:StopUnit.*hangar-mount/.test(c));
+                const forgotAt = ordered.findIndex((c) => / forget /.test(c + ' '));
+                assert(stopped >= 0,
+                    `the mount was never released, so prune would hit hangar's own lock: ${JSON.stringify(ordered)}`);
+                assert(stopped < forgotAt,
+                    'the mount was released after the prune, which is too late');
+            });
+
+            await ctx.close();
+        }
+
+        // ---- pressing Save actually writes the job
+        //
+        // Reported from real use: "i pressed save for job, no job appeared,
+        // refreshed but the same". Every partial carried x-init="init()" while its
+        // component also defined init(), and Alpine 3 calls init() by itself — so
+        // init ran twice and every window listener was registered twice. The job
+        // dialog therefore received its own open event twice; the second delivery
+        // hit the "a second open cancels the first" guard and resolved the caller's
+        // promise with null. Save then closed the dialog, wrote nothing, and
+        // reported nothing.
+        {
+            const REPO = { id: 'attic', kind: 'local', name: 'Attic', path: '/srv/backups/attic' };
+            const { ctx, page } = await open(browser, {
+                spawn: Object.assign({}, DEFAULT_STUB.spawn, {
+                    'ls -1 /etc/hangar/repos': 'attic.json',
+                    'snapshots': '[]',
+                    'stats': JSON.stringify({ total_size: 0, snapshots_count: 0 }),
+                    'systemctl': '', 'systemd-run': ''
+                }),
+                files: Object.assign({}, DEFAULT_STUB.files, {
+                    '/etc/hangar/repos/attic.json': JSON.stringify(REPO)
+                })
+            });
+
+            await check('opening a dialog does not resolve the caller before they answer', async () => {
+                // The exact mechanism of the silent save. With init() running twice
+                // the dialog held two listeners, so one dispatch arrived twice; the
+                // second arrival hit "a second open cancels the first" and resolved
+                // the promise the Jobs screen was waiting on — with null, before the
+                // user had touched anything. Save then had nothing left to resolve.
+                const settled = await page.evaluate(() => new Promise((done) => {
+                    let state = 'NOT_CALLED';
+                    window.dispatchEvent(new CustomEvent('hangar:job-edit', {
+                        detail: { form: {}, repos: [], taken: [], resolve: (v) => { state = String(v); } }
+                    }));
+                    setTimeout(() => done(state), 500);
+                }));
+                assertEqual(settled, 'NOT_CALLED',
+                    `the dialog resolved its caller on open, with ${settled}`);
+
+                // That dispatch opened the dialog; close it properly, or its
+                // backdrop swallows the next check's clicks.
+                await page.click('#hangar-job-edit button:text-is("Cancel")');
+                await page.waitForSelector('#hangar-job-edit.show', { state: 'hidden', timeout: 5000 });
+            });
+
+            await check('pressing Save writes the job and lists it', async () => {
+                await page.click('.nav-pills .nav-link:text-is("Jobs")');
+                await page.waitForTimeout(600);
+                await page.click('button:text-is("Create job")');
+                await page.waitForSelector('#hangar-job-edit.show', { timeout: 5000 });
+                await page.waitForTimeout(600);
+
+                await page.fill('#hangar-job-id', 'nightly');
+                await page.fill('#hangar-job-name', 'Nightly');
+                await page.selectOption('#hangar-job-repo', 'attic');
+                await page.fill('#hangar-job-edit textarea', '/home');
+                await page.click('#hangar-job-edit button:text-is("Save job")');
+                await page.waitForTimeout(2000);
+
+                // It must reach /etc, not merely disappear from the dialog.
+                const written = await page.evaluate(() => (window.__hangarStub.calls || [])
+                    .filter((c) => c.kind === 'replace' && /\/etc\/hangar\/jobs\//.test(c.path || ''))
+                    .map((c) => c.path));
+                assert(written.some((p) => /nightly\.json$/.test(p)),
+                    `nothing was written to /etc/hangar/jobs: ${JSON.stringify(written)}`);
+
+                // The stub records writes but does not materialise files, so make
+                // the world reflect what was just written and re-read it the way
+                // the user did when they pressed Refresh.
+                await page.evaluate(() => {
+                    const call = (window.__hangarStub.calls || [])
+                        .filter((c) => c.kind === 'replace' && /jobs\/nightly\.json$/.test(c.path || '')).pop();
+                    window.__hangarStub.spawn['ls -1 /etc/hangar/jobs'] = 'nightly.json';
+                    window.__hangarStub.files['/etc/hangar/jobs/nightly.json'] = call.content;
+                });
+                await page.click('#hangar-jobs button:text-is("Refresh")');
+                await page.waitForTimeout(1500);
+
+                const onScreen = await page.evaluate(() =>
+                    document.getElementById('hangar-jobs').innerText);
+                assert(/Nightly/.test(onScreen), `the saved job is not listed: ${onScreen.slice(0, 120)}`);
+                assert(!/No backup jobs yet/i.test(onScreen),
+                    'the screen still says there are no jobs');
+            });
+
+            await ctx.close();
+        }
+
+        // ---- a repository created just now is offered to the next job
+        //
+        // Reported from real use: "i created a repository but dropdown has nothing
+        // in it". Every screen keeps its own copy of the repository list, read when
+        // that screen loaded, and the Jobs screen had loaded before the repository
+        // existed.
+        {
+            const REPO = { id: 'attic', kind: 'local', name: 'Attic', path: '/srv/backups/attic' };
+            let listed = '';                       // what `ls` reports, mutated mid-test
+            const { ctx, page } = await open(browser, {
+                spawn: Object.assign({}, DEFAULT_STUB.spawn, {
+                    'ls -1 /etc/hangar/repos': '',
+                    'snapshots': '[]',
+                    'stats': JSON.stringify({ total_size: 0, snapshots_count: 0 })
+                }),
+                files: Object.assign({}, DEFAULT_STUB.files, {
+                    '/etc/hangar/repos/attic.json': JSON.stringify(REPO)
+                })
+            });
+
+            await check('a repository created after the Jobs screen loaded is still offered', async () => {
+                // Load the Jobs screen FIRST, with no repositories — the state the
+                // report came from.
+                await page.click('.nav-pills .nav-link:text-is("Jobs")');
+                await page.waitForTimeout(800);
+
+                // Now one appears, exactly as creating one on the other tab would
+                // leave the world, and the Repositories screen announces it.
+                await page.evaluate(() => {
+                    window.__hangarStub.spawn['ls -1 /etc/hangar/repos'] = 'attic.json';
+                    window.dispatchEvent(new CustomEvent('hangar:repos-changed'));
+                });
+                await page.waitForTimeout(800);
+
+                await page.click('button:text-is("Create job")');
+                await page.waitForSelector('#hangar-job-edit.show', { timeout: 5000 });
+                await page.waitForTimeout(800);
+
+                const seen = await page.evaluate(() => {
+                    const sel = document.querySelector('#hangar-job-repo');
+                    return sel ? Array.from(sel.options).map((o) => o.value).filter(Boolean) : [];
+                });
+                assert(seen.includes('attic'),
+                    `the new repository is not in the dropdown: ${JSON.stringify(seen)}`);
+                await page.click('#hangar-job-edit button:text-is("Cancel")');
+                await page.waitForTimeout(400);
+            });
+
+            await ctx.close();
+        }
+
+        // ---- an empty dropdown is replaced by the action that fills it
+        //
+        // The default stub has no repositories, which is the state a fresh
+        // install is in: the job dialog used to render a picker containing only
+        // "Choose a repository…" and a line of text naming another tab.
+        {
+            const { ctx, page } = await open(browser);
+
+            await check('the job dialog offers no empty repository dropdown', async () => {
+                await page.click('.nav-pills .nav-link:text-is("Jobs")');
+                await page.waitForTimeout(500);
+                await page.click('button:text-is("Create job")');
+                await page.waitForSelector('#hangar-job-edit.show', { timeout: 5000 });
+                await page.waitForTimeout(600);
+                const seen = await page.evaluate(() => {
+                    const dlg = document.getElementById('hangar-job-edit');
+                    const sel = dlg.querySelector('#hangar-job-repo');
+                    const guide = Array.from(dlg.querySelectorAll('.hangar-empty'))
+                        .find((e) => e.getClientRects().length);
+                    return { select: !!(sel && sel.getClientRects().length),
+                        guidance: guide ? guide.innerText.replace(/\s+/g, ' ') : '' };
+                });
+                assert(!seen.select, 'an empty repository dropdown is still rendered');
+                assert(/no repository yet/i.test(seen.guidance),
+                    `no guidance in its place: ${JSON.stringify(seen.guidance)}`);
+            });
+
+            await check('the guidance leads to the screen that can help', async () => {
+                await page.click('#hangar-job-edit button:text-is("Create one now")');
+                await page.waitForTimeout(900);
+                const landed = await page.evaluate(() => ({
+                    jobDialogOpen: !!document.querySelector('#hangar-job-edit.show'),
+                    tab: document.querySelector('.nav-pills .nav-link.active').textContent.trim(),
+                    repoDialogOpen: !!document.querySelector('#hangar-repo-edit.show')
+                }));
+                assert(!landed.jobDialogOpen, 'the job dialog was left open behind the new screen');
+                assertEqual(landed.tab, 'Repositories', 'did not land on the Repositories tab');
+                assert(landed.repoDialogOpen, 'the user was sent to a screen and left to find the button');
+            });
+
+            await check('no screen shows a dropdown with nothing to choose', async () => {
+                // The rule, checked across every tab rather than one dialog.
+                for (const tab of ['Overview', 'Repositories', 'Jobs', 'Logbook', 'Recovery', 'Settings']) {
+                    await page.keyboard.press('Escape');
+                    await page.waitForTimeout(200);
+                    await page.click(`.nav-pills .nav-link:text-is("${tab}")`);
+                    await page.waitForTimeout(700);
+                    const empty = await page.evaluate(() => Array.from(document.querySelectorAll('select'))
+                        .filter((s) => s.getClientRects().length)
+                        .filter((s) => s.options.length === 0 ||
+                            (s.options.length === 1 && s.options[0].value === ''))
+                        .map((s) => s.id || s.getAttribute('x-model')));
+                    assertEqual(empty.length, 0, `${tab} shows an empty dropdown: ${JSON.stringify(empty)}`);
+                }
+            });
+
+            await ctx.close();
+        }
+
+        // ---- a loaded screen must stop saying it is loading
+        //
+        // Both failures below were invisible to the unit suites: the data was
+        // right, only the DOM disagreed. They are the reason this block exists.
+        {
+            const REPO = { id: 'attic', kind: 'local', name: 'Attic', path: '/srv/backups/attic' };
+            const SNAPS = [
+                { id: 'aa11', short_id: 'aa11', time: new Date(Date.now() - 7200e3).toISOString(),
+                    hostname: 'db01', paths: ['/home'] },
+                { id: 'bb22', short_id: 'bb22', time: new Date(Date.now() - 3600e3).toISOString(),
+                    hostname: 'db01', paths: ['/home'] }
+            ];
+            const { ctx, page } = await open(browser, {
+                spawn: Object.assign({}, DEFAULT_STUB.spawn, {
+                    'ls -1 /etc/hangar/repos': 'attic.json',
+                    // Ahead of 'snapshots': the mounted tree is read from a path
+                    // that contains /snapshots/, and the stub matches substrings.
+                    'find /run/hangar/mnt': 'f\t2048\t1700000000\tnotes.md\n',
+                    // The folder picker's own listing: "%y\t%f" per record,
+                    // separated by RS (\u001e) — what listArgv asks find for.
+                    'find /': ['d\tetc', 'd\thome', 'd\tsrv'].join('\u001e') + '\u001e',
+                    'snapshots': JSON.stringify(SNAPS),
+                    'stats': JSON.stringify({ total_size: 5_368_709_120, snapshots_count: 2 }),
+                    'diff': '',
+                    'systemd-run': '', 'systemctl': ''
+                }),
+                files: Object.assign({}, DEFAULT_STUB.files, {
+                    '/etc/hangar/repos/attic.json': JSON.stringify(REPO)
+                }),
+                // The Logbook asks systemd whether its mount unit is already up.
+                // Without an answer it falls back to `restic ls`, which this stub
+                // does not serve — and the tree would be empty for the wrong reason.
+                dbus: {
+                    'org.freedesktop.systemd1:LoadUnit': ['/org/freedesktop/systemd1/unit/hangar'],
+                    'org.freedesktop.systemd1:GetAll': [{
+                        ActiveState: { v: 'inactive' }, SubState: { v: 'dead' },
+                        LoadState: { v: 'loaded' }, Id: { v: 'hangar.service' }
+                    }]
+                }
+            });
+
+            await check('a repository row shows its size instead of a stuck "Reading repository…"', async () => {
+                // refresh() used to hand loadStats the raw row objects rather than
+                // Alpine's proxies, so the size arrived in the data and never on
+                // screen: the row sat at "Reading repository…" with an em dash.
+                await page.click('.nav-pills .nav-link:text-is("Repositories")');
+                await page.waitForSelector('#hangar-repos', { timeout: 5000 });
+                await page.waitForTimeout(1200);
+                const shown = await page.evaluate(() =>
+                    document.getElementById('hangar-repos').innerText);
+                assert(/GiB|MiB|KiB|bytes/.test(shown), `no size rendered: ${shown.slice(0, 300)}`);
+                assert(!/Reading repository/.test(shown),
+                    'the row still claims it is reading the repository');
+                const disabled = await page.evaluate(() => Array.from(
+                    document.querySelectorAll('#hangar-repos button'))
+                    .filter((b) => /^(Test|Check|Edit)$/.test(b.textContent.trim()) && b.disabled).length);
+                assertEqual(disabled, 0, 'row actions are still disabled by a busy flag nobody cleared');
+            });
+
+            await check('Browse opens the folder picker and fills the field', async () => {
+                // It opened nothing at all: app.js loads last and replaced the
+                // shared HangarDialogs object, deleting the pickPath that
+                // fspicker-ui.js had registered. Clicking Browse hit a missing
+                // function and returned false without a word.
+                await page.click('.nav-pills .nav-link:text-is("Repositories")');
+                await page.click('button:text-is("Add repository")');
+                await page.waitForSelector('#hangar-repo-edit.show', { timeout: 5000 });
+                await page.click('#hangar-repo-edit button:has-text("Browse")');
+                await page.waitForSelector('#hangar-fspicker.show', { timeout: 5000 });
+                await page.waitForSelector('#hangar-fspicker >> text=srv', { timeout: 5000 });
+
+                // And it must hand the choice back, not just open.
+                await page.click('#hangar-fspicker >> text=srv');
+                await page.waitForTimeout(300);
+                await page.click('#hangar-fspicker button:text-is("Choose")');
+                await page.waitForSelector('#hangar-fspicker.show', { state: 'hidden', timeout: 5000 });
+                const value = await page.inputValue('#hangar-repo-edit input[x-model="form[f.name]"]')
+                    .catch(async () => await page.evaluate(() => {
+                        const el = Array.from(document.querySelectorAll('#hangar-repo-edit input'))
+                            .find((i) => /srv/.test(i.value));
+                        return el ? el.value : '';
+                    }));
+                assert(/\/srv/.test(value), `the picked folder never reached the field: ${value}`);
+
+                await page.click('#hangar-repo-edit button:text-is("Cancel")');
+                await page.waitForSelector('#hangar-repo-edit.show', { state: 'hidden', timeout: 5000 });
+            });
+
+            await check('no select displays a value its component does not hold', async () => {
+                // Alpine binds x-model before the <template x-for> inside the
+                // select has produced an option, so the browser keeps showing the
+                // first one: the password dialog offered a six-word passphrase
+                // under a box reading "Two words, two numbers — weak".
+                await page.evaluate(() => window.dispatchEvent(new CustomEvent('hangar:password',
+                    { detail: { confirming: true, repoLabel: 'attic', resolve() {} } })));
+                await page.waitForSelector('#hangar-pw-pattern', { timeout: 5000 });
+                await page.waitForTimeout(400);
+                const wrong = await page.evaluate(() =>
+                    Array.from(document.querySelectorAll('select[x-model]'))
+                        .filter((el) => el.options.length)
+                        .map((el) => ({
+                            id: el.id || el.getAttribute('x-model'),
+                            shown: el.value,
+                            held: String(window.Alpine.evaluate(el, el.getAttribute('x-model')))
+                        }))
+                        // A model value with no matching option is a different
+                        // problem, and deliberately not resynced.
+                        .filter((r) => r.shown !== r.held && r.held !== 'undefined'));
+                assertEqual(wrong.length, 0, `selects out of sync: ${JSON.stringify(wrong)}`);
+
+                // Leave the screen as it was found: an open modal swallows the
+                // clicks the next check makes.
+                await page.click('#hangar-password button:text-is("Cancel")');
+                await page.waitForSelector('#hangar-password.show', { state: 'hidden', timeout: 5000 });
+            });
+
+            await check('the Logbook stops saying it is mounting once the tree is up', async () => {
+                // Three overlapping loads shared one boolean, so the first to
+                // finish declared the screen idle while the others still ran —
+                // and Alpine applies x-show on an animation frame, which let the
+                // flurry settle on "shown" over a finished tree.
+                await page.click('.nav-pills .nav-link:text-is("Logbook")');
+                await page.waitForSelector('#hangar-logbook', { timeout: 5000 });
+                await page.waitForTimeout(1500);
+                const shown = await page.evaluate(() =>
+                    document.getElementById('hangar-logbook').innerText);
+                assert(/notes\.md/.test(shown), `the tree never rendered: ${shown.slice(0, 300)}`);
+                assert(!/Mounting the repository|Reading the snapshot|Reading snapshots|Looking for repositories/
+                    .test(shown), `a stale progress line is still on screen: ${shown.slice(0, 300)}`);
+            });
+
+            await ctx.close();
+        }
+
     } finally {
         await browser.close();
         server.close();

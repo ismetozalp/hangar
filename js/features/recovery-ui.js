@@ -66,12 +66,12 @@
 
     // ------------------------------------------------------- the DR form
 
-    const TEXT_FIELDS = ['repoId', 'repoUrl', 'repoKind', 'host', 'outputUrl',
+    const TEXT_FIELDS = ['repoId', 'repoUrl', 'repoKind', 'host', 'outputUrl', 'excludeFile',
                          'backupUrl', 'keyPath', 'isoDefault', 'isoPrefix', 'isoVolid'];
 
     // Fields that are only sent to core/dr.js when the user actually filled them
     // in, so an empty box means "use ReaR's/hangar's default" rather than "".
-    const OPTIONAL_TEXT = ['host', 'outputUrl', 'backupUrl', 'keyPath',
+    const OPTIONAL_TEXT = ['host', 'outputUrl', 'excludeFile', 'backupUrl', 'keyPath',
                            'isoDefault', 'isoPrefix', 'isoVolid'];
 
     const LIST_FIELDS = ['backupPaths', 'excludes', 'extraCopyAsIs', 'extraRequiredProgs'];
@@ -83,6 +83,7 @@
             repoKind: 'local',
             host: '',
             outputUrl: '',
+            excludeFile: '',
             backupUrl: '',
             keyPath: '',
             backupPaths: joinList(Dr.DEFAULT_BACKUP_PATHS),
@@ -93,6 +94,7 @@
             isoPrefix: '',
             isoVolid: '',
             userInputTimeout: 30,
+            autoshrinkPercent: '',
             useDhclient: true,
             keepBuildDir: false
         };
@@ -124,12 +126,38 @@
         const t = trim(f.userInputTimeout);
         if (t !== '') cfg.userInputTimeout = /^-?\d+$/.test(t) ? Number(t) : f.userInputTimeout;
 
+        // Empty means "do not write AUTOSHRINK_DISK_SIZE_LIMIT_PERCENTAGE at
+        // all", so ReaR keeps its own default rather than hangar restating it.
+        const a = trim(f.autoshrinkPercent);
+        if (a !== '') cfg.autoshrinkPercent = /^-?\d+$/.test(a) ? Number(a) : f.autoshrinkPercent;
+
         return cfg;
+    }
+
+    // Has this object ever held a CONFIGURATION, or only hangar's own bookkeeping?
+    //
+    // hangar records the path of the last rescue image it built in the same file,
+    // so /etc/hangar/dr.json can exist while holding nothing but {"lastIso": ...}.
+    // Treating that as a saved form blanked the default paths and excludes — a
+    // user who had never saved anything found "Paths to back up" empty after
+    // building an image, and a recovery configuration that backs up nothing is
+    // the worst kind of empty box.
+    function isSavedConfig(cfg) {
+        if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) return false;
+        const has = (k) => Object.prototype.hasOwnProperty.call(cfg, k) &&
+            cfg[k] !== undefined && cfg[k] !== null;
+        // A list PRESENT but empty still counts: clearing the excludes and saving
+        // is a decision, and the defaults must not creep back in afterwards. The
+        // switches count too — someone who turned dhclient off and saved has
+        // configured this form as surely as someone who typed a path.
+        const SWITCHES = ['useDhclient', 'keepBuildDir', 'userInputTimeout', 'autoshrinkPercent'];
+        return TEXT_FIELDS.some((k) => has(k) && str(cfg[k]) !== '') ||
+            LIST_FIELDS.some(has) || SWITCHES.some(has);
     }
 
     function configToDrForm(cfg) {
         const f = defaultDrForm();
-        if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) return f;
+        if (!isSavedConfig(cfg)) return f;
 
         TEXT_FIELDS.forEach(function (k) {
             if (cfg[k] !== undefined && cfg[k] !== null) f[k] = str(cfg[k]);
@@ -141,6 +169,8 @@
 
         if (cfg.userInputTimeout !== undefined && cfg.userInputTimeout !== null)
             f.userInputTimeout = cfg.userInputTimeout;
+        f.autoshrinkPercent = (cfg.autoshrinkPercent === undefined || cfg.autoshrinkPercent === null)
+            ? '' : cfg.autoshrinkPercent;
         f.useDhclient = cfg.useDhclient !== false;
         f.keepBuildDir = cfg.keepBuildDir === true;
 
@@ -250,12 +280,24 @@
         return { level: level, code: code, message: message };
     }
 
+    // Where the drill's guest console is captured. Its own directory, because the
+    // file has to be writable by the qemu user and /var/lib/libvirt/images is not.
+    const DRILL_DIR = '/var/lib/hangar/drill';
+
+    // The group libvirt runs qemu as, by distribution. Probed in order; the first
+    // that exists on this host wins. RHEL/Fedora use qemu, Debian/Ubuntu
+    // libvirt-qemu, and kvm is the fallback that exists nearly everywhere.
+    const QEMU_GROUPS = ['qemu', 'libvirt-qemu', 'kvm'];
+
     function drillPlan(iso, opts) {
         const o = Object.assign({}, DRILL_DEFAULTS, opts || {});
         const warnings = [];
 
         const name = drillName(o.name);
         const isoPath = trim(iso);
+        // Already configurable — the libvirt pool is usually on /, which is the
+        // filesystem of the machine being tested, and a drill disk big enough to
+        // hold its restore is by definition big enough to fill it.
         const diskDir = trim(o.diskDir).replace(/\/+$/, '') || DRILL_DEFAULTS.diskDir;
         const diskPath = diskDir + '/' + name + '.qcow2';
 
@@ -271,9 +313,15 @@
 
         // Relative here would resolve against whatever directory the bridge
         // happens to be in, which is not a place a 20 GB disk should appear.
-        if (diskDir.charAt(0) !== '/' || CTRL_RE.test(diskDir))
+        // Absolute, no traversal, no shell metacharacters. Every consumer passes it
+        // as an argv element rather than through a shell, so this is the second
+        // line of defence rather than the first — but it runs as root and creates
+        // a directory, so a value like /home/../etc should never get that far.
+        if (diskDir.charAt(0) !== '/' || CTRL_RE.test(diskDir) ||
+            diskDir.split('/').indexOf('..') >= 0 || /['"`$;&|<>()\s\\]/.test(diskDir))
             warnings.push(note('error', 'disk-dir',
-                'The drill disk directory must be an absolute path with no control characters.'));
+                'The drill disk directory must be an absolute path with no "..", ' +
+                'spaces, quotes or shell characters.'));
 
         // Absence of libvirt is a limit of this host, not a defect in the image.
         if (o.libvirt === false)
@@ -324,6 +372,14 @@
                 'The repository is not on this machine and the drill VM has no network, so the ' +
                 'restore step cannot reach it.'));
 
+        // NOT beside the disk: /var/lib/libvirt/images is drwx--x--x root:root, so
+        // the qemu user can traverse it but cannot CREATE anything in it —
+        //   ERROR Unable to open file: …-console.log: Permission denied
+        // and the domain is torn down again having produced nothing. hangar makes
+        // its own directory for this, group-owned by whichever group the local
+        // libvirt runs qemu as.
+        const consolePath = DRILL_DIR + '/' + name + '-console.log';
+
         const firmware = o.firmware === 'uefi' ? 'uefi' : 'bios';
         const timeoutMin = Math.min(MAX_TIMEOUT_MIN,
             Math.max(1, intOr(o.timeoutMin, DRILL_DEFAULTS.timeoutMin)));
@@ -335,23 +391,89 @@
             '--disk', 'path=' + diskPath + ',size=' + diskGb + ',format=qcow2,sparse=yes',
             '--cdrom', isoPath,
             '--os-variant', 'generic',
-            // No graphics means virt-install attaches the serial console to stdout,
-            // which is the only way the drill can report what the rescue system did.
             '--graphics', 'none',
-            '--console', 'pty,target_type=serial',
+            // NOT '--console pty': virt-install would try to attach an interactive
+            // console, and hangar runs it through cockpit's channel, which has no
+            // controlling TTY. It refuses outright —
+            //
+            //   error: Cannot run interactive console without a controlling TTY
+            //
+            // — after defining the domain, so the drill died having proved nothing.
+            //
+            // The guest's serial output is still the only evidence the drill
+            // produces, so it goes to a FILE that hangar reads instead of to a
+            // terminal nobody is sitting at. The path is beside the drill disk on
+            // purpose: /var/lib/libvirt/images is already labelled for qemu to write
+            // to, which /var/log is not.
+            '--noautoconsole',
+            '--serial', 'file,path=' + consolePath,
             // The drill is finished the moment recovery reports; letting the VM
             // reboot into the recovered system proves nothing extra and costs time.
+            // The drill disk must be as big as the ORIGINAL disk, because ReaR
+            // recreates the recorded partition table and refuses to shrink a
+            // partition by more than a couple of percent. That nominal size is
+            // not what gets used: the disk is sparse, so it occupies roughly
+            // what the restore actually writes.
+            //
+            // virt-install checks the requested size against free space as if
+            // it were fully allocated, and refuses — "The requested volume
+            // capacity will exceed the available pool space when the volume is
+            // fully allocated" — which for a sparse drill disk measures the
+            // wrong thing entirely. Turning off that one check (not all of
+            // them) is what lets a 1 TB layout be drilled on a filesystem with
+            // room for the data but not for a full 1 TB.
+            //
+            // The real "is there room" question is asked by the System size
+            // field, which warns when the disk is too small for the restore.
+            '--check', 'disk_size=off',
             '--noreboot',
             '--wait', String(timeoutMin)];
 
         if (network === 'none') argv.push('--network', 'none');
         else argv.push('--network', 'network=' + network);
-        if (firmware === 'uefi') argv.push('--boot', 'uefi');
+        // UEFI, but NOT Secure Boot. A ReaR rescue image is not signed by a key
+        // any firmware trusts, so a secure-boot guest stops at the bootloader —
+        //
+        //   failed to load Boot0002 "UEFI QEMU DVD-ROM": Access Denied
+        //     -- rejected probably by Secure Boot
+        //   No bootable option or device was found.
+        //
+        // and then waits at the boot menu until the drill times out, having
+        // tested nothing.
+        //
+        // It must be the firmware feature, not `uefi,loader.secure=no`. The
+        // `uefi` shorthand resolves to a secure-boot firmware and overrides the
+        // attribute; measured with `virt-install --print-xml`:
+        //
+        //   uefi,loader.secure=no  -> <loader secure="yes">OVMF_CODE.secboot.fd
+        //   firmware.feature0…=no  -> <firmware><feature enabled="no"
+        //                                 name="secure-boot"/></firmware>
+        //
+        // The second form also matches how these machines really boot: the host
+        // this was found on reports SecureBoot disabled.
+        //
+        // --machine q35 is not decoration. Every EFI firmware descriptor ships
+        // q35-only targets (checked across all of /usr/share/qemu/firmware:
+        // machines=['q35'], the no-secure-boot one included). virt-install's
+        // default machine is i440fx, and it only switched to q35 as a side
+        // effect of arranging secure boot — so turning secure boot off took the
+        // machine type down with it and left firmware autoselect with nothing:
+        //
+        //   ERROR operation failed: Unable to find 'efi' firmware that is
+        //   compatible with the current configuration
+        //
+        // Asking for q35 outright makes the drill independent of that coupling.
+        if (firmware === 'uefi') {
+            argv.push('--machine', 'q35');
+            argv.push('--boot', 'firmware=efi,firmware.feature0.name=secure-boot,'
+                + 'firmware.feature0.enabled=no');
+        }
 
         return {
             name: name,
             iso: isoPath,
             diskPath: diskPath,
+            consolePath: consolePath,
             memoryMb: memoryMb,
             vcpus: vcpus,
             diskGb: diskGb,
@@ -362,7 +484,10 @@
             // Throwaway means throwaway: the disk goes with the domain, always.
             cleanup: [
                 ['virsh', 'destroy', name],
-                ['virsh', 'undefine', '--nvram', '--remove-all-storage', name]
+                ['virsh', 'undefine', '--nvram', '--remove-all-storage', name],
+                // --remove-all-storage takes the disk; the console log is an
+                // ordinary file beside it and has to be named.
+                ['rm', '-f', consolePath]
             ],
             warnings: warnings,
             ok: !warnings.some(function (w) { return w.level === 'error'; })
@@ -387,6 +512,106 @@
         recovered:    'Recovery completed in the drill VM.',
         failed:       'Recovery failed in the drill VM.'
     };
+
+    // How often the guest console file is re-read while a drill runs. Slow enough
+    // not to hammer a privileged channel, fast enough that the box on screen looks
+    // alive rather than hung.
+    const GUEST_POLL_MS = 2000;
+
+    // A serial console is a terminal, not a log file. What arrives is the byte
+    // stream a VT100 would have drawn: cursor moves, colour changes, screen
+    // clears, and a boot menu that repaints one line 300 times to count down.
+    // Shown raw it is unreadable —
+    //
+    //   [2J[001;001HBdsDxe: loading Boot0002 …
+    //   [054;001H   The highlighted entry will be executed automatically in 300s.
+    //   [054;001H   The highlighted entry will be executed automatically in 299s.
+    //
+    // This is not a terminal emulator and does not try to be one: it keeps the
+    // text, drops the drawing instructions, and collapses repaints.
+    function decodeConsole(raw) {
+        let s = str(raw);
+        if (!s) return '';
+
+        // Cursor moves and screen/line erases are where the firmware jumps to
+        // write somewhere else, so each one reads as a line break.
+        // Cursor moves and screen/line erases are where the firmware jumps to
+        // write somewhere else, so each one reads as a line break.
+        s = s.replace(/\u001b\[[0-9;]*[Hf]/g, '\n');
+        s = s.replace(/\u001b\[[0-9;?]*[JK]/g, '\n');
+        // Operating-system commands (window titles and such) carry no console text.
+        s = s.replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)?/g, '');
+        // Every other CSI: colours, modes, the 8;056;240t window resize.
+        s = s.replace(/\u001b\[[0-9;?=<>!]*[ -\/]*[@-~]/g, '');
+        s = s.replace(/\u001b[()][A-Za-z0-9]/g, '');   // charset selection
+        s = s.replace(/\u001b[=><NOMDEHc78]/g, '');    // single-character escapes
+        s = s.replace(/\u001b/g, '');                  // anything left over
+
+        const out = [];
+        const lines = s.split('\n');
+        for (let i = 0; i < lines.length; i++) {
+            // A carriage return rewinds to column one and the rest overwrites.
+            // Keeping the last segment is the usual approximation and is what
+            // makes progress bars readable.
+            // The trailing CR of a CRLF ending is NOT an overwrite. Stripping it
+            // first is the whole ballgame: 'text\r'.split('\r').pop() is '', so
+            // treating it as one deleted every CRLF-terminated line — which is
+            // every line a Linux rescue system prints. Measured on a real drill
+            // log: 89 KB in, 20 lines out, with 'rear recover failed' among the
+            // casualties.
+            let line = lines[i].replace(/\r+$/, '');
+            // An embedded CR is a genuine rewind: what follows overwrites.
+            if (line.indexOf('\r') >= 0) line = line.split('\r').pop();
+            // Trimmed at BOTH ends. DRILL_MARKERS anchors its verdicts to the
+            // start of a line ("^Finished recovering your system"), but a console
+            // line begins wherever the cursor was parked — a single leading space
+            // would hide the one line the whole drill exists to report.
+            line = line.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '').trim();
+            if (!line.trim()) continue;
+            // The menu frame is drawn character by character; it says nothing.
+            if (/^[\s\u2500-\u257f*]*$/.test(line)) continue;
+            out.push(line);
+        }
+        return collapseRepaints(out).join('\n');
+    }
+
+    // A repainted line arrives once per update. Consecutive lines of the same
+    // shape — identical once their numbers are blanked — are one line being
+    // rewritten, and only the final state is worth reading.
+    function collapseRepaints(lines) {
+        const out = [];
+        let i = 0;
+        while (i < lines.length) {
+            const shape = lines[i].replace(/\d+/g, '#');
+            let j = i + 1;
+            while (j < lines.length && lines[j].replace(/\d+/g, '#') === shape) j++;
+            const runLength = j - i;
+            const identical = lines[i] === lines[j - 1];
+            if (runLength === 1) {
+                out.push(lines[i]);
+            } else if (identical) {
+                out.push(lines[i] + '   [repeated ' + runLength + ' times]');
+            } else if (runLength >= 3) {
+                // A counter. The last value is the only informative one, but say
+                // how long it ran so a stall is still visible.
+                out.push(lines[j - 1] + '   [' + runLength + ' updates, last shown]');
+            } else {
+                for (let k = i; k < j; k++) out.push(lines[k]);
+            }
+            i = j;
+        }
+        return out;
+    }
+
+    // virt-install's own output and the guest's serial output, in that order, with
+    // a rule between them so a reader can tell which machine said what.
+    function joinLogs(toolLog, guestLog) {
+        const tool = str(toolLog);
+        const guest = str(guestLog);
+        if (!guest) return tool;
+        if (!tool) return guest;
+        return tool.replace(/\s+$/, '') + '\n\n--- guest console ---\n' + guest;
+    }
 
     function drillOutcome(text) {
         const lines = splitLines(text);
@@ -427,6 +652,9 @@
         'init':            'Initialise repository',
         'list-unreadable': 'Show unreadable files',
         'free-space':      'Show what is using the space',
+        // Cockpit's header owns the switch; hangar cannot flip it from a page,
+        // so the button says where to look rather than promising an escalation.
+        'grant-access':      'How to grant access',
         'reauthorize':     'Sign in to the destination again',
         'retry':           'Try again'
     };
@@ -499,7 +727,18 @@
             // --- drill ---------------------------------------------------
             libvirt: { checked: false, available: false, reason: '' },
             drillOpts: Object.assign({}, DRILL_DEFAULTS),
+            // The path of a rescue image hangar recorded and can no longer find.
+            // Kept so the screen can say what happened rather than silently
+            // dropping back to "no image yet".
+            isoMissing: '',
+            // Set when Build is asked to run against a /etc/rear/local.conf that
+            // does not match this form.
+            unwritten: false,
             drillRunning: false,
+            // The guest's serial output, read from the file virt-install writes it
+            // to. Kept apart from virt-install's own output so a tool error and a
+            // guest message never overwrite one another.
+            guestLog: '',
             drillLog: '',
             drillResult: null,
             drillError: null,
@@ -510,6 +749,11 @@
                 try {
                     await this.loadRepos();
                     await this.loadConfig();
+                    // AFTER loadConfig, never before: a location already written to
+                    // /etc/rear/local.conf is the user's decision and outranks any
+                    // default hangar would like to suggest.
+                    await this.seedOutputUrl();
+                    await this.seedHost();
                 } catch (e) {
                     this.setError(e);
                 }
@@ -534,6 +778,58 @@
                 this.partial = routed.partial;
                 if (routed.partial) this.showUnreadable = true;
                 return routed;
+            },
+
+            // Shown in place of an empty repository dropdown: the Recovery screen
+            // cannot do anything useful without one, so it sends the user to the
+            // screen that can and opens the form there.
+            goCreateRepository() {
+                if (typeof root.dispatchEvent !== 'function' || typeof root.CustomEvent !== 'function')
+                    return false;
+                root.dispatchEvent(new root.CustomEvent('hangar:go', { detail: { tab: 'repos' } }));
+                root.dispatchEvent(new root.CustomEvent('hangar:new-repository'));
+                return true;
+            },
+
+            // The ISO default follows the person using hangar, not root. cockpit
+            // knows whose session this is; when it cannot say, ReaR's own default
+            // is used and nothing changes.
+            //
+            // Only ever fills an EMPTY field: a path the user typed, or one already
+            // written to /etc/rear/local.conf, is theirs and is left alone.
+            async defaultOutputUrl() {
+                if (typeof cockpit === 'undefined' || typeof cockpit.user !== 'function')
+                    return Dr.DEFAULT_OUTPUT_URL;
+                try {
+                    const who = await cockpit.user();
+                    return Dr.outputUrlForHome(who && who.home);
+                } catch (e) {
+                    return Dr.DEFAULT_OUTPUT_URL;
+                }
+            },
+
+            // The field's placeholder promises "this machine's hostname"; without a
+            // value the generated config carried no --host at all, so `restore
+            // latest` in a shared repository could pick a snapshot written by a
+            // different machine and restore it onto this one. Seeded from the same
+            // name restic records in a snapshot.
+            async seedHost() {
+                if (str(this.form.host).trim() !== '') return false;
+                if (typeof cockpit === 'undefined' || !cockpit.spawn) return false;
+                try {
+                    const name = str(await cockpit.spawn(['hostname'], { err: 'message' })).trim();
+                    if (!name) return false;
+                    this.form.host = name;
+                    return true;
+                } catch (e) {
+                    return false;
+                }
+            },
+
+            async seedOutputUrl() {
+                if (str(this.form.outputUrl).trim() !== '') return false;
+                this.form.outputUrl = await this.defaultOutputUrl();
+                return true;
             },
 
             async loadRepos() {
@@ -564,6 +860,12 @@
                 if (!stored) return;
                 this.form = configToDrForm(stored);
                 this.iso = stored.lastIso ? str(stored.lastIso) : null;
+                // Remembered, not verified — until now. hangar went on saying
+                // "Rescue image ready" and naming a file that had been deleted,
+                // moved, or written to a USB stick and removed. That is the worst
+                // thing this screen can get wrong: the whole point of the rescue
+                // image is that it EXISTS when everything else does not.
+                await this.verifyIso();
             },
 
             // --- derived -------------------------------------------------
@@ -681,6 +983,35 @@
                 }
             },
 
+            // Does /etc/rear/local.conf match this form?
+            //
+            // `rear mkrescue` reads that file and knows nothing about what is typed
+            // here. Building with unsaved changes silently produces an image from
+            // the OLD configuration — which is how an image landed in
+            // /var/lib/rear/output while the form said /home/operator, and how an image
+            // got built with none of hangar's restic workflow in it at all.
+            //
+            // Returns true when they agree, false when they do not, and null when
+            // the question cannot be answered — in which case the build proceeds,
+            // because refusing on a failed check would block a legitimate build.
+            async configMatchesDisk() {
+                if (typeof cockpit === 'undefined' || !cockpit.file) return null;
+                let wanted;
+                try {
+                    wanted = Dr.renderLocalConf(this.config());
+                } catch (e) {
+                    return null;                    // an invalid form is reported elsewhere
+                }
+                try {
+                    const onDisk = await cockpit.file(Dr.LOCAL_CONF_PATH,
+                        { superuser: 'require' }).read();
+                    if (onDisk === null || onDisk === undefined) return false;
+                    return str(onDisk).trim() === str(wanted).trim();
+                } catch (e) {
+                    return null;
+                }
+            },
+
             // --- building ------------------------------------------------
 
             async build() {
@@ -688,12 +1019,25 @@
                 this.partial = null;
                 this.notice = '';
                 this.drillResult = null;
+
+                // Before anything is built, not after several minutes of it.
+                const matches = await this.configMatchesDisk();
+                if (matches === false) {
+                    this.unwritten = true;
+                    return null;
+                }
+                this.unwritten = false;
+
                 this.building = true;
                 this.lastAction = 'build';
                 this.progress = phaseLabel(null);
                 try {
                     const res = await Dr.mkrescue((parsed) => { this.progress = phaseLabel(parsed); });
                     this.iso = (res && res.iso) || null;
+                    // A build answers the "the rescue image is gone" notice. Leaving
+                    // it up beside a fresh "Rescue image ready" put two contradictory
+                    // boxes on screen at once.
+                    if (this.iso) this.isoMissing = '';
                     this.progress = phaseLabel(res && res.log);
                     await this.rememberIso();
                     return res;
@@ -844,37 +1188,300 @@
                 }
 
                 this.drillRunning = true;
+                this.guestLog = '';
+                let watch = null;
+                let toolLog = '';
+                let staged = null;
                 try {
-                    const proc = cockpit.spawn(plan.argv, { superuser: 'require', err: 'out' });
+                    await this.prepareConsole(plan);
+                    await this.prepareDiskDir(plan);
+
+                    // Before virt-install spends a minute allocating a disk it
+                    // will not be allowed to open.
+                    const blocked = await this.blockedDiskParent(plan);
+                    if (blocked) {
+                        this.drillError = Errors.create(Errors.KIND.GENERIC,
+                            'The drill disk cannot be created where you asked: ' + blocked +
+                            ' is not readable by the qemu user, so the virtual machine could ' +
+                            'not open its disk. A home directory is 0700 and blocks everything ' +
+                            'beneath it. Choose a location outside any home directory — ' +
+                            '/home/hangar-drill or /var/lib/libvirt/images both work.',
+                            { blocked: blocked, diskPath: plan.diskPath });
+                        return null;
+                    }
+                    // The plan's argv names the image; if it has to be staged, the
+                    // copy replaces it in place so the command that runs is the
+                    // command the dialog showed, bar the path.
+                    staged = await this.stageIso(plan);
+                    const argv = (staged && staged !== plan.iso)
+                        ? plan.argv.map((a) => (a === plan.iso ? staged : a))
+                        : plan.argv;
+                    const proc = cockpit.spawn(argv, { superuser: 'require', err: 'out' });
                     if (proc && typeof proc.stream === 'function') {
                         proc.stream((chunk) => {
                             // str(), not +=: a channel can hand back a Uint8Array, and
                             // "[object Uint8Array]" in the console log is worse than
                             // nothing because it looks like output.
-                            this.drillLog += str(chunk);
+                            toolLog += str(chunk);
+                            this.drillLog = joinLogs(toolLog, this.guestLog);
                             this.drillResult = drillOutcome(this.drillLog);
                         });
                     }
+                    // The guest writes to a file now, so it has to be read WHILE the
+                    // drill runs — otherwise the console box stays empty for the whole
+                    // wait and the user cannot tell a working drill from a hung one.
+                    if (root.setInterval) {
+                        watch = root.setInterval(() => {
+                            this.readGuestConsole(plan).then((text) => {
+                                if (text === null) return;
+                                this.guestLog = text;
+                                this.drillLog = joinLogs(toolLog, this.guestLog);
+                                this.drillResult = drillOutcome(this.drillLog);
+                            });
+                        }, GUEST_POLL_MS);
+                    }
+
                     const out = await proc;
-                    this.drillLog = str(out) || this.drillLog;
+                    toolLog = str(out) || toolLog;
+                    // One last read: the guest's final words land after virt-install
+                    // has already returned.
+                    const last = await this.readGuestConsole(plan);
+                    if (last !== null) this.guestLog = last;
+                    this.drillLog = joinLogs(toolLog, this.guestLog);
                     this.drillResult = drillOutcome(this.drillLog);
                     return this.drillResult;
                 } catch (e) {
                     // virt-install exiting non-zero is itself part of the answer, so
                     // the console is still parsed before the error is reported.
-                    this.drillLog = this.drillLog || str(e && e.message);
+                    // A guest that said something before virt-install failed is
+                    // still evidence; the tool's error is appended, not substituted.
+                    const said = await this.readGuestConsole(plan);
+                    if (said !== null) this.guestLog = said;
+                    this.drillLog = joinLogs(toolLog || str(e && e.message), this.guestLog) ||
+                        str(e && e.message);
                     this.drillResult = drillOutcome(this.drillLog);
                     this.drillError = Errors.isHangarError(e) ? e
                         : Errors.create(Errors.KIND.GENERIC, 'The drill VM could not be run.',
                             { error: str(e && e.message ? e.message : e) });
                     return this.drillResult;
                 } finally {
+                    if (watch && root.clearInterval) root.clearInterval(watch);
+                    // A staged copy is 900 MB of somebody's disk; it goes with the VM.
+                    if (staged && staged !== plan.iso) {
+                        try {
+                            await cockpit.spawn(['rm', '-f', staged],
+                                { superuser: 'require', err: 'message' });
+                        } catch (e) { /* reported by the disk usage, not worth an alert */ }
+                    }
                     this.drillRunning = false;
                     // Cleanup runs in a finally, so a throw here would replace the
                     // drill's verdict with a plumbing error. The verdict is the point.
                     try {
                         await this.cleanupDrill(plan);
                     } catch (e) { /* reported by drillCleaned staying false */ }
+                }
+            },
+
+            // A drill boots the image and watches. If the image's own boot default
+            // is "boot the hard disk" or "wait for a human", nothing happens: the
+            // menu waits for a keypress that cannot arrive on a VM with no display,
+            // burning a core until the timeout expires. Measured on a real host —
+            // 100% of a CPU, zero bytes written to the target disk, in ten minutes.
+            //
+            // The safe default for a real rescue USB is exactly the one that makes a
+            // drill useless, so this is a warning rather than a rule: hangar says
+            // what will happen and lets the operator decide.
+            drillWillWait() {
+                return str(this.form.isoDefault || 'boothd') !== 'automatic';
+            },
+
+            // Confirms the remembered rescue image is still on disk. Clears the
+            // record when it is not, so the screen offers a rebuild instead of a
+            // promise it cannot keep. Never throws: a check that cannot run leaves
+            // the record alone rather than discarding a good image.
+            async verifyIso() {
+                const path = str(this.iso).trim();
+                if (!path) return false;
+                if (typeof cockpit === 'undefined' || !cockpit.spawn) return false;
+                try {
+                    await cockpit.spawn(['test', '-f', path], { superuser: 'require', err: 'message' });
+                    this.isoMissing = '';
+                    return true;
+                } catch (e) {
+                    this.isoMissing = path;
+                    this.iso = null;
+                    return false;
+                }
+            },
+
+            // Can the hypervisor actually READ the rescue image?
+            //
+            // qemu runs as its own user and has to traverse every directory in the
+            // path. A rescue image delivered into a home directory cannot be read:
+            // /home/<user> is 0700, so virt-install warns and the VM fails to boot —
+            //
+            //   WARNING /home/operator/localhost/rear-localhost.iso may not be
+            //   accessible by the hypervisor. You will need to grant the 'qemu' user
+            //   search permissions for the following directories …
+            //
+            // Rather than telling the operator to loosen the permissions on their
+            // home directory, hangar stages a copy in the drill directory it
+            // already owns — and removes it again with the rest of the drill.
+            // The drill disk's directory has to exist, be traversable by the qemu
+            // user, and be labelled for VM images. None of that is true of a path
+            // someone types under their home: /home/<user> is 0700, and a
+            // directory there carries a home label SELinux will not let qemu open.
+            //
+            // hangar makes it rather than telling the operator to chmod their home.
+            // 0711: traversable by everyone, listable by nobody but root — the disk
+            // inside is a copy of this machine's filesystem.
+            async prepareDiskDir(plan) {
+                const dir = plan && plan.diskPath &&
+                    plan.diskPath.slice(0, plan.diskPath.lastIndexOf('/'));
+                if (!dir || typeof cockpit === 'undefined' || !cockpit.spawn) return false;
+                try {
+                    await cockpit.spawn(['install', '-d', '-m', '0711', '-o', 'root', '-g', 'root', dir],
+                        { superuser: 'require', err: 'message' });
+                    // argv, never a shell string: `dir` is a free-text field, and
+                    // this runs as root.
+                    await cockpit.spawn(['chcon', '-t', 'svirt_image_t', '--', dir],
+                        { superuser: 'require', err: 'message' }).catch(() => null);
+                    return true;
+                } catch (e) {
+                    return false;               // virt-install reports it better than a guess would
+                }
+            },
+
+            // Can qemu actually reach the drill disk?
+            //
+            // prepareDiskDir makes the directory traversable, but it cannot fix the
+            // PARENTS: /home/<user> is 0700, so a location under a home is
+            // unreachable however the leaf is chmodded. virt-install only says so
+            // after allocating the disk —
+            //
+            //   Cannot access storage file '…' (as uid:107, gid:107): Permission denied
+            //
+            // — which is a minute of writing a 60 GB file to learn something
+            // knowable in advance. Returns the directory that blocks it, or ''.
+            async blockedDiskParent(plan) {
+                const dir = plan && plan.diskPath &&
+                    plan.diskPath.slice(0, plan.diskPath.lastIndexOf('/'));
+                if (!dir || typeof cockpit === 'undefined' || !cockpit.spawn) return '';
+
+                // Is the check itself usable? `/` is traversable by everyone, so a
+                // failure here means there is no qemu user, no runuser, or no
+                // privilege — not that the directory is unreachable. "Cannot tell"
+                // must never become "refuse to run": the drill is what the operator
+                // asked for, and virt-install reports the truth either way.
+                try {
+                    await cockpit.spawn(['runuser', '-u', 'qemu', '--', 'test', '-x', '/'],
+                        { superuser: 'require', err: 'message' });
+                } catch (e) {
+                    return '';
+                }
+
+                // -x, not -w: qemu never creates the disk. libvirt creates it as
+                // root and hands over the open file, so all qemu needs is to
+                // TRAVERSE every directory on the way to it. Testing for write
+                // access condemned hangar's own 0711 drill directory — and then
+                // recommended it in the same sentence.
+                const parts = dir.split('/').filter(Boolean);
+                for (let i = 1; i <= parts.length; i++) {
+                    const step = '/' + parts.slice(0, i).join('/');
+                    try {
+                        await cockpit.spawn(['runuser', '-u', 'qemu', '--', 'test', '-x', step],
+                            { superuser: 'require', err: 'message' });
+                    } catch (err) {
+                        return step;            // the first one that blocks the way
+                    }
+                }
+                return '';                      // every step is traversable
+            },
+
+            async stageIso(plan) {
+                const iso = plan && plan.iso;
+                if (!iso || typeof cockpit === 'undefined' || !cockpit.spawn) return null;
+                try {
+                    // Readable where it stands? Then use it as it is: copying 900 MB
+                    // for nothing is not free.
+                    await cockpit.spawn(['runuser', '-u', 'qemu', '--', 'test', '-r', iso],
+                        { superuser: 'require', err: 'message' });
+                    return iso;
+                } catch (e) {
+                    // Not readable, or there is no qemu user to ask as. Stage it.
+                }
+                const staged = DRILL_DIR + '/' + drillName(plan.name) + '.iso';
+                try {
+                    await cockpit.spawn(['install', '-m', '0644', iso, staged],
+                        { superuser: 'require', err: 'message' });
+                    await cockpit.spawn(['chcon', '-t', 'svirt_image_t', '--', staged],
+                        { superuser: 'require', err: 'message' }).catch(() => null);
+                    return staged;
+                } catch (e) {
+                    return null;                 // fall back to the original path
+                }
+            },
+
+            // The guest console file must exist, and must be writable by the user
+            // libvirt runs qemu as, BEFORE the domain starts — qemu creates nothing
+            // in a directory it cannot write, and virt-install reports that as a
+            // flat "Permission denied" after tearing the domain down again.
+            //
+            // Best effort by design: if this cannot be done the drill still runs and
+            // simply has no guest console, which is a worse drill but not a broken
+            // one. The verdict then comes from virt-install's own exit.
+            async prepareConsole(plan) {
+                const path = plan && plan.consolePath;
+                if (!path || typeof cockpit === 'undefined' || !cockpit.spawn) return false;
+                for (const group of QEMU_GROUPS) {
+                    try {
+                        // 0770, not 0710: libvirt cleans up the console file as the
+                        // qemu user when the domain goes away, and unlinking needs
+                        // WRITE on the directory, not just traverse. With 0710 the
+                        // drill failed on its own cleanup —
+                        //   ERROR Unable to delete file …-console.log: Permission denied
+                        await cockpit.spawn(['install', '-d', '-m', '0770', '-o', 'root',
+                            '-g', group, DRILL_DIR], { superuser: 'require', err: 'message' });
+                        await cockpit.spawn(['install', '-m', '0660', '-o', 'root', '-g', group,
+                            '/dev/null', path], { superuser: 'require', err: 'message' });
+                        // SELinux, on a host where it is enforcing, is the rest of the
+                        // problem: the file inherits var_lib_t from its directory and
+                        // qemu (svirt_t) may not write or unlink that, whatever the
+                        // Unix permissions say. libvirt relabels the DISKS it manages
+                        // but not a serial chardev target, so hangar labels it.
+                        //
+                        // restorecon would be exactly wrong here — it would reset the
+                        // label to the one the directory implies, which is the one
+                        // that does not work. Best effort: a host without SELinux has
+                        // no chcon and needs none.
+                        // argv, never a shell string: the path is built from a
+                        // VM name the operator types. A missing chcon rejects and
+                        // is caught, which is the same outcome the old `command -v`
+                        // guard produced without handing a shell anything to parse.
+                        await cockpit.spawn(['chcon', '-t', 'svirt_image_t', '--', DRILL_DIR, path],
+                            { superuser: 'require', err: 'message' }).catch(() => null);
+                        return group;
+                    } catch (e) {
+                        // Wrong group for this distribution — try the next one.
+                    }
+                }
+                return false;
+            },
+
+            // Never throws and never reports a failure: the console file does not
+            // exist until the guest writes its first line, and "not there yet" is
+            // the normal state for the first few seconds of every drill.
+            async readGuestConsole(plan) {
+                const path = plan && plan.consolePath;
+                if (!path || typeof cockpit === 'undefined' || !cockpit.file) return null;
+                try {
+                    const text = await cockpit.file(path, { superuser: 'require' }).read();
+                    // Decoded here rather than at display time: drillOutcome reads
+                    // this text looking for what the rescue system said, and the
+                    // words it needs are the ones buried in the escape sequences.
+                    return text === null || text === undefined ? null : decodeConsole(text);
+                } catch (e) {
+                    return null;
                 }
             },
 
@@ -916,7 +1523,7 @@
         hangarRecoveryUi,
         // pure
         defaultDrForm, drFormToConfig, configToDrForm,
-        phaseLabel, drillPlan, drillOutcome, drillName,
+        phaseLabel, drillPlan, drillOutcome, drillName, joinLogs, decodeConsole, isSavedConfig,
         remediationLabel, unreadableFrom, isPartial, routeError,
         splitList, joinList,
         // constants

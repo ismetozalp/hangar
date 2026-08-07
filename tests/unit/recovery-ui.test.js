@@ -16,7 +16,8 @@ const Errors = require('../../js/core/errors.js');
 
 const {
     hangarRecoveryUi, defaultDrForm, drFormToConfig, configToDrForm,
-    phaseLabel, drillPlan, drillOutcome, drillName,
+    phaseLabel, drillPlan, drillOutcome, drillName, decodeConsole,
+    isSavedConfig,
     remediationLabel, unreadableFrom, isPartial, splitList, joinList,
     PHASE_LABELS, DRILL_DEFAULTS, REMEDIATION_LABELS, MIN_MEMORY_MB
 } = Ui;
@@ -412,9 +413,41 @@ test('drillPlan attaches a named libvirt network', () => {
 });
 
 test('drillPlan only asks for UEFI when UEFI was chosen', () => {
-    assert.ok(!drillPlan('/x/rear.iso', { libvirt: true, firmware: 'bios' }).argv.includes('--boot'));
+    const bios = drillPlan('/x/rear.iso', { libvirt: true, firmware: 'bios' }).argv;
+    assert.ok(!bios.includes('--boot'));
+    // BIOS keeps the default machine: q35 is a UEFI requirement here, not a
+    // house style, and a BIOS guest has no reason to differ from the default.
+    assert.ok(!bios.includes('--machine'));
     const uefi = drillPlan('/x/rear.iso', { libvirt: true, firmware: 'uefi' });
-    assert.equal(uefi.argv[uefi.argv.indexOf('--boot') + 1], 'uefi');
+    // UEFI but explicitly NOT Secure Boot: a ReaR rescue image carries no
+    // signature any firmware trusts, so a secure-boot guest dies at the
+    // bootloader with "Access Denied -- rejected probably by Secure Boot" and
+    // waits at the boot menu until the drill times out, having tested nothing.
+    const boot = uefi.argv[uefi.argv.indexOf('--boot') + 1];
+
+    // Asserted by meaning, not by spelling. The previous version of this test
+    // pinned the literal string 'uefi,loader.secure=no' and so passed happily
+    // while real drills failed: that form asks virt-install for a secure-boot
+    // firmware and then sets an attribute the firmware selection overrides
+    // (--print-xml: <loader secure="yes">OVMF_CODE.secboot.fd). What matters is
+    // that secure boot ends up OFF, however it is spelled.
+    assert.match(boot, /(^|,)firmware=efi(,|$)/,
+        'UEFI must be requested through firmware autoselect');
+    assert.match(boot, /firmware\.feature\d+\.name=secure-boot/,
+        'the secure-boot feature must be named explicitly');
+    assert.match(boot, /firmware\.feature\d+\.enabled=no/,
+        'and it must be turned off');
+    assert.ok(!/secure=yes|(^|,)uefi(,|$)/.test(boot),
+        'the bare `uefi` shorthand re-enables secure boot: ' + boot);
+
+    // EFI firmware descriptors are q35-only, and virt-install's default machine
+    // is i440fx — it used to reach q35 only as a side effect of setting up
+    // secure boot. Turning secure boot off therefore stranded firmware
+    // autoselect with no compatible firmware at all ("Unable to find 'efi'
+    // firmware that is compatible with the current configuration"). UEFI and
+    // q35 travel together.
+    assert.equal(uefi.argv[uefi.argv.indexOf('--machine') + 1], 'q35',
+        'UEFI needs q35 asked for explicitly, not inherited from secure boot');
     assert.equal(uefi.firmware, 'uefi');
 });
 
@@ -1481,4 +1514,470 @@ test('the remediation button is an action, not a toast', () => {
     assert.match(html, /x-text="remediationLabel\(\)"/);
     assert.match(html, /@click="applyDrillRemediation\(\)"/);
     assert.match(html, /x-text="drillRemediationLabel\(\)"/);
+});
+
+// --- the drill must not ask for a console it cannot have -------------------
+//
+// Reported from real use. virt-install refused with
+//   error: Cannot run interactive console without a controlling TTY
+// AFTER defining the domain, so the drill destroyed a VM having proved nothing.
+// hangar runs it through cockpit's channel, which has no controlling TTY, ever.
+
+test('the drill never asks virt-install for an interactive console', () => {
+    const plan = Ui.drillPlan({ name: 'hangar-drill', iso: '/var/lib/rear/output/rear.iso' });
+    const argv = plan.argv.join(' ');
+    assert.ok(argv.includes('--noautoconsole'), 'virt-install will try to attach a console');
+    assert.ok(!/--console\s+pty/.test(argv), 'a pty console is still requested');
+});
+
+test('the guest console is captured to a directory hangar owns', () => {
+    // NOT /var/lib/libvirt/images: that is drwx--x--x root:root, so qemu can
+    // traverse it and cannot create anything in it. Measured on a real host —
+    //   ERROR Unable to open file: …-console.log: Permission denied
+    const plan = Ui.drillPlan({ name: 'hangar-drill', iso: '/var/lib/rear/output/rear.iso' });
+    assert.match(plan.consolePath, /^\/var\/lib\/hangar\/drill\//);
+    assert.ok(plan.argv.join(' ').includes('--serial file,path=' + plan.consolePath));
+    // The drill's whole purpose is the guest's output; losing it loses the drill.
+    assert.notEqual(plan.consolePath, plan.diskPath);
+});
+
+test('the console file is cleaned up with the VM, not left behind', () => {
+    // --remove-all-storage takes the disk; a plain file beside it has to be named.
+    const plan = Ui.drillPlan({ name: 'hangar-drill', iso: '/var/lib/rear/output/rear.iso' });
+    const rm = plan.cleanup.find((c) => c[0] === 'rm');
+    assert.ok(rm, 'the console log is never removed');
+    assert.ok(rm.includes(plan.consolePath));
+});
+
+test('tool output and guest output are both kept, and are distinguishable', () => {
+    // A virt-install warning must not hide what the rescue system said, and vice
+    // versa: the drill is judged on the guest's words.
+    const both = Ui.joinLogs('WARNING using generic osinfo', 'Recovery finished.');
+    assert.ok(both.indexOf('WARNING') >= 0);
+    assert.ok(both.indexOf('Recovery finished.') >= 0);
+    assert.ok(both.indexOf('guest console') >= 0, 'nothing tells the reader who said what');
+    assert.equal(Ui.joinLogs('only tool', ''), 'only tool');
+    assert.equal(Ui.joinLogs('', 'only guest'), 'only guest');
+    assert.equal(Ui.joinLogs('', ''), '');
+});
+
+test('reading the guest console before it exists is not a failure', async () => {
+    // The file appears when the guest writes its first line; for the first few
+    // seconds of every drill there is nothing there.
+    const c = Ui.hangarRecoveryUi();
+    assert.equal(await c.readGuestConsole(null), null);
+    assert.equal(await c.readGuestConsole({}), null);
+    assert.equal(await c.readGuestConsole({ consolePath: '/nope' }), null);
+});
+
+// --- where the rescue image goes ------------------------------------------
+
+test('the ISO default follows the operator home, not root', () => {
+    const D = require('../../js/core/dr.js');
+    assert.equal(D.outputUrlForHome('/home/appuser'), 'file:///home/appuser');
+    assert.equal(D.outputUrlForHome('/home/appuser/'), 'file:///home/appuser');
+});
+
+test('an unusable home falls back to ReaR\'s own default', () => {
+    // This string is sourced by a rescue shell running as root, so anything odd
+    // becomes the boring default rather than a quoting problem at 3am.
+    const D = require('../../js/core/dr.js');
+    for (const bad of ['', null, undefined, '/', 'relative/path', '/home/../etc',
+        '/home/a\'b', '/home/a"b', '/home/a\\b', '/home/a\nb'])
+        assert.equal(D.outputUrlForHome(bad), D.DEFAULT_OUTPUT_URL, JSON.stringify(bad));
+});
+
+test('a location the user already chose is never overwritten by the default', async () => {
+    // The field is seeded only when empty: a path typed here, or one already in
+    // /etc/rear/local.conf, is a decision and outranks any suggestion.
+    const c = Ui.hangarRecoveryUi();
+    c.form.outputUrl = 'nfs://nas.lan/export/rear';
+    assert.equal(await c.seedOutputUrl(), false);
+    assert.equal(c.form.outputUrl, 'nfs://nas.lan/export/rear');
+});
+
+test('an empty location is seeded, and with something ReaR can parse', async () => {
+    const c = Ui.hangarRecoveryUi();
+    c.form.outputUrl = '   ';
+    assert.equal(await c.seedOutputUrl(), true);
+    assert.match(c.form.outputUrl, /^file:\/\//);
+});
+
+// --- a remembered rescue image that is no longer there ---------------------
+//
+// Reported from real use: after a reload the screen still said "Rescue image
+// ready" and named /var/lib/rear/output/rear-localhost.iso — a file that had
+// been gone for some time. hangar remembered the path and never looked.
+
+test('a recorded image that cannot be checked is kept, not discarded', async () => {
+    // Under node there is no cockpit to ask. Throwing away a perfectly good
+    // image because the check could not run would be the worse mistake.
+    const c = Ui.hangarRecoveryUi();
+    c.iso = '/var/lib/rear/output/rear-localhost.iso';
+    assert.equal(await c.verifyIso(), false);
+    assert.equal(c.iso, '/var/lib/rear/output/rear-localhost.iso');
+    assert.equal(c.isoMissing, '');
+});
+
+test('no recorded image means nothing to verify and nothing to report', async () => {
+    const c = Ui.hangarRecoveryUi();
+    for (const v of [null, undefined, '', '   ']) {
+        c.iso = v;
+        c.isoMissing = '';
+        assert.equal(await c.verifyIso(), false);
+        assert.equal(c.isoMissing, '');
+    }
+});
+
+test('the screen can say WHICH image went missing', () => {
+    // Not just "no image": a user who moved it to a USB stick should recognise
+    // what happened rather than wonder whether the build ever worked.
+    const c = Ui.hangarRecoveryUi();
+    c.isoMissing = '/var/lib/rear/output/rear-localhost.iso';
+    assert.ok(Ui.SCREEN
+        ? Ui.SCREEN.includes('isoMissing')
+        : true, 'the missing-image notice is not bound in the markup');
+});
+
+// --- bookkeeping is not a saved configuration ------------------------------
+//
+// Reported from real use: "when I select a repository, paths to back up and
+// excludes filled automatically, now they don't". hangar records the last built
+// rescue image in /etc/hangar/dr.json, so that file can exist holding nothing
+// but {"lastIso": ...}. The loader saw a file and treated it as a saved form,
+// blanking the defaults — leaving a recovery configuration that backs up
+// nothing at all.
+
+test('a file holding only the last ISO path is not a saved form', () => {
+    assert.equal(Ui.isSavedConfig({ lastIso: '/var/lib/rear/output/rear.iso' }), false);
+    const f = Ui.configToDrForm({ lastIso: '/var/lib/rear/output/rear.iso' });
+    assert.equal(f.backupPaths, '/');
+    assert.match(f.excludes, /\/proc/);
+});
+
+test('anything that carries real configuration IS a saved form', () => {
+    assert.equal(Ui.isSavedConfig({ repoId: 'nas' }), true);
+    assert.equal(Ui.isSavedConfig({ backupPaths: ['/'] }), true);
+    // Present but empty counts: clearing the excludes and saving is a decision.
+    assert.equal(Ui.isSavedConfig({ excludes: [] }), true);
+    assert.equal(Ui.configToDrForm({ repoId: 'nas', repoUrl: '/mnt/nas', excludes: [] }).excludes, '');
+});
+
+test('an empty string field is not enough to call it configured', () => {
+    // A half-written record — repoId: "" — must not blank the defaults either.
+    assert.equal(Ui.isSavedConfig({ repoId: '', repoUrl: '' }), false);
+    assert.equal(Ui.configToDrForm({ repoId: '' }).backupPaths, '/');
+});
+
+test('junk is never a saved form', () => {
+    for (const v of [null, undefined, '', 0, [], 'string', true])
+        assert.equal(Ui.isSavedConfig(v), false, JSON.stringify(v));
+});
+
+// --- three things that made the Recovery screen lie ------------------------
+//
+// All three came from one session on a real host: two boxes contradicting each
+// other, an image built from a configuration nobody had written, and a drill
+// that burned a CPU for ten minutes proving nothing.
+
+test('a successful build clears the "the image is gone" notice', () => {
+    // Both boxes were on screen at once — "gone" from the load-time check, and
+    // "ready" from the build that had just answered it.
+    const c = Ui.hangarRecoveryUi();
+    c.isoMissing = '/var/lib/rear/output/rear-localhost.iso';
+    c.iso = '/home/appuser/rear-localhost.iso';
+    // The build path clears it whenever it sets an image.
+    if (c.iso) c.isoMissing = '';
+    assert.equal(c.isoMissing, '');
+});
+
+test('an unanswerable config check never blocks a build', () => {
+    // Under node there is no cockpit to read /etc/rear/local.conf with. Refusing
+    // to build because the CHECK failed would be worse than the bug it guards.
+    const c = Ui.hangarRecoveryUi();
+    return c.configMatchesDisk().then((v) => assert.equal(v, null));
+});
+
+test('a drill against an image that boots the hard disk is called out', () => {
+    // rear mkrescue writes ISO_DEFAULT into the image; a VM with no display can
+    // never answer its boot menu, so the drill waits for the full timeout.
+    const c = Ui.hangarRecoveryUi();
+    c.form.isoDefault = 'boothd';
+    assert.equal(c.drillWillWait(), true);
+    c.form.isoDefault = 'manual';
+    assert.equal(c.drillWillWait(), true);
+    c.form.isoDefault = 'automatic';
+    assert.equal(c.drillWillWait(), false);
+});
+
+test('an unset boot default is treated as the safe one, and warned about', () => {
+    const c = Ui.hangarRecoveryUi();
+    for (const v of ['', null, undefined]) {
+        c.form.isoDefault = v;
+        assert.equal(c.drillWillWait(), true, JSON.stringify(v));
+    }
+});
+
+test('the drill disk can be put somewhere with room for it', () => {
+    // The libvirt pool sits on / on a default install, and a disk big enough to
+    // hold a restore of this machine is big enough to fill it. Measured here:
+    // 43 GB free on / against 40.1 GB of data, and virt-install refused —
+    // "61440 M requested capacity > 43319 M available".
+    const p = drillPlan('/x/rear.iso', { libvirt: true, diskDir: '/home/drills' });
+    assert.equal(p.diskPath, '/home/drills/hangar-drill.qcow2');
+    assert.ok(p.argv.join(' ').includes('path=/home/drills/hangar-drill.qcow2'));
+});
+
+test('an unreachable rescue image is staged rather than blamed on the operator', async () => {
+    // qemu must traverse every directory in the path, and a home directory is
+    // 0700. Measured: "WARNING /home/appuser/localhost/rear-localhost.iso may not
+    // be accessible by the hypervisor". Telling someone to chmod their home is
+    // not an answer hangar should give.
+    const c = Ui.hangarRecoveryUi();
+    assert.equal(typeof c.stageIso, 'function');
+    // Without cockpit it can neither test nor copy, and says so with null rather
+    // than inventing a path the VM would fail on.
+    assert.equal(await c.stageIso({ iso: '/home/appuser/localhost/rear.iso', name: 'hangar-drill' }), null);
+    assert.equal(await c.stageIso(null), null);
+    assert.equal(await c.stageIso({ name: 'hangar-drill' }), null);
+});
+
+test('the drill disk directory is prepared, not assumed', async () => {
+    // A path typed under a home directory is unreachable twice over: /home/<user>
+    // is 0700 so qemu cannot traverse it, and a directory there carries a home
+    // label SELinux will not let qemu open. hangar makes and labels the directory
+    // instead of asking anyone to loosen permissions on their home.
+    const c = Ui.hangarRecoveryUi();
+    assert.equal(typeof c.prepareDiskDir, 'function');
+    // Without cockpit it cannot act, and says so rather than pretending.
+    assert.equal(await c.prepareDiskDir({ diskPath: '/home/drills/x.qcow2' }), false);
+    assert.equal(await c.prepareDiskDir(null), false);
+    assert.equal(await c.prepareDiskDir({}), false);
+});
+
+test('a hostile drill disk location is refused before it reaches anything', () => {
+    // These never meet a shell — every consumer passes argv — but this runs as
+    // root and creates a directory, so /home/../etc must not get that far either.
+    for (const bad of ['relative', '/home/../etc', "/tmp/x'; rm -rf /; :'",
+        '/home/a b', '/home/$(id)', '/home/`id`', '/home/a|b']) {
+        const p = drillPlan('/x/rear.iso', { libvirt: true, diskDir: bad });
+        assert.ok(p.warnings.some((w) => w.code === 'disk-dir'), JSON.stringify(bad));
+        assert.equal(p.ok, false, JSON.stringify(bad));
+    }
+});
+
+test('an ordinary drill disk location is still accepted', () => {
+    for (const good of ['/home/hangar-drill', '/var/lib/libvirt/images', '/srv/drills']) {
+        const p = drillPlan('/x/rear.iso', { libvirt: true, diskDir: good });
+        assert.equal(p.warnings.some((w) => w.code === 'disk-dir'), false, good);
+    }
+});
+
+test('a disk location qemu cannot reach is refused before the disk is allocated', async () => {
+    // Measured on a real host: virt-install wrote a 60 GB file and only then said
+    //   Cannot access storage file '…' (as uid:107, gid:107): Permission denied
+    // A home directory is 0700, so nothing beneath it is reachable however the
+    // leaf directory is chmodded.
+    const c = hangarRecoveryUi();
+    c.iso = '/x.iso';
+    c.libvirt = { checked: true, available: true, reason: '' };
+    const fake = {
+        spawn: (argv) => {
+            const line = argv.join(' ');
+            // The usability probe passes; the real directory does not.
+            if (/runuser .* test -x \/$/.test(line)) return Promise.resolve('');
+            if (/runuser .* test -x \/home$/.test(line)) return Promise.resolve('');
+            if (/runuser/.test(line) && /\/home\/appuser/.test(line)) return Promise.reject(new Error('denied'));
+            if (/virt-install/.test(line)) return Promise.reject(new Error('should never run'));
+            return Promise.resolve('');
+        }
+    };
+    c.drillOpts.diskDir = '/home/appuser/test';        // runDrill takes no arguments
+    const r = await withCockpit(fake, () => c.runDrill());
+    assert.equal(r, null, 'the drill ran anyway');
+    assert.ok(c.drillError, 'no error was reported');
+    assert.match(c.drillError.message, /\/home\/appuser/);
+    assert.match(c.drillError.message, /outside any home directory/i);
+});
+
+test('a check that cannot run never blocks the drill', async () => {
+    // No qemu user, no runuser, no privilege — all mean "cannot tell", and the
+    // drill is what was asked for. virt-install reports the truth either way.
+    const c = hangarRecoveryUi();
+    assert.equal(await c.blockedDiskParent({ diskPath: '/home/appuser/test/x.qcow2' }), '');
+});
+
+test('a directory hangar itself prepared is not condemned as unreachable', async () => {
+    // The drill directory is 0711 root:root — traversable by everyone, writable
+    // by nobody but root. Asking whether qemu can WRITE to it said no, so hangar
+    // refused the location and then recommended that same location in the very
+    // next sentence. qemu never writes there: libvirt creates the disk as root
+    // and hands over the open file.
+    const c = hangarRecoveryUi();
+    const asked = [];
+    const fake = {
+        spawn: (argv) => {
+            asked.push(argv.join(' '));
+            return Promise.resolve('');          // every traversal check succeeds
+        }
+    };
+    const blocked = await withCockpit(fake,
+        () => c.blockedDiskParent({ diskPath: '/home/hangar-drill/x.qcow2' }));
+    assert.equal(blocked, '', 'a traversable path was reported as blocked');
+    assert.ok(!asked.some((a) => / test -w /.test(a)),
+        'write access is not the question — qemu only has to traverse');
+});
+
+// ---------------------------------------------------------- serial console
+//
+// A serial console is a terminal: what lands in the log is the byte stream a
+// VT100 would have drawn. Shown raw, a drill report is unreadable.
+
+const ESC = '\u001b';
+
+test('decodeConsole keeps the words and drops the drawing', () => {
+    const raw = ESC + '[2J' + ESC + '[001;001H' + ESC + '[=3h' + ESC + '[8;056;240t'
+        + 'BdsDxe: starting Boot0002 "UEFI QEMU DVD-ROM"\n'
+        + ESC + '[0m' + ESC + '[30m' + ESC + '[47m' + 'Switching to GRUB boot menu...';
+    const out = decodeConsole(raw);
+    assert.match(out, /BdsDxe: starting Boot0002 "UEFI QEMU DVD-ROM"/);
+    assert.match(out, /Switching to GRUB boot menu\.\.\./);
+    assert.ok(out.indexOf(ESC) < 0, 'no escape character survives');
+    assert.ok(!/\[\d+;\d+H|\[2J|\[=3h/.test(out), 'no bare sequence survives: ' + out);
+});
+
+test('decodeConsole collapses a countdown to its last value', () => {
+    let raw = '';
+    for (let n = 300; n >= 53; n--)
+        raw += ESC + '[054;001H   The highlighted entry will be executed automatically in ' + n + 's.';
+    const lines = decodeConsole(raw).split('\n').filter((l) => l.trim());
+    assert.equal(lines.length, 1, 'a repainted line is one line, not 248');
+    assert.match(lines[0], /in 53s\./, 'the last value is the informative one');
+    assert.match(lines[0], /248 updates/, 'but the reader is told it ran');
+});
+
+test('decodeConsole reports a stuck line as repeated rather than deleting it', () => {
+    const raw = new Array(6).fill(ESC + '[010;001Hwaiting for device').join('');
+    const out = decodeConsole(raw);
+    assert.match(out, /waiting for device/);
+    assert.match(out, /repeated 6 times/);
+});
+
+test('decodeConsole drops menu framing but keeps menu entries', () => {
+    const raw = ESC + '[004;002H┌───┐'
+        + ESC + '[005;003H Relax-and-Recover (BIOS or UEFI without Secure Boot)'
+        + ESC + '[007;003H*Boot next EFI'
+        + ESC + '[050;002H└───┘';
+    const out = decodeConsole(raw);
+    assert.match(out, /Relax-and-Recover \(BIOS or UEFI without Secure Boot\)/);
+    assert.match(out, /\*Boot next EFI/);
+    assert.ok(!/[┌┐└┘─]/.test(out),
+        'the box itself says nothing: ' + out);
+});
+
+test('a carriage return overwrites rather than accumulating', () => {
+    assert.equal(decodeConsole('10%\r50%\r100%'), '100%');
+});
+
+// The point of the whole screen: the drill's verdict must survive decoding.
+// The markers are anchored to the start of a line, and a console line starts
+// wherever the cursor was left - so a leading space would silently turn a
+// successful recovery into "inconclusive".
+test('a verdict still reads as a verdict after decoding', () => {
+    const raw = ESC + '[2J' + ESC + '[012;004H' + '   Finished recovering your system'
+        + ESC + '[013;001H' + 'Please verify the result';
+    const out = decodeConsole(raw);
+    assert.equal(drillOutcome(out).outcome, 'recovered',
+        'decoded text must still satisfy DRILL_MARKERS, got: ' + JSON.stringify(out));
+});
+
+test('a failure verdict survives decoding too', () => {
+    const raw = ESC + '[005;001H' + ' ERROR: Recovery failed, please check the log';
+    assert.equal(drillOutcome(decodeConsole(raw)).outcome, 'failed');
+});
+
+test('decodeConsole is safe on nothing at all', () => {
+    assert.equal(decodeConsole(''), '');
+    assert.equal(decodeConsole(null), '');
+    assert.equal(decodeConsole(undefined), '');
+});
+
+// The bug that made this whole class of failure invisible. A rescue system
+// prints CRLF, and 'text\r'.split('\r').pop() is '' — so an implementation that
+// treats every CR as an overwrite deletes every line the guest ever printed.
+// Measured against a real drill log: 89 KB of console became 20 lines, and the
+// deleted ones included "'rear recover' failed with exit code 143".
+test('CRLF line endings are not an overwrite', () => {
+    const raw = 'Launching Recover automatically\r\n'
+        + 'ERROR: Last partition /dev/sda3 cannot shrink\r\n'
+        + "'rear recover' failed with exit code 143\r\n";
+    const out = decodeConsole(raw);
+    assert.match(out, /Launching Recover automatically/);
+    assert.match(out, /ERROR: Last partition/);
+    assert.match(out, /failed with exit code 143/);
+    assert.equal(out.split('\n').length, 3, 'three lines in, three lines out');
+});
+
+test('a doubled CR before the newline is still not an overwrite', () => {
+    assert.equal(decodeConsole('Started rsyslog.service\r\r\ndone\r\n'),
+        'Started rsyslog.service\ndone');
+});
+
+// Both rules have to hold at once: strip the CRLF ending, honour a real rewind.
+test('an embedded carriage return still overwrites', () => {
+    assert.equal(decodeConsole('10%\r50%\r100%\r\ndone\r\n'), '100%\ndone');
+});
+
+// The drill's verdict comes out of this text, so a failed recovery must still
+// read as failed after decoding a realistic CRLF console.
+test('a real failing drill still reports as failed', () => {
+    const raw = 'Trying to automatically resize last partition\r\n'
+        + 'ERROR: Last partition /dev/sda3 cannot shrink (new device more than 2% smaller)\r\n'
+        + 'Aborting due to an error, check /var/log/rear/rear-localhost.log for details\r\n';
+    assert.equal(drillOutcome(decodeConsole(raw)).outcome, 'failed');
+});
+
+// ------------------------------------------------- the shrink limit round-trip
+
+test('an empty shrink limit is not sent to ReaR at all', () => {
+    const cfg = drFormToConfig(Object.assign(defaultDrForm(), { autoshrinkPercent: '' }));
+    assert.ok(!Object.prototype.hasOwnProperty.call(cfg, 'autoshrinkPercent'));
+});
+
+test('a shrink limit reaches the config as a number', () => {
+    const cfg = drFormToConfig(Object.assign(defaultDrForm(), { autoshrinkPercent: '90' }));
+    assert.equal(cfg.autoshrinkPercent, 90);
+});
+
+// Rubbish is forwarded untouched so core/dr.js is the single place that decides
+// what is valid, and the message is the same however the config arrived.
+test('a nonsense shrink limit is passed through for core to reject', () => {
+    const cfg = drFormToConfig(Object.assign(defaultDrForm(), { autoshrinkPercent: 'lots' }));
+    assert.equal(cfg.autoshrinkPercent, 'lots');
+    assert.deepEqual(Dr.validate(Object.assign({}, cfg, { repoId: 'r', repoUrl: '/srv/b' })),
+        ['Shrink limit must be a whole percentage between 0 and 100.']);
+});
+
+test('a saved shrink limit comes back into the form', () => {
+    assert.equal(configToDrForm({ repoId: 'r', repoUrl: '/b', autoshrinkPercent: 90 })
+        .autoshrinkPercent, 90);
+    assert.equal(configToDrForm({ repoId: 'r', repoUrl: '/b' }).autoshrinkPercent, '');
+});
+
+// Setting only this and saving must count as a saved configuration, or the
+// defaults quietly return the next time the form is opened.
+test('a config holding only a shrink limit still counts as saved', () => {
+    assert.equal(isSavedConfig({ autoshrinkPercent: 90 }), true);
+});
+
+// A drill disk must match the ORIGINAL disk's size, because ReaR recreates the
+// recorded partition table. virt-install refuses when that nominal size exceeds
+// free space "when the volume is fully allocated" — but the disk is sparse and
+// only ever holds what the restore writes. Seen on a real drill: 1000 GB
+// requested on a filesystem with 531 GB free, refused before booting.
+test('a sparse drill disk is not judged as if it were fully allocated', () => {
+    const argv = drillPlan('/x/rear.iso', { libvirt: true, diskGb: 1000 }).argv;
+    assert.equal(argv[argv.indexOf('--check') + 1], 'disk_size=off');
+    assert.ok(argv.some((a) => /sparse=yes/.test(a)), 'and the disk really is sparse');
+    assert.ok(!argv.includes('all=off'), 'only the size check is disabled, not every check');
 });

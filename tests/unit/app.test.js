@@ -205,3 +205,37 @@ test('a probe that rejects is reported and does not leave a stale list', async (
         assert.ok(a.error, 'the failure was swallowed');
     } finally { delete globalThis.HangarProvision; }
 });
+
+// --- selects whose options arrive late ------------------------------------
+//
+// Alpine binds x-model on a <select> before the <template x-for> inside it has
+// produced any <option>, so the browser keeps showing the first one. The
+// password dialog generated a six-word passphrase while its Shape box read
+// "Two words, two numbers — weak".
+
+test('a select showing something other than its model is resynced', () => {
+    assert.equal(App.selectNeedsSync('short', 'longer', ['short', 'longer']), true);
+});
+
+test('a select already showing its model is left alone', () => {
+    // Re-applying on every mutation would fight a user mid-selection.
+    assert.equal(App.selectNeedsSync('longer', 'longer', ['short', 'longer']), false);
+});
+
+test('a model value no option carries is not forced onto the box', () => {
+    // The repository this job points at was deleted: blanking the select would
+    // hide that the stored value is now unavailable, which is the one thing the
+    // user needs to see.
+    assert.equal(App.selectNeedsSync('short', 'gone', ['short', 'longer']), false);
+});
+
+test('an absent model is not a mismatch', () => {
+    for (const want of [undefined, null])
+        assert.equal(App.selectNeedsSync('a', want, ['a', 'b']), false, String(want));
+});
+
+test('values are compared as strings, the way a select holds them', () => {
+    // x-model on a number field yields a number; el.value is always a string.
+    assert.equal(App.selectNeedsSync('30', 30, ['30', '60']), false);
+    assert.equal(App.selectNeedsSync('60', 30, ['30', '60']), true);
+});

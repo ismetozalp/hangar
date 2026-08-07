@@ -32,9 +32,15 @@ function makeSandbox() {
     const repo = path.join(root, 'repo');
     const data = path.join(root, 'data');
     const pw = path.join(root, 'pw');
+    // hangar's real cache lives in root-owned /var/cache/hangar/restic; this suite
+    // runs as an ordinary user, so it exercises the same flag pointed somewhere
+    // it can write. The flag itself is not optional — without it restic exits 1
+    // in any environment that has no $HOME, which is every systemd unit.
+    const cache = path.join(root, 'cache');
     fs.mkdirSync(data, { recursive: true });
     fs.writeFileSync(pw, 'correct-horse-battery-staple\n', { mode: 0o600 });
-    return { root, repo, data, pw, cleanup: () => fs.rmSync(root, { recursive: true, force: true }) };
+    return { root, repo, data, pw, cache,
+        cleanup: () => fs.rmSync(root, { recursive: true, force: true }) };
 }
 
 // Run restic using the argv that the plugin itself would build. If these tests pass
@@ -42,7 +48,8 @@ function makeSandbox() {
 function restic(sb, op, opts = {}, expectOk = true) {
     // buildArgs() returns arguments only; run() prepends the binary (restic.js:452).
     // Mirroring that split here keeps the test honest about the real call shape.
-    const args = Restic.buildArgs(op, Object.assign({ repoUrl: sb.repo, passwordFile: sb.pw }, opts));
+    const args = Restic.buildArgs(op,
+        Object.assign({ repoUrl: sb.repo, passwordFile: sb.pw, cacheDir: sb.cache }, opts));
     assert.ok(Array.isArray(args) && args.length, 'buildArgs must return an argument array');
     assert.notEqual(args[0], 'restic', 'buildArgs must not include the binary name');
     const r = spawnSync('restic', args, { encoding: 'utf8', env: process.env });

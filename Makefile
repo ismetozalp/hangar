@@ -3,6 +3,9 @@ NAME = hangar
 INSTALL_DIR = $(PREFIX)/$(NAME)
 SYSCONF ?= /etc/$(NAME)
 LIBEXEC ?= /usr/libexec/$(NAME)
+# Must match CACHE_DIR in js/engine/restic.js and RESTIC_CACHE_DIR in
+# libexec/hangar-run; tests/smoke.mjs asserts all of them agree.
+CACHE_DIR ?= /var/cache/$(NAME)/restic
 VERSION := $(shell cat VERSION)
 TAG := v$(VERSION)
 RELEASE_NOTES ?= Release $(VERSION)
@@ -40,6 +43,11 @@ install:
 	@if [ -f libexec/hangar-run ]; then install -m 0755 libexec/hangar-run $(LIBEXEC)/hangar-run; fi
 	install -d -m 0755 $(SYSCONF)
 	install -d -m 0700 $(SYSCONF)/repos
+	# restic finds its cache from $$XDG_CACHE_HOME or $$HOME, and the systemd units
+	# that run backups and the Logbook mount have neither — so hangar passes
+	# --cache-dir explicitly and the directory is created here rather than left to
+	# whichever process happens to run restic first.
+	install -d -m 0700 $(CACHE_DIR)
 	install -d -m 0755 $(SYSCONF)/jobs
 	printf '%s\n' "$(VERSION)" > $(SYSCONF)/installed-version
 	@echo "Installed hangar $(VERSION) to $(INSTALL_DIR)"
@@ -48,6 +56,7 @@ install:
 uninstall:
 	@if [ "$$(id -u)" != "0" ]; then echo "uninstall requires root (use sudo)"; exit 1; fi
 	rm -rf $(INSTALL_DIR)
+	rm -rf $(CACHE_DIR)
 	rm -rf $(LIBEXEC)
 	@echo "Removed $(INSTALL_DIR) and $(LIBEXEC)"
 	@echo "Configuration in $(SYSCONF) was left in place — remove it manually if desired."

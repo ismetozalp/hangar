@@ -2,9 +2,14 @@
      Opened via the 'hangar:confirm' event so any feature can reuse it rather than
      shipping its own. Destructive actions get btn-danger and require the user to
      read what will happen, not just where the button is. -->
+<!-- No x-init="init()" here: Alpine 3 calls init() by itself when the x-data
+     object defines one, so writing it out ran init TWICE — two listeners for
+     every event, and a dialog that received its own open event twice. The
+     second delivery resolved the caller's promise with null, so pressing Save
+     on a job closed the dialog and wrote nothing, in silence. -->
 <div class="modal fade" id="hangar-confirm" tabindex="-1"
      aria-labelledby="hangar-confirm-title" aria-hidden="true"
-     x-data="hangarConfirm()" x-init="init()">
+     x-data="hangarConfirm()">
     <div class="modal-dialog modal-dialog-centered">
         <div class="modal-content">
 

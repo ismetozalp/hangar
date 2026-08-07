@@ -129,6 +129,10 @@
         // Not "try again": a destination whose sign-in has expired fails
         // identically on every retry, which is how a nightly job dies quietly.
         reauthorize: 'Sign in to the destination again',
+        // Nothing hangar can do from inside the page: Cockpit's own header owns
+        // the switch. The button explains where to look rather than pretending
+        // to perform an escalation this page cannot perform.
+        'grant-access': 'How to grant access',
         retry: 'Try again'
     };
 
@@ -847,7 +851,8 @@
 
     // ------------------------------------------------------------ pure: progress
 
-    const UNITS = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB'];
+    // Identical to overview.js and logbook-ui.js; tests/smoke.mjs checks that.
+    const UNITS = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB', 'EiB'];
 
     function formatBytes(value) {
         const n = num(value);
@@ -951,6 +956,20 @@
 
     // -------------------------------------------------------------- pure: status
 
+    // Short enough for a table cell, and the same vocabulary the Overview banner
+    // uses — a user who reads both should not have to work out that they are the
+    // same failure.
+    const FAILURE_REASON = {
+        GO_RUNTIME: 'restic crashed',
+        REPO_MISSING: 'the repository does not exist yet',
+        REPO_LOCKED: 'the repository is locked',
+        WRONG_PASSWORD: 'the repository password was rejected',
+        NO_SPACE: 'the destination is out of space',
+        NETWORK: 'the repository could not be reached',
+        AUTH_EXPIRED: 'the destination\'s sign-in has expired',
+        CANCELLED: 'cancelled'
+    };
+
     function lastResultLabel(state) {
         if (!isObj(state)) return { tone: 'idle', text: 'Never run' };
         switch (str(state.status)) {
@@ -964,8 +983,14 @@
         case 'prune-failed':
             return { tone: 'partial', text: 'Backed up, but thinning failed' };
         case 'failed': {
+            // The kind is an internal enum: "Failed (AUTH_EXPIRED)" tells a user
+            // nothing they can act on, and the Overview already knows how to say
+            // it in a sentence. Anything unrecognised falls back to plain
+            // "Failed" rather than leaking the enum into the table.
             const kind = str(state.kind);
-            return { tone: 'failed', text: 'Failed' + (kind ? ' (' + kind + ')' : '') };
+            const why = Object.prototype.hasOwnProperty.call(FAILURE_REASON, kind)
+                ? FAILURE_REASON[kind] : '';
+            return { tone: 'failed', text: 'Failed' + (why ? ' — ' + why : '') };
         }
         default:
             return { tone: 'idle', text: state.status ? str(state.status) : 'Never run' };
@@ -1109,7 +1134,8 @@
 
         '<div x-show="loading" class="text-secondary small">Loading jobs…</div>',
 
-        '<div x-show="!loading && !jobs.length" class="hangar-empty">',
+        // Only when the read succeeded — see repos-ui for why.
+        '<div x-show="!loading && !jobs.length && !error" class="hangar-empty">',
         '  <p class="mb-2">No backup jobs yet.</p>',
         '  <button type="button" class="btn btn-sm btn-primary" @click="create()">Create the first job</button>',
         '</div>',
@@ -1143,14 +1169,14 @@
         '          </td>',
         '          <td class="small" x-text="describeRetention(row)"></td>',
         '          <td>',
-        '            <div x-text="lastResult(row).text"></div>',
+        '            <div x-text="isRunning(row) ? \'Running now\' : lastResult(row).text"></div>',
         '            <div class="small text-secondary" x-text="lastRunTime(row)"></div>',
         '          </td>',
         // Everything except Delete is disabled for a job whose definition failed to
         // load: editing one would save the empty form back over the real file.
         '          <td class="text-end text-nowrap">',
         '            <button type="button" class="btn btn-sm btn-outline-primary"',
-        '                    @click="runNow(row)" :disabled="working || !!run || row.unreadable"',
+        '                    @click="runNow(row)" :disabled="working || isRunning(row) || row.unreadable"',
         '                    :aria-label="\'Back up \' + row.id + \' now\'">Back up now</button>',
         '            <button type="button" class="btn btn-sm btn-outline-secondary ms-1"',
         '                    @click="edit(row)" :disabled="working || row.unreadable"',
@@ -1271,10 +1297,54 @@
             run: null,
 
             async init() {
+                this.watchRepos();
                 await this.reload();
             },
 
             // ---- reading ------------------------------------------------
+
+            // The button behind ADMIN_REQUIRED. hangar cannot flip Cockpit's own
+            // switch from inside the page, so this asks the shell to re-check —
+            // the user turns access on in the header, presses this, and the screen
+            // reloads rather than the whole page.
+            async grantAccess() {
+                if (typeof root.dispatchEvent === 'function' && typeof root.CustomEvent === 'function')
+                    root.dispatchEvent(new root.CustomEvent('hangar:recheck-access'));
+                return this.reload();
+            },
+
+            // A repository added or removed anywhere invalidates this screen's copy.
+            watchRepos() {
+                if (typeof root.addEventListener !== 'function') return false;
+                root.addEventListener('hangar:repos-changed', async () => {
+                    try { this.repos = await this.loadRepos(); } catch (e) { /* keep the old list */ }
+                });
+                return true;
+            },
+
+            // A dashboard that is a photograph of page-load time is worse than no
+            // dashboard: a backup ran for ten minutes while this screen said
+            // "Not run yet". Polling is deliberately conditional — it runs only
+            // while something IS running, and stops as soon as nothing is, so an
+            // idle page makes no periodic calls at all. The final poll after a run
+            // ends is what replaces "Running now" with the actual result.
+            _watch: null,
+            WATCH_MS: 5000,
+
+            anyRunning() {
+                return (this.jobs || []).some((r) => this.isRunning(r));
+            },
+
+            syncWatch() {
+                const running = this.anyRunning();
+                if (running && !this._watch && root.setInterval) {
+                    this._watch = root.setInterval(() => { this.reload(); }, this.WATCH_MS);
+                } else if (!running && this._watch && root.clearInterval) {
+                    root.clearInterval(this._watch);
+                    this._watch = null;
+                }
+                return !!this._watch;
+            },
 
             async reload() {
                 const Config = M('HangarConfig');
@@ -1293,6 +1363,7 @@
                     this.error = e;
                 } finally {
                     this.loading = false;
+                    this.syncWatch();
                 }
             },
 
@@ -1437,8 +1508,19 @@
                 }
             },
 
+            // A backup started by the timer, by `systemctl start`, from the
+            // Overview, or from another browser tab is still a backup. This screen
+            // used to know only about runs IT had started, so a job that was
+            // running right now showed "Never run" — while the Overview, reading
+            // the same systemd state, correctly said "Running now".
+            isRunning(row) {
+                if (this.run && row && this.run.jobId === row.id) return true;
+                const svc = row && row.unit && row.unit.service;
+                return !!(svc && svc.active);
+            },
+
             dotClass(row) {
-                if (this.run && row && this.run.jobId === row.id) return 'running';
+                if (this.isRunning(row)) return 'running';
                 return lastResultLabel(row && row.state).tone;
             },
 
@@ -1461,8 +1543,19 @@
                 return this.openEditor(jobToFormState(row && row.job));
             },
 
-            openEditor(form) {
+            async openEditor(form) {
                 const taken = this.jobs.map((r) => r.id);
+                // Re-read rather than trusting the copy this screen loaded: a
+                // repository created on another tab a moment ago is exactly the
+                // one the user is here to select, and a stale list showed them a
+                // dialog with nothing to choose. The event listener below usually
+                // gets there first; this is the belt to its braces.
+                try {
+                    this.repos = await this.loadRepos();
+                } catch (e) {
+                    // Keep whatever we already had — an empty list then shows the
+                    // guidance, which is still better than a failed dialog.
+                }
                 const repos = this.repos;
                 const self = this;
                 return new Promise((resolve) => {
@@ -2124,6 +2217,18 @@
             cancel() {
                 if (this._resolve) this._resolve(null);
                 this._resolve = null;
+            },
+
+            // Shown in place of an empty repository dropdown. The dialog closes
+            // first: leaving a modal open behind the Repositories screen strands
+            // the promise the caller is awaiting, and hides the screen the user
+            // was just sent to.
+            goCreateRepository() {
+                this.cancel();
+                hideModal(MODAL_ID);
+                emit('hangar:go', { tab: 'repos' });
+                emit('hangar:new-repository', {});
+                return true;
             }
         };
     }

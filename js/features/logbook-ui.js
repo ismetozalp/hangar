@@ -102,10 +102,16 @@
 
     // ---- pure: formatting ---------------------------------------------------
 
-    const UNITS = ['B', 'kB', 'MB', 'GB', 'TB', 'PB'];
+    // BINARY units, identical to js/features/overview.js and js/features/jobs-ui.js.
+    // hangar showed the same repository three ways on three screens — 34.9 GiB
+    // added, 14.8 GiB on disk, 40.1 GB in the snapshot — and the last of those
+    // differed from the others in UNIT as well as in meaning, which turned three
+    // honest numbers into a puzzle. One convention everywhere, and it is restic's:
+    // `restic forget --prune` reports GiB, so what hangar shows matches what the
+    // same repository reports at a shell.
+    const UNITS = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB', 'EiB'];
+    const STEP = 1024;
 
-    // Decimal units, matching cockpit.format_bytes, so a size shown here reads
-    // the same as the same size shown anywhere else in the console.
     function formatBytes(bytes) {
         // Number(true) is 1, so an unguarded boolean would render as a 1-byte file.
         if (typeof bytes === 'boolean') return '0 B';
@@ -115,11 +121,11 @@
         // chain reaches exponential notation ('1e+285 PB'), which is not a size a
         // human can read and is not a size a filesystem can hold either.
         const n = Math.min(raw, Number.MAX_SAFE_INTEGER);
-        if (n < 1000) return Math.round(n) + ' B';
+        if (n < STEP) return Math.round(n) + ' B';
         let value = n;
         let unit = 0;
-        while (value >= 1000 && unit < UNITS.length - 1) {
-            value /= 1000;
+        while (value >= STEP && unit < UNITS.length - 1) {
+            value /= STEP;
             unit++;
         }
         const rounded = Math.round(value * 10) / 10;
@@ -488,6 +494,9 @@
         'init': 'Initialise repository',
         'list-unreadable': 'Show unreadable files',
         'free-space': 'Check free space',
+        // Cockpit's own header owns the switch; this page cannot flip it, so
+        // the button says where to look instead of pretending it can.
+        'grant-access': 'How to grant access',
         // Deliberately not 'Try again': retrying an expired sign-in fails
         // identically, every time, which is how the failure stays invisible.
         'reauthorize': 'Sign in again',
@@ -637,14 +646,30 @@
             crumbs: [{ label: 'Snapshot root', path: '/' }],
             selected: [],
 
+            // What the selected snapshot holds. Read separately from the tree
+            // because `restic stats` walks the whole snapshot and the file list
+            // must not wait on it.
+            momentStats: null,          // { totalSize, totalFileCount } | null
+            momentStatsFor: '',         // the snapshot id those numbers describe
+            momentStatsBusy: false,
+
             // how the tree was read, and why
             reader: 'none',            // 'mount' | 'ls' | 'none'
             fallbackReason: '',
             mountPoint: '',
 
             // status
+            //
+            // `busy` is derived from a DEPTH, not set directly: picking a
+            // repository starts loadSnapshots which starts loadTree, so several
+            // loads are in flight at once. With a plain boolean the first one to
+            // finish declares the screen idle while the others are still working
+            // — and because Alpine applies x-show on an animation frame, a
+            // show/hide/show flurry can even settle on the wrong one and leave
+            // "Mounting the repository…" on screen over a finished tree.
             busy: false,
             busyLabel: '',
+            busyDepth: 0,
             error: null,
             unreadable: [],
             unreadableTitle: '',
@@ -683,8 +708,44 @@
                 const nowVisible = tab === 'logbook';
                 if (nowVisible === this.visible) return;
                 this.visible = nowVisible;
-                if (nowVisible) this.touchIdle();
-                else this.releaseMount();
+                if (nowVisible) {
+                    this.touchIdle();
+                    // The snapshot list was read when this screen first loaded. A
+                    // backup that finished afterwards — from the timer, from the
+                    // Jobs screen, from a shell — left this showing a repository
+                    // that no longer exists, and the empty state made it worse:
+                    // "Nothing has been backed up yet" about a repository that had
+                    // just been filled with 475,000 files.
+                    this.refreshOnShow();
+                } else {
+                    this.releaseMount();
+                }
+            },
+
+            // Cheap on purpose: `restic snapshots` and nothing else unless the set
+            // actually changed. Re-selecting a moment remounts and re-lists, which
+            // would throw away the folder the user was looking at every time they
+            // glanced at another tab.
+            async refreshOnShow() {
+                if (!this.repoId || this.busy) return false;
+                let fresh;
+                try {
+                    fresh = R.parseSnapshots(await resticText('snapshots', this.resticOpts()));
+                } catch (e) {
+                    return false;           // a failed refresh must not break browsing
+                }
+                const ids = (list) => (list || []).map((s) => str(s && s.id)).sort().join(',');
+                if (ids(fresh) === ids(this.snapshots)) return false;
+
+                this.snapshots = fresh;
+                this.bands = timelineModel(this.snapshots, Date.now());
+                const stillThere = this.moment &&
+                    fresh.some((s) => str(s.id) === str(this.moment.id));
+                if (stillThere) return true;            // leave the user where they are
+                const first = this.bands.length ? this.bands[0].moments[0] : null;
+                if (first) await this.selectMoment(first);
+                else { this.moment = null; this.rows = []; this.entries = []; }
+                return true;
             },
 
             // A configured timeout past the 32-bit millisecond ceiling is clamped by
@@ -806,11 +867,35 @@
                 return parts.join(' · ');
             },
 
+            // Paired: every beginBusy needs an endBusy in a `finally`, and the
+            // label is cleared with the last one so nothing stale is left behind.
+            beginBusy(label) {
+                this.busyDepth += 1;
+                this.busyLabel = label;
+                this.busy = true;
+            },
+
+            endBusy() {
+                this.busyDepth = Math.max(0, this.busyDepth - 1);
+                if (this.busyDepth > 0) return;
+                this.busy = false;
+                this.busyLabel = '';
+            },
+
             // --- repositories and snapshots -----------------------------------
 
+            // The button behind ADMIN_REQUIRED. hangar cannot flip Cockpit's own
+            // switch from inside the page, so this asks the shell to re-check —
+            // the user turns access on in the header, presses this, and the screen
+            // reloads rather than the whole page.
+            async grantAccess() {
+                if (typeof root.dispatchEvent === 'function' && typeof root.CustomEvent === 'function')
+                    root.dispatchEvent(new root.CustomEvent('hangar:recheck-access'));
+                return this.loadRepos();
+            },
+
             async loadRepos() {
-                this.busy = true;
-                this.busyLabel = 'Looking for repositories…';
+                this.beginBusy('Looking for repositories…');
                 try {
                     const ids = await Cfg.listRepos();
                     const repos = [];
@@ -839,7 +924,7 @@
                 } catch (e) {
                     this.handleError(e);
                 } finally {
-                    this.busy = false;
+                    this.endBusy();
                 }
             },
 
@@ -870,8 +955,7 @@
 
             async loadSnapshots() {
                 if (!this.repo) return;
-                this.busy = true;
-                this.busyLabel = 'Reading snapshots…';
+                this.beginBusy('Reading snapshots…');
                 this.error = null;
                 try {
                     const text = await resticText('snapshots', this.resticOpts());
@@ -882,7 +966,7 @@
                 } catch (e) {
                     this.handleError(e);
                 } finally {
-                    this.busy = false;
+                    this.endBusy();
                 }
             },
 
@@ -897,6 +981,9 @@
                 this.selected = [];
                 this.cwd = '/';
                 this.touchIdle();
+                // Deliberately not awaited: the tree is what the user came for,
+                // and the size can arrive a second later.
+                this.loadMomentStats();
                 await this.loadBadges();
                 await this.loadTree();
             },
@@ -925,6 +1012,53 @@
                     // file tree, which is the thing they came for.
                     this.badges = {};
                 }
+            },
+
+            // restore-size, not raw-data: a user looking at a snapshot is asking
+            // "how much is in here", which is the size of the files as they were —
+            // not how many bytes this snapshot happens to occupy after
+            // deduplication against its neighbours.
+            //
+            // Never blocks the tree and never raises: a size that cannot be read
+            // is a missing label, not a failed screen.
+            async loadMomentStats() {
+                const m = this.moment;
+                const id = m && str(m.id);
+                if (!id || !this.repo) { this.momentStats = null; this.momentStatsFor = ''; return false; }
+                if (this.momentStatsFor === id && this.momentStats) return true;
+
+                this.momentStats = null;
+                this.momentStatsFor = id;
+                this.momentStatsBusy = true;
+                try {
+                    const text = await resticText('stats', this.resticOpts({
+                        mode: 'restore-size', snapshotIds: [id]
+                    }));
+                    // Still the snapshot the user is looking at? They can scrub
+                    // faster than a NAS answers.
+                    if (this.momentStatsFor !== id) return false;
+                    this.momentStats = R.parseStats(text);
+                    return true;
+                } catch (e) {
+                    if (this.momentStatsFor === id) this.momentStats = null;
+                    return false;
+                } finally {
+                    if (this.momentStatsFor === id) this.momentStatsBusy = false;
+                }
+            },
+
+            // "34.9 GiB · 475,099 files", or '' while unknown.
+            momentSizeLabel() {
+                if (this.momentStatsBusy) return 'measuring…';
+                const st = this.momentStats;
+                if (!st || !Number.isFinite(st.totalSize)) return '';
+                const files = Number.isFinite(st.totalFileCount) && st.totalFileCount > 0
+                    ? ' \u00b7 ' + st.totalFileCount.toLocaleString() + ' files' : '';
+                // Named, because the Overview and Repositories screens show two
+                // OTHER sizes for the same repository — what the last run added,
+                // and what it occupies on disk after deduplication. All three are
+                // right; only labels tell a reader which is which.
+                return formatBytes(st.totalSize) + files + ' in this snapshot';
             },
 
             // --- the file tree ------------------------------------------------
@@ -962,8 +1096,23 @@
                             mountRoot: this.mountRoot()
                         });
                     }
-                    this.reader = 'mount';
                     this.mountPoint = L.mountPoint(this.repoId, this.mountRoot());
+
+                    // The unit is running; that is not the same as FUSE serving a
+                    // tree. Listing now races the mount and reports a missing path
+                    // for a snapshot that is perfectly fine.
+                    this.busyLabel = 'Waiting for the snapshot to appear…';
+                    const ready = await L.waitForMount(this.mountPoint, {});
+                    if (!ready) {
+                        // Not an error the user can act on — the slower reader gets
+                        // them their files, which is what they came for.
+                        // releaseMount() returns undefined when there is nothing
+                        // to release, so it is wrapped rather than .catch()ed.
+                        await Promise.resolve(this.releaseMount()).catch(() => null);
+                        this.fallback('the snapshot did not appear in the mount in time');
+                        return false;
+                    }
+                    this.reader = 'mount';
                     return true;
                 } catch (e) {
                     this.fallback((e && e.message) || 'the repository could not be mounted');
@@ -982,8 +1131,7 @@
 
             async loadTree() {
                 if (!this.moment) return;
-                this.busy = true;
-                this.busyLabel = 'Reading the snapshot…';
+                this.beginBusy('Reading the snapshot…');
                 this.error = null;
                 try {
                     const mounted = await this.ensureMount();
@@ -997,7 +1145,7 @@
                     // navigates relative to a directory they are not looking at.
                     this.crumbs = breadcrumbsFor(this.cwd);
                 } finally {
-                    this.busy = false;
+                    this.endBusy();
                 }
             },
 
@@ -1089,8 +1237,7 @@
             },
 
             async runRestore(plan) {
-                this.busy = true;
-                this.busyLabel = 'Restoring…';
+                this.beginBusy('Restoring…');
                 this.clearStatus();
                 this.progress = null;
                 try {
@@ -1123,9 +1270,77 @@
                 } catch (e) {
                     this.handleError(e);
                 } finally {
-                    this.busy = false;
-                    this.busyLabel = '';
+                    this.endBusy();
                     this.progress = null;
+                }
+            },
+
+            // Used by the delete button's accessible name, so a screen reader
+            // announces WHICH snapshot is about to be destroyed.
+            momentLabel() {
+                if (!this.moment) return 'no snapshot';
+                return absoluteLabel(this.moment.time) || str(this.moment.id).slice(0, 8);
+            },
+
+            // --- deleting a snapshot -------------------------------------------
+            //
+            // restic separates unlinking a snapshot from reclaiming its space:
+            // `forget` is instant and frees nothing, `prune` rewrites the pack
+            // files and is the slow part (four minutes for 150 GiB over CIFS in
+            // one measured run). Doing only the first would leave a user watching
+            // a repository that never shrinks, so both run here and the dialog
+            // says plainly that the second one takes a while.
+            //
+            // The mount is released first. A live Logbook mount holds a shared
+            // lock on the repository, prune needs an exclusive one, and the
+            // failure is an opaque "repository is already locked by PID …" about
+            // a lock hangar itself is holding.
+            async deleteMoment(moment) {
+                const m = moment || this.moment;
+                if (!m || !this.repoId) return false;
+                const id = str(m.id || (m.snapshot && m.snapshot.id));
+                if (!id) return false;
+
+                const D = dialogs();
+                if (!D || typeof D.confirmDialog !== 'function') return false;
+                const when = absoluteLabel(m.time) || str(m.id).slice(0, 8);
+                const ok = await D.confirmDialog({
+                    title: 'Delete this snapshot?',
+                    message: 'The snapshot from ' + when + ' will be removed from ' +
+                        this.repoId + ' and the space it holds will be reclaimed.',
+                    detail: 'This cannot be undone. Files that exist only in this snapshot ' +
+                        'are gone for good. Reclaiming the space rewrites the repository ' +
+                        'and can take several minutes.',
+                    danger: true,
+                    confirmLabel: 'Delete snapshot'
+                });
+                if (!ok) return false;
+
+                this.beginBusy('Deleting the snapshot…');
+                this.clearStatus();
+                try {
+                    // Before the lock is needed, not after it is refused.
+                    await Promise.resolve(this.releaseMount()).catch(() => null);
+                    this.reader = 'none';
+                    this.mountPoint = '';
+
+                    // snapshotIds, not `snapshots`: buildArgs reads that name, and
+                    // a forget that reached restic with no id and no policy would
+                    // be a very different command.
+                    await R.run('forget', this.resticOpts({ snapshotIds: [id], prune: true }));
+
+                    this.noticeKind = 'success';
+                    this.notice = 'The snapshot from ' + when + ' was deleted.';
+                    this.rows = [];
+                    this.entries = [];
+                    this.moment = null;
+                    await this.loadSnapshots();
+                    return true;
+                } catch (e) {
+                    this.handleError(e);
+                    return false;
+                } finally {
+                    this.endBusy();
                 }
             },
 
@@ -1170,8 +1385,7 @@
                     return;
                 }
 
-                this.busy = true;
-                this.busyLabel = 'Working…';
+                this.beginBusy('Working…');
                 let done = false;
                 try {
                     if (action === 'unlock') {
@@ -1202,8 +1416,7 @@
                     this.handleError(e);
                     done = false;
                 } finally {
-                    this.busy = false;
-                    this.busyLabel = '';
+                    this.endBusy();
                 }
                 if (done && !this.error) await this.loadSnapshots();
             }
@@ -1373,7 +1586,11 @@
     // second loader for screens would be a second thing to keep in sync.
     function template() {
         return '' +
-'<div class="hangar-logbook" x-data="hangarLogbookUi()" x-init="init()" x-effect="onScreenChange(tab)">' +
+// No x-init="init()": Alpine 3 calls init() itself when the x-data object
+// defines one. Writing it out ran init TWICE — every listener registered
+// twice, and a dialog that received its own open event twice resolved the
+// caller's promise with null before the user had pressed anything.
+'<div class="hangar-logbook" x-data="hangarLogbookUi()" x-effect="onScreenChange(tab)">' +
 
 '  <div class="hangar-tree d-flex flex-column">' +
 
@@ -1400,7 +1617,20 @@
 
 '      <button type="button" class="btn btn-sm btn-primary"' +
 '              :disabled="!selected.length || busy" @click="restore()">Restore…</button>' +
+
+     // Deliberately last, outline rather than solid, and disabled while anything
+     // else is in flight: it is the one control on this screen that destroys
+     // something.
+'      <button type="button" class="btn btn-sm btn-outline-danger"' +
+'              :disabled="!moment || busy" @click="deleteMoment()"' +
+'              :aria-label="\'Delete the snapshot from \' + momentLabel()">Delete snapshot…</button>' +
 '      <span class="small text-secondary" x-text="selectionLabel()"></span>' +
+
+     // The size of the snapshot being browsed, next to the selection summary so
+     // "what is in here" and "what have I picked" read together.
+'      <span class="small text-secondary ms-auto hangar-mono" x-show="momentSizeLabel()"' +
+'            :title="\'Total size of everything in the snapshot from \' + momentLabel()"' +
+'            x-text="momentSizeLabel()"></span>' +
 '    </div>' +
 '    </template>' +
 

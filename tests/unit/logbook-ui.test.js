@@ -126,13 +126,13 @@ test('breadcrumbsFor builds a clickable trail from the snapshot root', () => {
 
 // --- formatting -----------------------------------------------------------
 
-test('formatBytes uses decimal units, matching the rest of the console', () => {
+test('formatBytes uses binary units, the same as every other screen', () => {
     assert.equal(UI.formatBytes(0), '0 B');
     assert.equal(UI.formatBytes(999), '999 B');
-    assert.equal(UI.formatBytes(1000), '1 kB');
-    assert.equal(UI.formatBytes(1536), '1.5 kB');
-    assert.equal(UI.formatBytes(2400000), '2.4 MB');
-    assert.equal(UI.formatBytes(3e9), '3 GB');
+    assert.equal(UI.formatBytes(1024), '1 KiB');
+    assert.equal(UI.formatBytes(1536), '1.5 KiB');
+    assert.equal(UI.formatBytes(2516582), '2.4 MiB');
+    assert.equal(UI.formatBytes(3 * 1024 ** 3), '3 GiB');
 });
 
 test('formatBytes refuses to invent a size from hostile input', () => {
@@ -323,7 +323,7 @@ test('treeRowsFor ignores an unrecognised badge value', () => {
 test('treeRowsFor hides a directory size, which means nothing to a restore', () => {
     const rows = UI.treeRowsFor(ENTRIES, {});
     assert.equal(rows[0].sizeLabel, '');
-    assert.equal(rows[2].sizeLabel, '2.4 MB');
+    assert.equal(rows[2].sizeLabel, '2.3 MiB');
 });
 
 test('treeRowsFor drops entries with no name — an unclickable row is worse than none', () => {
@@ -364,7 +364,7 @@ function row(name, isDir, size) {
 
 test('selectionSummary names counts and total size', () => {
     const sel = [row('a', false, 2000000), row('b', false, 400000), row('c', false, 0), row('d', true, 4096)];
-    assert.equal(UI.selectionSummary(sel), '3 files, 1 folder (2.4 MB)');
+    assert.equal(UI.selectionSummary(sel), '3 files, 1 folder (2.3 MiB)');
 });
 
 test('selectionSummary is singular for one of each', () => {
@@ -388,7 +388,7 @@ test('selectionSummary ignores a nonsense size rather than printing NaN', () => 
 
 test('selectionSummary accepts rows typed by "type" alone', () => {
     assert.equal(UI.selectionSummary([{ type: 'dir' }, { type: 'file', size: 1000 }]),
-        '1 file, 1 folder (1 kB)');
+        '1 file, 1 folder (1000 B)');
 });
 
 // --- the restore plan -----------------------------------------------------
@@ -535,6 +535,46 @@ test('the component constructs with no DOM and no cockpit', () => {
     assert.equal(c.error, null);
 });
 
+// --- the busy indicator ---------------------------------------------------
+//
+// Picking a repository starts loadSnapshots, which starts loadTree, so two or
+// three loads are always in flight together. A plain boolean let the first one
+// to finish declare the screen idle — and with Alpine applying x-show on an
+// animation frame, the resulting show/hide/show flurry could settle on "shown"
+// and strand "Mounting the repository…" above a fully loaded tree.
+
+test('nested work keeps the screen busy until the outermost finishes', () => {
+    const c = UI.hangarLogbookUi();
+    c.beginBusy('Reading snapshots…');
+    c.beginBusy('Reading the snapshot…');
+    c.endBusy();
+    assert.equal(c.busy, true, 'the inner load ended and claimed the screen was idle');
+    assert.equal(c.busyLabel, 'Reading the snapshot…');
+    c.endBusy();
+    assert.equal(c.busy, false);
+});
+
+test('the last endBusy clears the label, so nothing stale is left on screen', () => {
+    const c = UI.hangarLogbookUi();
+    c.beginBusy('Mounting the repository…');
+    c.endBusy();
+    assert.equal(c.busy, false);
+    assert.equal(c.busyLabel, '');
+});
+
+test('an unpaired endBusy cannot drive the depth negative', () => {
+    // A stray end would otherwise leave the counter at -1, and the next real
+    // load would need two ends to clear — the indicator sticking on again.
+    const c = UI.hangarLogbookUi();
+    c.endBusy();
+    c.endBusy();
+    assert.equal(c.busyDepth, 0);
+    c.beginBusy('Working…');
+    assert.equal(c.busy, true);
+    c.endBusy();
+    assert.equal(c.busy, false);
+});
+
 test('selection toggling is idempotent per path', () => {
     const c = UI.hangarLogbookUi();
     const r = { path: '/etc/hosts', name: 'hosts', isDir: false, size: 100 };
@@ -548,7 +588,7 @@ test('selection toggling is idempotent per path', () => {
 test('the selection label comes from the pure summary', () => {
     const c = UI.hangarLogbookUi();
     c.selected = [row('a', false, 1000), row('b', true, 0)];
-    assert.equal(c.selectionLabel(), '1 file, 1 folder (1 kB)');
+    assert.equal(c.selectionLabel(), '1 file, 1 folder (1000 B)');
 });
 
 test('previousMoment finds the adjacent older snapshot the badges are relative to', () => {
@@ -867,7 +907,8 @@ test('formatBytes never reaches exponential notation, however large the claim', 
         const label = UI.formatBytes(n);
         assert.ok(!/e\+/.test(label), `exponential leaked: ${label}`);
         assert.ok(!/NaN/.test(label), `NaN leaked: ${label}`);
-        assert.match(label, /PB$/);
+        // Clamped at MAX_SAFE_INTEGER, which lands in PiB with this table.
+        assert.match(label, /PiB$/);
     });
 });
 
@@ -1562,7 +1603,7 @@ test('restore progress is rendered rather than merely stored', () => {
     const c = attached();
     assert.equal(c.progressLabel(), '');
     c.progress = { message_type: 'status', percent_done: 0.4213, bytes_done: 2400000, total_bytes: 3e9 };
-    assert.equal(c.progressLabel(), '42% · 2.4 MB of 3 GB');
+    assert.equal(c.progressLabel(), '42% \u00b7 2.3 MiB of 2.8 GiB');
 });
 
 test('progressLabel refuses to render a nonsense percentage', () => {
@@ -1610,7 +1651,7 @@ test('a row with no path cannot be selected', () => {
 test('a selection that survived from an older render cannot summarise to nonsense', () => {
     const c = UI.hangarLogbookUi();
     c.selected = [null, { path: '/a', type: 'file', size: 1000 }];
-    assert.equal(c.selectionLabel(), '1 file (1 kB)');
+    assert.equal(c.selectionLabel(), '1 file (1000 B)');
 });
 
 // --- the restore dialog ----------------------------------------------------
@@ -1780,4 +1821,140 @@ test('the source carries no stray NUL or carriage return', () => {
     assert.ok(SRC.indexOf(NUL) < 0, 'NUL byte in the source');
     assert.ok(SRC.indexOf('\r') < 0, 'carriage return in the source');
     assert.ok(RESTORE_HTML.indexOf(NUL) < 0);
+});
+
+// --- deleting a snapshot ---------------------------------------------------
+//
+// restic separates unlinking a snapshot (`forget`, instant, frees nothing) from
+// reclaiming its space (`prune`, slow). A delete that only forgot would leave a
+// user watching a repository that never shrinks.
+
+test('deleting asks restic to forget AND prune', () => {
+    const Restic = require('../../js/engine/restic.js');
+    const args = Restic.buildArgs('forget', {
+        repoUrl: '/srv/r', passwordFile: '/k', snapshotIds: ['abc123'], prune: true
+    });
+    assert.ok(args.includes('abc123'), 'the snapshot id never reaches restic');
+    assert.ok(args.includes('--prune'), 'forget without prune reclaims nothing');
+});
+
+test('a delete with no snapshot selected does nothing at all', async () => {
+    const c = UI.hangarLogbookUi();
+    c.repoId = 'main';
+    assert.equal(await c.deleteMoment(null), false);
+});
+
+test('a delete on a moment carrying no id is refused', async () => {
+    // A malformed timeline entry must not turn into `restic forget --prune`
+    // with no snapshot argument, which is how you delete more than you meant.
+    const c = UI.hangarLogbookUi();
+    c.repoId = 'main';
+    assert.equal(await c.deleteMoment({ time: '2026-08-04T00:00:00Z' }), false);
+});
+
+test('the button names the snapshot it would destroy', () => {
+    const c = UI.hangarLogbookUi();
+    assert.equal(c.momentLabel(), 'no snapshot');
+    c.moment = { id: 'ff66aa11bb22', time: '2026-08-03T21:32:00Z' };
+    assert.match(c.momentLabel(), /2026/);
+});
+
+// --- the screen must not be a photograph of page-load time -----------------
+//
+// Found live: a backup of / finished while the page was open, and the Logbook
+// went on saying "Nothing has been backed up yet" about a repository that had
+// just received 475,000 files. The list was read once, at load, and nothing
+// ever read it again.
+
+test('showing the screen re-reads the snapshot list', async () => {
+    const c = UI.hangarLogbookUi();
+    let asked = 0;
+    c.repoId = 'main';
+    c.refreshOnShow = async () => { asked += 1; return true; };
+    c.visible = false;
+    c.onScreenChange('logbook');
+    assert.equal(asked, 1);
+    // Becoming visible arms the idle-unmount timer; an armed timer keeps node
+    // alive and the suite never exits.
+    c.clearIdle();
+});
+
+test('leaving the screen releases the mount rather than refreshing', async () => {
+    const c = UI.hangarLogbookUi();
+    let released = 0, asked = 0;
+    c.releaseMount = () => { released += 1; };
+    c.refreshOnShow = async () => { asked += 1; };
+    c.visible = true;
+    c.onScreenChange('settings');
+    assert.equal(released, 1);
+    assert.equal(asked, 0);
+});
+
+test('a repeated visibility event does no work at all', () => {
+    // x-effect fires on every reactive change, not only on a tab switch.
+    const c = UI.hangarLogbookUi();
+    let asked = 0;
+    c.repoId = 'main';
+    c.refreshOnShow = async () => { asked += 1; };
+    c.visible = false;
+    c.onScreenChange('logbook');
+    c.onScreenChange('logbook');
+    c.onScreenChange('logbook');
+    assert.equal(asked, 1);
+    c.clearIdle();
+});
+
+test('refreshing without a repository or mid-load does nothing', async () => {
+    const c = UI.hangarLogbookUi();
+    assert.equal(await c.refreshOnShow(), false);
+    c.repoId = 'main';
+    c.busy = true;
+    assert.equal(await c.refreshOnShow(), false);
+});
+
+// --- how much is in the snapshot you are looking at ------------------------
+
+test('the size label reads as a person would say it', () => {
+    const c = UI.hangarLogbookUi();
+    c.momentStats = { totalSize: 37437177569, totalFileCount: 475099 };
+    assert.equal(c.momentSizeLabel(), '34.9 GiB \u00b7 475,099 files in this snapshot');
+});
+
+test('an unknown size renders nothing rather than a zero', () => {
+    // A stats call that failed must not claim the snapshot is empty.
+    const c = UI.hangarLogbookUi();
+    assert.equal(c.momentSizeLabel(), '');
+    c.momentStats = { totalSize: NaN, totalFileCount: 10 };
+    assert.equal(c.momentSizeLabel(), '');
+});
+
+test('a slow repository says so instead of showing a stale number', () => {
+    const c = UI.hangarLogbookUi();
+    c.momentStats = { totalSize: 100, totalFileCount: 1 };
+    c.momentStatsBusy = true;
+    assert.equal(c.momentSizeLabel(), 'measuring…');
+});
+
+test('a genuinely empty snapshot shows its size without a file count', () => {
+    const c = UI.hangarLogbookUi();
+    c.momentStats = { totalSize: 0, totalFileCount: 0 };
+    assert.equal(c.momentSizeLabel(), '0 B in this snapshot');
+});
+
+test('measuring nothing is refused, and clears any previous number', async () => {
+    const c = UI.hangarLogbookUi();
+    c.momentStats = { totalSize: 1, totalFileCount: 1 };
+    assert.equal(await c.loadMomentStats(), false);
+    assert.equal(c.momentStats, null, 'the previous snapshot\'s size was left on screen');
+});
+
+test('the size is measured with restore-size, not raw-data', () => {
+    // "How much is in here" is the size of the files as they were — not how many
+    // bytes this snapshot occupies after deduplication against its neighbours,
+    // which is a different question with a much smaller answer.
+    const Restic = require('../../js/engine/restic.js');
+    const args = Restic.buildArgs('stats', { repoUrl: '/r', passwordFile: '/k',
+        mode: 'restore-size', snapshotIds: ['ff66'] });
+    assert.ok(args.includes('restore-size'));
+    assert.ok(args.includes('ff66'), 'the snapshot id never reaches restic');
 });

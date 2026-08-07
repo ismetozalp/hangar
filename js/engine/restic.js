@@ -77,6 +77,11 @@
         [KIND.NO_SPACE]: 'No space left on the backup destination',
         [KIND.NETWORK]: 'Could not reach the repository over the network',
         [KIND.AUTH_EXPIRED]: 'This cloud destination needs to be authorised again — its sign-in has expired',
+        // Not something restic can report — the refusal happens before restic is
+        // reached — but the catalogue is exhaustive over KIND on purpose, so that
+        // an error of any kind always renders as a sentence rather than a bare
+        // enum. See tests/unit/restic.test.js.
+        [KIND.ADMIN_REQUIRED]: 'Cockpit is running with limited access, so hangar cannot read its own configuration',
         [KIND.UNKNOWN]: 'restic exited with an unexpected status'
     };
 
@@ -223,6 +228,11 @@
         if (s) out.push(flag, s);
     }
 
+    // Root-owned and outside any home directory, because every process that runs
+    // restic here is root: the timer units, the Logbook mount unit, and the
+    // browser's privileged channel. restic creates it on first use.
+    const CACHE_DIR = '/var/cache/hangar/restic';
+
     function buildArgs(op, opts) {
         const o = opts || {};
         if (OPS.indexOf(op) < 0)
@@ -235,6 +245,24 @@
             args.push('-r', repo);
         }
         pushFlag(args, '--password-file', o.passwordFile);
+        // ALWAYS, on every operation. restic locates its cache from $XDG_CACHE_HOME
+        // or $HOME, and a systemd unit has neither — so `restic mount` and every
+        // scheduled `restic backup` exited 1 before touching the repository:
+        //
+        //   unable to locate cache directory: neither $XDG_CACHE_HOME nor $HOME
+        //   are defined
+        //
+        // It worked from the browser only because the cockpit bridge happens to
+        // carry a HOME. Depending on ambient environment for something this
+        // load-bearing is how a backup fails every night in silence, so the path
+        // is stated outright instead.
+        // Repository-scoped operations only. `restic version` is hangar's presence
+        // probe, and a probe that can fail for a reason unrelated to restic being
+        // installed would report the wrong thing.
+        // Overridable, but never absent: a host with a small /var can point it
+        // elsewhere, and the integration suite runs as an ordinary user who
+        // cannot write under /var/cache at all.
+        if (!NO_REPO_OPS.has(op)) args.push('--cache-dir', str(o.cacheDir || CACHE_DIR));
         if (!NO_JSON_OPS.has(op)) args.push('--json');
 
         args.push(op);
@@ -610,6 +638,7 @@
         OPS,
         EXIT_KINDS,
         MESSAGES,
+        CACHE_DIR,
         parseJsonLines,
         classifyExit,
         buildArgs,

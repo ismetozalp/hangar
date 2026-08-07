@@ -603,9 +603,9 @@ test('describe echoes the limit FORMATTED, so the units can be checked by eye', 
     // "500G" is 500 GB and "500" is 500 bytes. Echoing the typed text back would
     // prove nothing; echoing the parsed size proves it was understood.
     assert.equal(Repos.describe({ kind: 'local', path: '/srv/b', sizeLimit: '500G' }),
-        'Local folder at /srv/b. Kept under 500 GB, never fewer than 3 snapshots.');
+        'Local folder at /srv/b. Kept under 465.7 GiB, never fewer than 3 snapshots.');
     assert.equal(Repos.describe({ kind: 'local', path: '/srv/b', sizeLimit: '1 TiB' }),
-        'Local folder at /srv/b. Kept under 1.1 TB, never fewer than 3 snapshots.');
+        'Local folder at /srv/b. Kept under 1 TiB, never fewer than 3 snapshots.');
 });
 
 test('describe names the floor that will actually apply, default included', () => {
@@ -632,7 +632,7 @@ test('describe adds no size sentence to a repository it cannot locate', () => {
 test('describe carries the limit through every backend', () => {
     Repos.KINDS.forEach((kind) => {
         assert.match(Repos.describe({ kind: kind, sizeLimit: '500 GB' }),
-            / Kept under 500 GB, never fewer than 3 snapshots\.$/, kind);
+            / Kept under 465.7 GiB, never fewer than 3 snapshots\.$/, kind);
     });
 });
 

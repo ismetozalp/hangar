@@ -48,6 +48,46 @@ package manager.
 
 ---
 
+## What it looks like
+
+![The Overview screen: three jobs with their last result, a banner about an expired cloud sign-in, and repository sizes](screenshots/overview.png)
+
+*Overview — one screen that says whether your backups are fine. A job that
+succeeded, one that finished with unreadable files, and one that failed because
+the cloud destination's sign-in expired, with the fix next to it.*
+
+![The Logbook: a snapshot's file tree beside a timeline of moments, with change badges on the files that differ from the previous snapshot](screenshots/logbook.png)
+
+*The Logbook — scroll back through every captured moment and browse the
+filesystem as it was. Badges mark what changed since the snapshot before it.*
+
+![The Jobs screen: three jobs with their schedule, retention policy and last result](screenshots/jobs.png)
+
+*Jobs — what is backed up, where it goes, how often, and how long it is kept.*
+
+![The Repositories screen: a local folder and a Backblaze B2 bucket, each with its size and snapshot count](screenshots/repositories.png)
+
+*Repositories — every destination with its real size and snapshot count.*
+
+![The Recovery screen: the ReaR configuration form, filled in for the attic repository](screenshots/recovery.png)
+
+*Recovery — a bootable rescue image that restores the whole machine from the
+same repository your files live in. The banner states the unsupported part
+plainly rather than hiding it.*
+
+![The repository password dialog with a generated six-word passphrase](screenshots/password-generator.png)
+
+*A repository password cannot be recovered, so the dialog helps you make a
+strong one you can still type at a rescue console — and will not let you past it
+without noticing you must store it.*
+
+![The Settings screen: eleven themes, mount options and update settings](screenshots/settings.png)
+
+*Settings — themes, how long a browsed snapshot stays mounted, and where updates
+come from.*
+
+---
+
 ## Cloud destinations
 
 Hangar speaks four object stores natively — **Amazon S3** (and S3-compatible
@@ -256,13 +296,26 @@ npm install          # only for the Playwright-based UI tests
 npm run test:unit    # pure logic, no system state touched
 npm run test:smoke   # structural checks on the shipped plugin
 npm run test:integration   # real restic against a temp repository
-npm run test:e2e     # Playwright, against a running Cockpit
+npm run test:e2e     # Playwright, against a stubbed cockpit bridge
+npm run test:ui      # Playwright, inside a real Cockpit session
 ```
 
 The integration suite runs a real restic binary against a throwaway local
 repository and asserts the round trip: backup, thin, restore, byte-for-byte
 comparison — plus the exit-code contracts the entire UI depends on. It skips
 cleanly when restic is not installed.
+
+`test:e2e` drives the plugin against a **stubbed** cockpit bridge: fast, needs no
+Cockpit, and blind to everything only the real bridge does. `test:ui` logs into a
+running Cockpit and drives the same screens through the real one. That
+distinction is not academic — the stub answered every call the folder picker made
+while the picker listed nothing at all on a real machine, because
+`cockpit.spawn`'s text channel discards output containing NUL bytes and the stub
+happily carried them. It needs credentials and skips (exit 2) without them:
+
+```sh
+COCKPIT_PASS=… npm run test:ui        # or COCKPIT_URL / COCKPIT_USER
+```
 
 ---
 

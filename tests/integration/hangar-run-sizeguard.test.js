@@ -269,7 +269,10 @@ test('the guard measures with --mode raw-data, never the default mode', () => {
     const p = planFor(repoWithGuard({ limit: '1 TB' }), JOB);
     const base = ['restic', '-r', '/srv/backup', '--password-file'];
     assert.deepEqual(p.guard.stats.slice(0, 4), base);
-    assert.deepEqual(p.guard.stats.slice(5), ['stats', '--json', '--mode', 'raw-data']);
+    // The cache directory sits between the password file and the subcommand: a
+    // systemd unit has no $HOME, and restic exits 1 instead of running.
+    assert.deepEqual(p.guard.stats.slice(5),
+        ['--cache-dir', '/var/cache/hangar/restic', 'stats', '--json', '--mode', 'raw-data']);
     const i = p.guard.stats.indexOf('--mode');
     assert.ok(i > 0, 'the stats command has no --mode at all');
     assert.equal(p.guard.stats[i + 1], 'raw-data');
@@ -277,9 +280,10 @@ test('the guard measures with --mode raw-data, never the default mode', () => {
 
 test('the guard lists snapshots and forgets with --prune, leaving the id for run time', () => {
     const p = planFor(repoWithGuard({ limit: '1 TB' }), JOB);
-    assert.deepEqual(p.guard.snapshots.slice(5), ['snapshots', '--json']);
+    const CACHE = ['--cache-dir', '/var/cache/hangar/restic'];
+    assert.deepEqual(p.guard.snapshots.slice(5), CACHE.concat(['snapshots', '--json']));
     // Forgetting alone frees nothing — it only unlinks the snapshot from its data.
-    assert.deepEqual(p.guard.forget.slice(5), ['forget', '--json', '--prune']);
+    assert.deepEqual(p.guard.forget.slice(5), CACHE.concat(['forget', '--json', '--prune']));
     // No snapshot id: which one is oldest cannot be known before the previous pass
     // has been measured.
     assert.equal(p.guard.forget.some((a) => /^[0-9a-f]{8,}$/.test(a)), false);
@@ -616,14 +620,14 @@ test('the floor stops the guard, and the run says so instead of claiming success
             assert.equal(r.state.size_guard.min_snapshots, 3);
 
             // And a journal warning naming the shortfall, in words.
-            assert.match(r.stderr, /still 88 GB over its size limit/);
+            assert.match(r.stderr, /still 82 GiB over its size limit/);
             assert.match(r.stderr, /"reason": "floor"/);
 
             // The record renders through the one sentence-writer there is, and that
             // sentence must read like a stop, not like a success.
             const sentence = Guard.describeOutcome(r.state.size_guard);
             assert.match(sentence, /^Stopped:/);
-            assert.match(sentence, /88 GB/);
+            assert.match(sentence, /82 GiB/);
         });
 });
 
@@ -654,7 +658,7 @@ test('the iteration budget stops the guard and is recorded as exhausted, not as 
             assert.equal(r.state.size_guard.reason, 'budget');
             assert.equal(r.state.size_guard.iterations, 2);
             assert.equal(r.state.size_guard.max_iterations, 2);
-            assert.match(r.stderr, /still 90 GB over its size limit/);
+            assert.match(r.stderr, /still 83.8 GiB over its size limit/);
             assert.match(Guard.describeOutcome(r.state.size_guard), /^Stopped after/);
         });
 });
@@ -699,7 +703,7 @@ test('a snapshot listing that fails stops the guard without deleting anything', 
             assert.equal(r.state.status, 'size-limit-exceeded');
             assert.equal(r.state.size_guard.reason, 'unknown-size');
             assert.match(r.state.size_guard.error, /snapshots could not be listed/);
-            assert.match(r.stderr, /still 90 GB over its size limit/);
+            assert.match(r.stderr, /still 83.8 GiB over its size limit/);
         });
 });
 
@@ -1069,7 +1073,7 @@ test('a measurement that fails after a prune stops, and never reports success', 
             // not "we finished".
             assert.ok(r.state.size_guard.remaining > 0);
             assert.equal(r.state.status, 'size-limit-exceeded');
-            assert.match(r.stderr, /still 90 GB over its size limit/);
+            assert.match(r.stderr, /still 83.8 GiB over its size limit/);
             assert.match(Guard.describeOutcome(r.state.size_guard), /Nothing was changed/);
         });
 });

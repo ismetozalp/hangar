@@ -302,3 +302,15 @@ body {
 .hangar-progress {
     height: 0.45rem;
 }
+
+/* Bootstrap paints every heading with --bs-heading-color, and each hangar theme
+ * sets that to a near-white for the dark page background. An alert has a light
+ * tinted background in every theme, so a heading inside one came out all but
+ * invisible — the Recovery screen's "How this works, and what it costs" was
+ * legible only by selecting it. Alerts already set their own foreground; the
+ * heading should simply take it. */
+.alert h1, .alert h2, .alert h3, .alert h4, .alert h5, .alert h6,
+.alert .h1, .alert .h2, .alert .h3, .alert .h4, .alert .h5, .alert .h6,
+.alert legend {
+    color: inherit;
+}

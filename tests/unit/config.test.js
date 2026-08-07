@@ -185,3 +185,31 @@ test('writeJson refuses cleanly with no cockpit rather than half-writing', async
     await assert.rejects(() => C.writeJson('/etc/hangar/config.json', { a: 1 }),
         (e) => e.kind === 'GENERIC');
 });
+
+// --- limited access is not an empty install -------------------------------
+//
+// Found by driving a real Cockpit session: every page starts with limited
+// access, /etc/hangar is root-owned, and listIds answered [] for the refusal.
+// A machine with a working repository was told it had none — the worst thing a
+// backup tool can get wrong.
+
+test('a refusal is recognised however cockpit words it', () => {
+    assert.equal(C.isAccessDenied({ problem: 'access-denied' }), true);
+    assert.equal(C.isAccessDenied({ message: 'Not permitted to perform this action.' }), true);
+    assert.equal(C.isAccessDenied({ message: 'ls: cannot open directory: Permission denied' }), true);
+});
+
+test('a missing directory is not a refusal — it really is nothing configured', () => {
+    assert.equal(C.isAccessDenied({ problem: 'not-found', message: 'No such file or directory' }), false);
+    assert.equal(C.isAccessDenied(null), false);
+    assert.equal(C.isAccessDenied({}), false);
+});
+
+test('the refusal carries a kind of its own, and says what to do about it', () => {
+    const e = C.adminRequired('/etc/hangar/repos');
+    assert.equal(e.kind, 'ADMIN_REQUIRED');
+    // Not 'retry': the next read is refused exactly like the last one.
+    assert.equal(e.remediation, 'grant-access');
+    assert.match(e.message, /\/etc\/hangar\/repos/);
+    assert.match(e.message, /administrative access/i);
+});

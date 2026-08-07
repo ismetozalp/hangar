@@ -568,6 +568,9 @@ test('buildMountArgv: mounts through a named transient unit, not a child process
         'restic',
         '-r', 's3:s3.eu-central-1.amazonaws.com/backups',
         '--password-file', '/etc/hangar/repos/main.key',
+        // A systemd unit has no $HOME, and restic exits 1 rather than mounting
+        // when it cannot place its cache.
+        '--cache-dir', '/var/cache/hangar/restic',
         'mount',
         '/run/hangar/mnt/main'
     ]);
@@ -1704,4 +1707,58 @@ test('the source carries no invisible control characters', () => {
     }
     assert.deepEqual(bad, [], 'control characters must be written as escapes');
     assert.ok(src.includes('/[\\u0000\\r\\n]/'), 'the unsafe-character class stays legible');
+});
+
+// --- waiting for the mount to serve ---------------------------------------
+//
+// systemd-run returns when the unit's process has been executed, not when FUSE
+// is serving. Listing immediately raced the mount and produced
+//   find: '/run/hangar/mnt/<repo>/snapshots/<time>': No such file or directory
+// about a snapshot that was perfectly fine. A tiny local repository takes about
+// 0.75 s to become listable; one on a NAS fetches its index first.
+
+test('readiness is asked of the snapshots directory, not the mount point', () => {
+    // The mount point exists the moment `install -d` made it, so testing that
+    // would answer "ready" before restic had attached anything at all.
+    assert.deepEqual(L.readyArgv('/run/hangar/mnt/nas/snapshots'),
+        ['test', '-d', '/run/hangar/mnt/nas/snapshots']);
+});
+
+test('readyArgv applies the same argv safety as everything else here', () => {
+    assert.throws(() => L.readyArgv('/run/hangar/mnt/\nevil'), (e) => e.kind === 'GENERIC');
+});
+
+test('wait options are bounded at both ends', () => {
+    // Zero would make the wait pointless; unbounded would hang the screen on a
+    // destination that is never coming back.
+    assert.deepEqual(L.waitOptions(), { timeoutMs: 30000, intervalMs: 250 });
+    assert.equal(L.waitOptions({ timeoutMs: 0 }).timeoutMs, 1000);
+    assert.equal(L.waitOptions({ timeoutMs: 1e9 }).timeoutMs, 300000);
+    assert.equal(L.waitOptions({ intervalMs: 1 }).intervalMs, 50);
+    assert.equal(L.waitOptions({ intervalMs: 1e9 }).intervalMs, 5000);
+});
+
+test('garbage options fall back to the defaults rather than to NaN', () => {
+    const o = L.waitOptions({ timeoutMs: 'soon', intervalMs: {} });
+    assert.equal(o.timeoutMs, 30000);
+    assert.equal(o.intervalMs, 250);
+});
+
+test('waiting resolves false without cockpit, and never rejects', async () => {
+    // The caller's answer to "not ready" is the slower reader, so a rejection
+    // here would turn a degraded experience into a broken screen.
+    assert.equal(await L.waitForMount('/run/hangar/mnt/nas', {}), false);
+});
+
+test('the mount unit passes a cache directory, matching the engine', () => {
+    // Without it the transient unit exits 1 and the Logbook shows a missing-path
+    // error about a snapshot that is perfectly fine.
+    const Restic = require('../../js/engine/restic.js');
+    const argv = L.buildMountArgv({ repoId: 'nas', repoUrl: '/srv/r',
+        passwordFile: '/k', maxRuntimeSec: 3600 });
+    const i = argv.indexOf('--cache-dir');
+    assert.ok(i >= 0, 'the mount unit has no --cache-dir');
+    assert.equal(argv[i + 1], Restic.CACHE_DIR);
+    // A global flag, so it must precede the subcommand.
+    assert.ok(i < argv.indexOf('mount'));
 });

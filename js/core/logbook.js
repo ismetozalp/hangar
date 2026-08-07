@@ -31,6 +31,8 @@
         (typeof require === 'function' ? require('./secrets.js') : null);
 
     const MOUNT_ROOT = '/run/hangar/mnt';
+    // Must match engine/restic.js CACHE_DIR; a unit test asserts they agree.
+    const RESTIC_CACHE_DIR = '/var/cache/hangar/restic';
     const MOUNT_UNIT_PREFIX = 'hangar-mount-';
     const SNAPSHOT_DIR = 'snapshots';
     const MOUNT_DIR_MODE = '0700';
@@ -556,7 +558,11 @@
             argv.push('--property=RuntimeMaxSec=' + o.maxRuntimeSec);
         }
 
-        argv.push(binary, '-r', url, '--password-file', passwordFile, 'mount');
+        // --cache-dir for the same reason engine/restic.js passes it on every
+        // command: this runs as a transient systemd unit, which has no $HOME, and
+        // restic exits 1 rather than mounting when it cannot place its cache.
+        argv.push(binary, '-r', url, '--password-file', passwordFile,
+            '--cache-dir', RESTIC_CACHE_DIR, 'mount');
         if (o.allowOther) argv.push('--allow-other');
         argv.push(point);
         return argv;
@@ -628,6 +634,59 @@
         return d && typeof d.call === 'function' ? d : null;
     }
 
+    // ---- waiting for the mount to actually serve ----------------------------
+    //
+    // systemd-run returns as soon as the unit's process has been EXECUTED, not
+    // when restic has attached FUSE and served a tree. Listing straight after it
+    // therefore races the mount, and the user gets:
+    //
+    //   find: '/run/hangar/mnt/<repo>/snapshots/<time>': No such file or directory
+    //
+    // about a snapshot that exists perfectly well. A tiny local repository takes
+    // ~0.75 s to become listable (measured); a repository on a NAS has to fetch
+    // its index over the network first and takes considerably longer.
+
+    const READY_TIMEOUT_MS = 30000;
+    const READY_INTERVAL_MS = 250;
+
+    // Pure: what to ask, and how long to keep asking.
+    function readyArgv(path) {
+        return ['test', '-d', requireSafe(str(path), 'mount point')];
+    }
+
+    function waitOptions(opts) {
+        const o = opts || {};
+        const num = (v, dflt, min, max) => {
+            const n = Number(v);
+            if (!Number.isFinite(n)) return dflt;
+            return Math.min(max, Math.max(min, Math.round(n)));
+        };
+        return {
+            // Bounded at both ends: a zero timeout would make the wait pointless,
+            // and an unbounded one would hang the screen on a destination that is
+            // never coming back.
+            timeoutMs: num(o.timeoutMs, READY_TIMEOUT_MS, 1000, 5 * 60 * 1000),
+            intervalMs: num(o.intervalMs, READY_INTERVAL_MS, 50, 5000)
+        };
+    }
+
+    // Resolves true once the snapshots directory is there, false on timeout.
+    // Never rejects: the caller's answer to "not ready" is to fall back to the
+    // slower reader, which is a better outcome than an error about a missing path.
+    function waitForMount(point, opts) {
+        const o = waitOptions(opts);
+        if (!hasCockpit() || typeof cockpit.spawn !== 'function') return Promise.resolve(false);
+        const argv = readyArgv(str(point).replace(/\/+$/, '') + '/' + SNAPSHOT_DIR);
+        const deadline = Date.now() + o.timeoutMs;
+        const attempt = () => cockpit.spawn(argv, { superuser: 'require', err: 'message' })
+            .then(() => true)
+            .catch(() => {
+                if (Date.now() >= deadline) return false;
+                return new Promise((resolve) => setTimeout(resolve, o.intervalMs)).then(attempt);
+            });
+        return attempt();
+    }
+
     function mount(opts) {
         return Promise.resolve().then(() => {
             const o = opts || {};
@@ -686,6 +745,7 @@
         diffToBadges, badgeForModifier,
         parseLsJson,
         mountUnitName, mountUnitService, mountPoint, normalizeMountRoot,
+        readyArgv, waitOptions, waitForMount,
         formatRelative,
         buildMountArgv, unwrapProps, normalizeMountState,
         // impure

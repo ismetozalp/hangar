@@ -8,6 +8,7 @@ const assert = require('node:assert/strict');
 const F = require('../../js/core/fspicker.js');
 
 const NUL = String.fromCharCode(0);
+const RS = String.fromCharCode(30);
 
 // --- path arithmetic ------------------------------------------------------
 
@@ -171,13 +172,50 @@ test('a selection wins over the current folder in every mode', () => {
 
 // --- argv -----------------------------------------------------------------
 
-test('listArgv asks find for one level, NUL separated', () => {
+test('listArgv asks find for one level, record separated', () => {
     const argv = F.listArgv('/srv');
     assert.equal(argv[0], 'find');
     assert.equal(argv[1], '/srv');
     assert.ok(argv.includes('-maxdepth'));
     assert.ok(argv.includes('-mindepth'));
     assert.ok(argv.join(' ').includes('%y'));
+});
+
+test('the record separator is asked for in octal, which find documents', () => {
+    // \xHH is not in find's escape grammar, and a literal control byte in the
+    // format string is the thing this whole change exists to avoid.
+    const fmt = F.listArgv('/')[F.listArgv('/').length - 1];
+    assert.match(fmt, /\\036$/);
+    assert.ok(fmt.indexOf(RS) < 0, 'the format string carries a raw control byte');
+    assert.ok(fmt.indexOf(NUL) < 0, 'the format string carries a raw NUL');
+});
+
+// --- a listing that cannot be read is not an empty folder -----------------
+//
+// The picker showed "This folder is empty." for '/' on a real machine. Every
+// entry had been dropped, and nothing said so — which sends the user looking
+// for a problem with their filesystem rather than with hangar.
+
+test('output that yields no records at all is reported, not called empty', () => {
+    assert.equal(F.looksUnparsed('d\tetc' + RS + 'd\thome' + RS), false);
+    assert.equal(F.looksUnparsed('d\tetc' + NUL + 'd\thome' + NUL), false);
+    // What a dropped separator looks like: one run with no separator to split on
+    // is still a record, but a listing whose tabs are gone is not.
+    assert.equal(F.looksUnparsed('detc dhome'), true);
+});
+
+test('an empty listing is an empty folder, not a failure', () => {
+    // An unreadable folder is common; claiming a bug every time one is empty
+    // would be its own kind of lie.
+    for (const v of ['', '   ', '\n', null, undefined])
+        assert.equal(F.looksUnparsed(v), false, JSON.stringify(v));
+});
+
+test('a folder of nothing but hidden files is empty, not unreadable', () => {
+    // Records parsed fine; the mode filtered them. That is not a parse failure.
+    const raw = 'f\t.bashrc' + RS + 'f\t.profile' + RS;
+    assert.equal(F.looksUnparsed(raw), false);
+    assert.deepEqual(F.parseListing(raw, { mode: 'any' }), []);
 });
 
 test('listArgv normalises before it asks, so .. never reaches find', () => {
@@ -220,4 +258,50 @@ test('mkdirArgv refuses a name that would become a path', () => {
         assert.throws(() => F.mkdirArgv('/srv', bad), (e) => e.kind === 'GENERIC',
             JSON.stringify(bad));
     }
+});
+
+// --- what the picker asks the bridge for ----------------------------------
+//
+// Both of these were found by driving a real Cockpit session with Playwright,
+// and neither could have been found any other way: the stub answered whatever
+// it was asked, so every one of these calls "passed" while the picker was dead.
+
+function withCockpit(reply, fn) {
+    const calls = [];
+    globalThis.cockpit = {
+        spawn(argv, opts) { calls.push({ argv, opts }); return Promise.resolve(reply); }
+    };
+    try { return fn(calls); } finally { delete globalThis.cockpit; }
+}
+
+test('listing asks for superuser but does not demand it', async () => {
+    // 'require' is refused outright in a session without administrative access,
+    // which left the dialog showing "Not permitted to perform this action." and
+    // nothing else. A listing is a read: show what this user can see.
+    await withCockpit('d\tetc' + RS, async (calls) => {
+        await F.list('/', { mode: 'dir' });
+        assert.equal(calls[0].opts.superuser, 'try');
+    });
+});
+
+test('creating a folder still demands superuser', async () => {
+    // A write that half-works is worse than one that is refused.
+    await withCockpit('', async (calls) => {
+        await F.makeFolder('/srv', 'backups');
+        assert.equal(calls[0].opts.superuser, 'require');
+    });
+});
+
+test('the listing never asks find for a NUL separator', async () => {
+    // Measured against a real session: cockpit.spawn's text channel discards
+    // output containing NUL, resolving with an empty string — so a picker that
+    // asked for '%y\t%f\0' reported every folder on the machine as empty.
+    await withCockpit('d\tetc' + RS, async (calls) => {
+        await F.list('/', { mode: 'dir' });
+        const fmt = calls[0].argv[calls[0].argv.length - 1];
+        // \\0 NOT followed by another octal digit: "\\036" is RS, "\\0" is NUL.
+        assert.doesNotMatch(fmt, /\\0(?![0-7])/, `the format asks for NUL: ${JSON.stringify(fmt)}`);
+        assert.match(fmt, /\\036$/);
+        assert.ok(calls[0].argv.every((a) => a.indexOf(NUL) < 0), 'a raw NUL reached argv');
+    });
 });

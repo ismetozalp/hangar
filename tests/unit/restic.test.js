@@ -206,7 +206,11 @@ test('classifyExit: every mapped code yields a non-empty message', () => {
 // -------------------------------------------------------------------- buildArgs
 
 const REPO = { repoUrl: '/srv/backup/repo', passwordFile: '/etc/hangar/repos/main.key' };
-const HEAD = ['-r', '/srv/backup/repo', '--password-file', '/etc/hangar/repos/main.key', '--json'];
+// --cache-dir is part of every argv now: restic cannot find its cache from a
+// systemd unit's environment, and exits 1 rather than running. See the tests at
+// the end of this file.
+const HEAD = ['-r', '/srv/backup/repo', '--password-file', '/etc/hangar/repos/main.key',
+    '--cache-dir', R.CACHE_DIR, '--json'];
 
 test('buildArgs: init', () => {
     assert.deepEqual(R.buildArgs('init', REPO), HEAD.concat(['init']));
@@ -374,7 +378,7 @@ test('buildArgs: every repository-scoped op requires a repoUrl', () => {
 
 test('buildArgs: the password file is optional', () => {
     assert.deepEqual(R.buildArgs('snapshots', { repoUrl: '/srv/repo' }),
-        ['-r', '/srv/repo', '--json', 'snapshots']);
+        ['-r', '/srv/repo', '--cache-dir', R.CACHE_DIR, '--json', 'snapshots']);
 });
 
 test('buildArgs: --json is emitted for every op except version', () => {
@@ -1144,7 +1148,7 @@ test('buildArgs: bare strings are accepted wherever a list is', () => {
     const args = R.buildArgs('backup', {
         repoUrl: '/r', paths: '/srv', excludes: '*.tmp', tags: 'nightly'
     });
-    assert.deepEqual(args, ['-r', '/r', '--json', 'backup', '--exclude', '*.tmp',
+    assert.deepEqual(args, ['-r', '/r', '--cache-dir', R.CACHE_DIR, '--json', 'backup', '--exclude', '*.tmp',
         '--tag', 'nightly', '--', '/srv']);
 });
 
@@ -1311,7 +1315,7 @@ test('buildArgs: the operation name appears once and after every global flag', (
 test('buildArgs: a password file path with spaces and unicode is one argument', () => {
     const key = '/etc/hangar/repos/ä repo.key';
     const args = R.buildArgs('snapshots', { repoUrl: '/r', passwordFile: key });
-    assert.deepEqual(args, ['-r', '/r', '--password-file', key, '--json', 'snapshots']);
+    assert.deepEqual(args, ['-r', '/r', '--password-file', key, '--cache-dir', R.CACHE_DIR, '--json', 'snapshots']);
 });
 
 // -------------------------------------------------------- summarize: hostile input
@@ -1855,8 +1859,8 @@ test('run: every argv element handed to cockpit is a non-empty string', async ()
             assert.equal(typeof a, 'string');
             assert.ok(a.length > 0);
         });
-        assert.deepEqual(argv, ['restic', '-r', '/srv/repo', '--json', 'backup',
-            '--tag', 'nightly', '--', '/srv']);
+        assert.deepEqual(argv, ['restic', '-r', '/srv/repo', '--cache-dir', R.CACHE_DIR,
+            '--json', 'backup', '--tag', 'nightly', '--', '/srv']);
     });
 });
 
@@ -2056,4 +2060,39 @@ test('the expiry signal is the rclone module\'s, not a second copy of it', () =>
     const code = src.split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
     assert.equal(/invalid_grant|fetch token/.test(code), false,
         'restic.js grew its own copy of the strings');
+});
+
+// --- restic's cache directory --------------------------------------------
+//
+// Found in a real session: the Logbook's mount unit and every scheduled backup
+// exited 1 with "unable to locate cache directory: neither $XDG_CACHE_HOME nor
+// $HOME are defined". A systemd unit has no HOME; the browser's privileged
+// channel happens to have one, which is why it only failed where it mattered.
+
+test('every operation passes an explicit cache directory', () => {
+    // Enough of every option that no operation refuses to build.
+    const opts = { repoUrl: '/srv/r', passwordFile: '/k', paths: ['/home'],
+        snapshot: 'abc', snapshotA: 'aaa', snapshotB: 'bbb',
+        target: '/tmp/out', keepDaily: 7 };
+    for (const op of R.OPS) {
+        if (op === 'version') continue;       // a presence probe; see the next test
+        const args = R.buildArgs(op, opts);
+        const i = args.indexOf('--cache-dir');
+        assert.ok(i >= 0, `restic ${op} has no --cache-dir`);
+        assert.equal(args[i + 1], R.CACHE_DIR, `restic ${op} points somewhere else`);
+    }
+});
+
+test('the cache directory is root-owned and outside any home', () => {
+    // Every process that runs restic here is root: the timer units, the mount
+    // unit, and the browser's privileged channel. A path under a user's home
+    // would be wrong for all three.
+    assert.match(R.CACHE_DIR, /^\/var\//);
+    assert.ok(!/\/home\//.test(R.CACHE_DIR));
+    assert.ok(!/\/root\//.test(R.CACHE_DIR));
+});
+
+test('the cache flag comes before the operation, where a global flag belongs', () => {
+    const args = R.buildArgs('backup', { repoUrl: '/srv/r', passwordFile: '/k', paths: ['/home'] });
+    assert.ok(args.indexOf('--cache-dir') < args.indexOf('backup'));
 });

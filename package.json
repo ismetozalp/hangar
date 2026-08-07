@@ -7,7 +7,8 @@
     "test:unit": "node --test tests/unit/*.test.js",
     "test:integration": "node --test tests/integration/*.test.js",
     "test:smoke": "node tests/smoke.mjs",
-    "test:e2e": "E2E=1 node tests/e2e.mjs"
+    "test:e2e": "E2E=1 node tests/e2e.mjs",
+    "test:ui": "node tests/ui.mjs"
   },
   "devDependencies": {
     "playwright": "^1.49.0"

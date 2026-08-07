@@ -27,6 +27,12 @@
         // completely in two minutes — and because retrying it, which is what
         // NETWORK invites, will fail every night until someone re-authorises.
         AUTH_EXPIRED: 'AUTH_EXPIRED',
+        // Cockpit is running this page with limited access, so every read of
+        // /etc/hangar is refused. Its own kind because it is indistinguishable
+        // from "nothing is configured yet" at the call site, and reporting it as
+        // that told a user with a working repository that they had none — the
+        // worst possible lie for a backup tool to tell.
+        ADMIN_REQUIRED: 'ADMIN_REQUIRED',
         UNKNOWN: 'UNKNOWN'
     };
 
@@ -48,7 +54,10 @@
         // than the severity: the user signs in again and the next run works.
         // Note this is NOT 'retry': re-running a backup against a destination
         // whose token has expired fails identically, every night, in silence.
-        [KIND.AUTH_EXPIRED]: 'reauthorize'
+        [KIND.AUTH_EXPIRED]: 'reauthorize',
+        // Not 'retry': the next read is refused exactly like the last one until
+        // the user turns on administrative access in Cockpit's own header.
+        [KIND.ADMIN_REQUIRED]: 'grant-access'
     };
 
     function create(kind, message, detail) {

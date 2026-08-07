@@ -80,12 +80,38 @@
         return cockpit.file(path, Object.assign({ superuser: 'require' }, opts || {}));
     }
 
+    // Cockpit reports a refused privileged channel as problem 'access-denied';
+    // the message is matched too because the same refusal arrives from `ls`
+    // itself when the bridge is unprivileged.
+    function isAccessDenied(e) {
+        if (!e) return false;
+        if (e.problem === 'access-denied') return true;
+        return /not permitted|permission denied|access denied/i.test(String(e.message || ''));
+    }
+
+    function adminRequired(what) {
+        const E = root.HangarErrors ||
+            (typeof require === 'function' ? require('./errors.js') : null);
+        const message = 'hangar could not read ' + what + ': Cockpit is running with ' +
+            'limited access. Turn on administrative access in Cockpit, then try again.';
+        if (E && typeof E.create === 'function') return E.create('ADMIN_REQUIRED', message, { path: what });
+        const e = new Error(message);
+        e.name = 'HangarError';
+        e.kind = 'ADMIN_REQUIRED';
+        return e;
+    }
+
     async function readJson(path, fallback) {
         try {
             const text = await file(path).read();
             if (text === null || text === '') return fallback === undefined ? null : fallback;
             return JSON.parse(text);
         } catch (e) {
+            // A fallback means "not configured yet". It does not mean "pretend the
+            // refusal was an absence": settings silently reverting to defaults, or
+            // a repository reading as missing, is how limited access disguised
+            // itself as an empty install.
+            if (isAccessDenied(e)) throw adminRequired(path);
             if (fallback !== undefined) return fallback;
             throw E.create('GENERIC', 'Could not read ' + path, { error: String(e) });
         }
@@ -158,7 +184,12 @@
                 .map(function (n) { return n.slice(0, -5); })
                 .filter(function (n) { return ID_RE.test(n); });
         } catch (e) {
-            return [];   // directory absent simply means nothing configured yet
+            // A missing directory genuinely means nothing is configured yet. Being
+            // REFUSED does not, and answering [] for it is how a machine with a
+            // configured repository came to show "No repositories yet." — the one
+            // answer a backup tool must never give wrongly.
+            if (isAccessDenied(e)) throw adminRequired(dir);
+            return [];
         }
     }
 
@@ -168,6 +199,7 @@
         mergeGlobal, validateJob,
         // I/O
         readJson, writeJson, listIds, ensureDirFor, dirModeFor, writeFailureText,
+        isAccessDenied, adminRequired,
         listRepos:  function () { return listIds(CONF_DIR + '/repos'); },
         listJobs:   function () { return listIds(CONF_DIR + '/jobs'); },
         readRepo:   function (id) { return readJson(repoPath(id)); },

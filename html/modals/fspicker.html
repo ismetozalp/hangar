@@ -2,9 +2,14 @@
      One dialog for repository folders, backup sources, exclude files, restore
      targets and rescue-image output, so a path is chosen the same way everywhere.
      Logic lives in js/core/fspicker.js and js/features/fspicker-ui.js. -->
+<!-- No x-init="init()" here: Alpine 3 calls init() by itself when the x-data
+     object defines one, so writing it out ran init TWICE — two listeners for
+     every event, and a dialog that received its own open event twice. The
+     second delivery resolved the caller's promise with null, so pressing Save
+     on a job closed the dialog and wrote nothing, in silence. -->
 <div class="modal fade" id="hangar-fspicker" tabindex="-1"
      aria-labelledby="hangar-fspicker-title" aria-hidden="true"
-     x-data="hangarFsPicker()" x-init="init()"
+     x-data="hangarFsPicker()"
      @hidden.bs.modal="if (open) cancel()">
     <div class="modal-dialog modal-dialog-centered modal-lg modal-dialog-scrollable">
         <div class="modal-content">
@@ -93,8 +98,14 @@
                                 <div class="form-text text-warning" x-text="p"></div>
                             </template>
                         </div>
+                        <!-- "> 0", not a bare .length: Alpine removes a boolean
+                             attribute only for null, undefined or false, and SETS it
+                             for anything else — including 0. A valid folder name
+                             produced an empty problems array, whose .length is 0, so
+                             this button disabled itself permanently the moment the
+                             name became valid. -->
                         <button type="button" class="btn btn-sm btn-outline-primary"
-                                :disabled="busy || !newFolder || newFolderProblems().length"
+                                :disabled="busy || !newFolder || newFolderProblems().length > 0"
                                 @click="createFolder()">Create</button>
                         <button type="button" class="btn btn-sm btn-outline-secondary"
                                 @click="creating = false; newFolder = ''">Cancel</button>

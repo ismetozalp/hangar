@@ -17,9 +17,14 @@
 
      Step branches use x-if rather than x-show: a step is torn down when it is not
      current, so a half-typed password never lingers in a hidden input. -->
+<!-- No x-init="init()" here: Alpine 3 calls init() by itself when the x-data
+     object defines one, so writing it out ran init TWICE — two listeners for
+     every event, and a dialog that received its own open event twice. The
+     second delivery resolved the caller's promise with null, so pressing Save
+     on a job closed the dialog and wrote nothing, in silence. -->
 <div class="modal fade" id="hangar-rclone-remote" tabindex="-1"
      aria-labelledby="hangar-rclone-title" aria-hidden="true"
-     x-data="hangarRcloneUi()" x-init="init()">
+     x-data="hangarRcloneUi()">
     <div class="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable">
         <div class="modal-content">
 

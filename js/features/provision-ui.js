@@ -320,6 +320,9 @@
         'init': 'Initialise repository',
         'list-unreadable': 'Show unreadable files',
         'free-space': 'I freed some space — retry',
+        // Cockpit's header owns the switch; hangar cannot flip it from a page,
+        // so the button says where to look rather than promising an escalation.
+        'grant-access': 'How to grant access',
         // Reachable here only because the table is shared with core/errors.js; a
         // package install has no cloud destination to re-authorise. Labelled all
         // the same, so a kind that gains this remediation can never ship a

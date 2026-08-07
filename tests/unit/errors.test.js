@@ -7,7 +7,7 @@ const E = require('../../js/core/errors.js');
 test('KIND is exhaustive and self-consistent', () => {
     const expected = ['OK', 'GENERIC', 'GO_RUNTIME', 'READ_ERRORS', 'REPO_MISSING',
         'REPO_LOCKED', 'WRONG_PASSWORD', 'CANCELLED', 'NO_SPACE', 'NETWORK',
-        'AUTH_EXPIRED', 'UNKNOWN'];
+        'AUTH_EXPIRED', 'ADMIN_REQUIRED', 'UNKNOWN'];
     assert.deepEqual(Object.keys(E.KIND).sort(), expected.slice().sort());
     // Every key maps to itself — callers pass kind strings around freely.
     for (const k of Object.keys(E.KIND)) assert.equal(E.KIND[k], k);

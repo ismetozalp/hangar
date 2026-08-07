@@ -121,7 +121,46 @@ test('renderLocalConf lets custom excludes replace the defaults entirely', () =>
 });
 
 test('renderLocalConf restores latest into /mnt/local', () => {
-    assert.match(render(), /'restore'\n {4}'latest'\n(?: {4}'--host' 'db01'\n)? {4}'--target' '\/mnt\/local'/);
+    assert.match(render(), /'restore'\n {4}'latest'\n[\s\S]*? {4}'--target' '\/mnt\/local'/);
+});
+
+// --host is not enough. hangar keeps every job in one repository under one
+// hostname, so "latest" is the newest snapshot ANY job wrote. Seen in a real
+// repository: two snapshots, both host=localhost.localdomain, tagged 'nightly'
+// — neither tagged hangar-dr. Had one of those jobs been backing up /home only,
+// recovery would have restored a machine with no /usr and no /etc and called it
+// a success.
+test('the restore leg will not accept a snapshot that omits what is backed up', () => {
+    const conf = render({ backupPaths: ['/', '/boot'] });
+    const restore = conf.slice(conf.indexOf('EXTERNAL_RESTORE=('));
+    assert.ok(restore.includes("'--path' '/'"), 'restore must require the backed-up roots');
+    assert.ok(restore.includes("'--path' '/boot'"));
+});
+
+// The two legs must ask about the same paths, or recovery selects a snapshot
+// that does not match what was saved.
+test('backup and restore agree on the paths, whatever they are', () => {
+    [['/'], ['/', '/boot'], ['/srv', '/etc']].forEach((paths) => {
+        const conf = render({ backupPaths: paths });
+        const cut = conf.indexOf('EXTERNAL_RESTORE=(');
+        const restore = conf.slice(cut);
+        paths.forEach((p) => {
+            assert.ok(conf.slice(0, cut).includes("    '" + p + "'"),
+                'backup leg must save ' + p);
+            assert.ok(restore.includes("'--path' '" + p + "'"),
+                'restore leg must require ' + p);
+        });
+    });
+});
+
+// The tighter filter is the wrong one: EXTERNAL_BACKUP runs only during
+// `rear mkbackup`, so an image built with `rear mkrescue` has no hangar-dr
+// snapshot at all and a tag filter would leave recovery with nothing to find.
+test('the restore leg does not demand a DR-tagged snapshot that may not exist', () => {
+    const conf = render();
+    const restore = conf.slice(conf.indexOf('EXTERNAL_RESTORE=('));
+    assert.ok(!restore.includes("'--tag'"),
+        'a tag filter makes recovery fail when only scheduled backups exist');
 });
 
 test('renderLocalConf pins the snapshot host so latest cannot select another machine', () => {
@@ -188,6 +227,86 @@ test('renderLocalConf emits ISO_PREFIX and ISO_VOLID only when configured', () =
 test('renderLocalConf accepts every documented ISO_DEFAULT value', () => {
     Dr.ISO_DEFAULT_VALUES.forEach((v) =>
         assert.match(render({ isoDefault: v }), new RegExp('^ISO_DEFAULT=\'' + v + '\'$', 'm')));
+});
+
+// ISO_DEFAULT steers the syslinux menu, which is what a BIOS machine boots. A
+// UEFI machine boots GRUB2, which reads two entirely different variables — so a
+// config carrying only ISO_DEFAULT sends UEFI hardware straight past the rescue
+// system and into the disk it was supposed to rebuild. Observed on a real drill:
+// the menu defaulted to "Boot next EFI" on a 300s timer while the config said
+// ISO_DEFAULT='automatic' and USER_INPUT_TIMEOUT='30'.
+test('the rescue menu behaves the same whether it boots via BIOS or UEFI', () => {
+    const conf = render({ isoDefault: 'automatic', userInputTimeout: 45 });
+    assert.match(conf, /^ISO_DEFAULT='automatic'$/m);
+    assert.match(conf, /^GRUB2_DEFAULT_BOOT='rear'$/m,
+        'GRUB2 defaults to "chainloader" (Boot next EFI) unless told otherwise');
+    assert.match(conf, /^GRUB2_TIMEOUT='45'$/m,
+        'GRUB2_TIMEOUT is expanded in default.conf before local.conf is read, '
+        + 'so USER_INPUT_TIMEOUT alone never reaches it');
+});
+
+// "Wait for a human" is 0 to syslinux and -1 to GRUB; 0 tells GRUB to boot at
+// once without showing the menu. Passed through unchanged, a config asking the
+// rescue system to wait would do the opposite on UEFI.
+test('waiting for a human means waiting on both bootloaders', () => {
+    const conf = render({ userInputTimeout: 0 });
+    assert.match(conf, /^USER_INPUT_TIMEOUT='0'$/m);
+    assert.match(conf, /^GRUB2_TIMEOUT='-1'$/m,
+        "GRUB reads 0 as 'boot immediately, show nothing'");
+});
+
+test('booting the hard disk is honoured on UEFI as well as BIOS', () => {
+    assert.match(render({ isoDefault: 'boothd' }), /^GRUB2_DEFAULT_BOOT='chainloader'$/m);
+});
+
+// ReaR adds `auto_recover` to the kernel line for ISO_DEFAULT='automatic' only
+// while writing the SYSLINUX menu; its GRUB2 entry is plain
+// `linux $kernel root=UUID=... $KERNEL_CMDLINE`. Without this the rescue system
+// boots on UEFI and sits at a login prompt forever.
+test('automatic recovery actually starts on a UEFI machine', () => {
+    assert.match(render({ isoDefault: 'automatic' }),
+        /^KERNEL_CMDLINE='[^']*\bauto_recover\b[^']*'$/m);
+});
+
+test('a manual rescue system is not turned into an automatic one', () => {
+    ['boothd', 'manual'].forEach((v) => {
+        assert.ok(!/\bauto_recover\b/.test(render({ isoDefault: v })),
+            v + ' must not start a recovery on its own');
+    });
+});
+
+// `unattended` reboots after a successful recovery. The drill VM boots the ISO
+// first, so that would recover, reboot, boot the ISO, and recover again — the
+// endless cycle ReaR warns about in default.conf.
+test('the rescue system never reboots itself into another recovery', () => {
+    assert.ok(!/\bunattended\b/.test(render({ isoDefault: 'automatic' })));
+});
+
+// ReaR refuses to recover onto a disk more than AUTOSHRINK_DISK_SIZE_LIMIT_PERCENTAGE
+// smaller than the original (default 2%), which stops a recovery onto a
+// replacement disk that is merely a different model of the same nominal size.
+test('the shrink limit is only written when the operator asked for one', () => {
+    assert.ok(!render().includes('AUTOSHRINK_DISK_SIZE_LIMIT_PERCENTAGE'),
+        "an unset field must leave ReaR's own default alone");
+    assert.match(render({ autoshrinkPercent: 90 }),
+        /^AUTOSHRINK_DISK_SIZE_LIMIT_PERCENTAGE='90'$/m);
+});
+
+test('a blank shrink limit is the same as not setting one', () => {
+    ['', '   '].forEach((v) => assert.ok(
+        !render({ autoshrinkPercent: v }).includes('AUTOSHRINK_DISK_SIZE_LIMIT_PERCENTAGE')));
+});
+
+test('validate rejects a shrink limit that is not a whole percentage', () => {
+    [101, -1, 1.5, 'lots', '10%'].forEach((v) => {
+        assert.deepEqual(Dr.validate(Object.assign({}, BASE, { autoshrinkPercent: v })),
+            ['Shrink limit must be a whole percentage between 0 and 100.'],
+            'accepted ' + JSON.stringify(v));
+    });
+    [0, 2, 100, '50'].forEach((v) => {
+        assert.deepEqual(Dr.validate(Object.assign({}, BASE, { autoshrinkPercent: v })), [],
+            'rejected ' + JSON.stringify(v));
+    });
 });
 
 test('renderLocalConf throws a fatal GENERIC HangarError on an invalid config', () => {
@@ -333,8 +452,10 @@ test('an injected value in the host, key path and iso fields stays a literal str
     const canary = path.join(dir, 'PWNED');
     const evil = "x'; touch " + canary + "; :'";
     const conf = render({ host: evil, isoVolid: evil, isoPrefix: evil });
-    // EXTERNAL_RESTORE: restic --repo U --password-file K restore latest --host H
-    const out = sourceAndRead(dir, conf, '${EXTERNAL_RESTORE[8]}|$ISO_VOLID|$ISO_PREFIX');
+    // EXTERNAL_RESTORE: restic --repo U --password-file K --no-cache restore
+    // latest --target T --host H — the host VALUE is element 9 now that
+    // --no-cache sits in front of the subcommand.
+    const out = sourceAndRead(dir, conf, '${EXTERNAL_RESTORE[9]}|$ISO_VOLID|$ISO_PREFIX');
     assert.equal(out, evil + '|' + evil + '|' + evil);
     assert.equal(fs.existsSync(canary), false);
 });
@@ -344,8 +465,10 @@ test('an injected exclude and required program stay literal words', (t) => {
     const canary = path.join(dir, 'PWNED');
     const evil = '/var/`touch ' + canary + '`';
     const conf = render({ excludes: [evil], extraRequiredProgs: ["a'; touch " + canary + "2; :'"] });
-    // EXTERNAL_BACKUP: restic --repo U --password-file K backup --tag T --exclude E
-    const out = sourceAndRead(dir, conf, '${EXTERNAL_BACKUP[9]}|${REQUIRED_PROGS[1]}');
+    // EXTERNAL_BACKUP: restic --repo U --password-file K --cache-dir C backup
+    // --tag T --exclude E — the exclude VALUE is element 11 now that --cache-dir
+    // adds two words in front of the subcommand.
+    const out = sourceAndRead(dir, conf, '${EXTERNAL_BACKUP[11]}|${REQUIRED_PROGS[1]}');
     assert.equal(out.split('|')[0], evil);
     assert.equal(out.split('|')[1], "a'; touch " + canary + "2; :'");
     assert.equal(fs.existsSync(canary), false);
@@ -968,12 +1091,13 @@ test('a flag and its value stay two separate bash words in a generated array', (
 
 test('the generated EXTERNAL_BACKUP argv reaches bash with the exact element count', (t) => {
     const dir = tmpdir(t);
-    // restic --repo U --password-file K backup --tag T = 8 words, then the 10
-    // default excludes plus the self-exclude as flag/value pairs = 22, then the
-    // single backup path at index 30. EXTERNAL_RESTORE is 11 with --host.
+    // restic --repo U --password-file K --cache-dir C backup --tag T = 10 words,
+    // then the 10 default excludes plus the self-exclude as flag/value pairs = 22,
+    // then the single backup path at index 32. EXTERNAL_RESTORE is 14: --no-cache
+    // adds one, --host and --path add two each.
     const out = sourceAndRead(dir, render(),
-        '${#EXTERNAL_BACKUP[@]}|${EXTERNAL_BACKUP[0]}|${EXTERNAL_BACKUP[30]}|${#EXTERNAL_RESTORE[@]}');
-    assert.equal(out, '31|restic|/|11');
+        '${#EXTERNAL_BACKUP[@]}|${EXTERNAL_BACKUP[0]}|${EXTERNAL_BACKUP[32]}|${#EXTERNAL_RESTORE[@]}');
+    assert.equal(out, '33|restic|/|14');
     assert.equal(Dr.DEFAULT_EXCLUDES.length, 10);
 });
 
@@ -1332,4 +1456,147 @@ test('mkrescue survives a failure with no message and no buffer at all', async (
 test('the I/O layer is inert again once cockpit goes away', async () => {
     assert.equal(typeof globalThis.cockpit, 'undefined', 'a cockpit stub leaked between tests');
     await assert.rejects(() => Dr.readLocalConf(), (e) => Errors.isHangarError(e));
+});
+
+// --- one exclude file for the machine, not one per job ---------------------
+//
+// Reported from real use: the Recovery screen showed hangar's short default
+// exclude list while the backup job used a 70-pattern ~/excludes.txt. Two
+// answers to "what does this machine skip" is one too many — the DR snapshot
+// would have carried the hundreds of gigabytes the job was told to leave out.
+
+test('an exclude file reaches restic as --exclude-file', () => {
+    const conf = render({ excludeFile: '/home/appuser/excludes.txt' });
+    assert.match(conf, /'--exclude-file' '\/home\/appuser\/excludes\.txt'/);
+});
+
+test('the exclude file is carried into the rescue system', () => {
+    // A rescue shell that reruns the backup step must be able to read it;
+    // restic treats a missing --exclude-file as a hard error, not a warning.
+    const conf = render({ excludeFile: '/home/appuser/excludes.txt' });
+    const copySection = conf.slice(conf.indexOf('COPY_AS_IS+='));
+    assert.ok(copySection.includes("'/home/appuser/excludes.txt'"),
+        'the exclude file is not copied into the rescue system');
+});
+
+test('no exclude file means no flag at all, not an empty one', () => {
+    // `--exclude-file ''` would make restic fail on every run.
+    const conf = render();
+    assert.ok(!conf.includes('--exclude-file'));
+});
+
+test('an exclude file is held to the same path rules as everything else here', () => {
+    // This string is sourced by a rescue shell running as root.
+    for (const bad of ['relative.txt', '/home/../etc/x', '/home/a\nb'])
+        assert.ok(Dr.validate({ repoId: 'n', repoUrl: '/r', excludeFile: bad })
+            .some((p) => /Exclude file/.test(p)), JSON.stringify(bad));
+    assert.equal(Dr.validate({ repoId: 'n', repoUrl: '/r', excludeFile: '/home/appuser/excludes.txt' })
+        .some((p) => /Exclude file/.test(p)), false);
+});
+
+// --- where the image ENDED UP, not where it was built ----------------------
+//
+// ReaR always builds into its own output directory, then copies the result to
+// OUTPUT_URL — into a subdirectory named after the host. hangar reported the
+// build path, so the screen sent people to /var/lib/rear/output while their
+// rescue image was in /home/appuser/localhost. Both lines are in ReaR's log; only
+// one of them is the file to put on a USB stick.
+
+const REAL_TAIL = [
+    'Wrote ISO image: /var/lib/rear/output/rear-localhost.iso (905M)',
+    "Copying result files '/var/lib/rear/output/rear-localhost.iso " +
+        "/var/tmp/rear.zabqAzl1bwFCFoE/tmp/VERSION' to /home/appuser/localhost at file location"
+].join('\n');
+
+test('isoPathFrom reports the copy destination when ReaR made one', () => {
+    assert.equal(Dr.isoPathFrom(REAL_TAIL), '/home/appuser/localhost/rear-localhost.iso');
+});
+
+test('isoPathFrom falls back to the build path when nothing was copied', () => {
+    // OUTPUT_URL pointing at ReaR's own directory produces no copy step.
+    assert.equal(Dr.isoPathFrom('Wrote ISO image: /var/lib/rear/output/rear-localhost.iso (905M)'),
+        '/var/lib/rear/output/rear-localhost.iso');
+});
+
+test('a remote destination is not reported as a local path', () => {
+    // nfs:// or sftp:// is not somewhere the operator can open a file, so the
+    // built copy — which does exist here — is the honest answer.
+    const text = 'Wrote ISO image: /var/lib/rear/output/x.iso (1G)\n' +
+        "Copying result files '/var/lib/rear/output/x.iso' to nfs://nas/export at nfs location";
+    assert.equal(Dr.isoPathFrom(text), '/var/lib/rear/output/x.iso');
+});
+
+test('a rerun supersedes an earlier build, and its delivery', () => {
+    const text = [
+        'Wrote ISO image: /var/lib/rear/output/old.iso (1G)',
+        "Copying result files '/old.iso' to /tmp/first at file location",
+        'Wrote ISO image: /var/lib/rear/output/new.iso (1G)',
+        "Copying result files '/new.iso' to /home/appuser/localhost at file location"
+    ].join('\n');
+    assert.equal(Dr.isoPathFrom(text), '/home/appuser/localhost/new.iso');
+});
+
+test('isoPathFrom still reports nothing when ReaR wrote no image', () => {
+    assert.equal(Dr.isoPathFrom('Copying result files \'/x\' to /home/appuser at file location'), null);
+    assert.equal(Dr.isoPathFrom(''), null);
+    assert.equal(Dr.isoPathFrom('no iso here'), null);
+});
+
+// --- restic must be able to run where ReaR runs it -------------------------
+
+test('the DR backup carries a cache directory, like every other hangar path', () => {
+    // ReaR is not a login shell; restic exits 1 when it can neither find nor
+    // make a cache. The same failure killed the Logbook mount and would have
+    // killed every scheduled backup.
+    const conf = render();
+    const backup = conf.slice(conf.indexOf('EXTERNAL_BACKUP=('), conf.indexOf('EXTERNAL_RESTORE=('));
+    assert.match(backup, /'--cache-dir' '\/var\/cache\/hangar\/restic'/);
+});
+
+test('the DR restore uses --no-cache, because the rescue system has nowhere to put one', () => {
+    // /var/cache/hangar does not exist in the rescue initramfs and may not be
+    // creatable. A cache would only speed up a second run, and there is no
+    // second run — this is the recovery.
+    const conf = render();
+    const restore = conf.slice(conf.indexOf('EXTERNAL_RESTORE=('));
+    assert.match(restore, /'--no-cache'/);
+    assert.ok(!/--cache-dir/.test(restore.slice(0, restore.indexOf(')'))),
+        'the restore leg points at a cache directory that will not exist');
+});
+
+test('restore latest is pinned to a host when one is configured', () => {
+    // Without it, a repository holding more than one machine can restore the
+    // wrong machine onto this one — silently, and only once.
+    const conf = render({ host: 'db01' });
+    const restore = conf.slice(conf.indexOf('EXTERNAL_RESTORE=('));
+    assert.match(restore, /'--host' 'db01'/);
+});
+
+// ReaR's default SSH_FILES='avoid_sensitive_files' copies only authorized_keys
+// and known_hosts from /root/.ssh, dropping every private key. COPY_AS_IS does
+// not override it. An unattended sftp restore then stops at
+// "backup@host's password:" with no terminal to answer — observed in a real drill
+// after the disk layout had been recreated successfully.
+test('an sftp rescue system carries the key it needs to reach the repository', () => {
+    const conf = render({ repoKind: 'sftp', repoUrl: 'sftp:u@nas:/vol/restic' });
+    assert.match(conf, /^SSH_FILES=\(\n\s+'\/root\/\.ssh\/'\n\)$/m);
+});
+
+test('a local repository is not given ssh keys it has no use for', () => {
+    assert.ok(!render().includes('SSH_FILES'));
+    assert.ok(!render({ repoKind: 'rclone', repoUrl: 'rclone:r:bucket' }).includes('SSH_FILES'));
+});
+
+// ReaR copies the key and then deletes it: 501_check_ssh_keys.sh strips private
+// keys that have no passphrase, because SSH_UNPROTECTED_PRIVATE_KEYS defaults
+// to 'no'. An unattended restore cannot type a passphrase, so its key is always
+// unprotected — without this the drill stops at "backup@host's password:" even
+// with SSH_FILES set. Observed twice on a real drill.
+test('the sftp key survives ReaR stripping unprotected private keys', () => {
+    const conf = render({ repoKind: 'sftp', repoUrl: 'sftp:u@nas:/vol/restic' });
+    assert.match(conf, /^SSH_UNPROTECTED_PRIVATE_KEYS='yes'$/m);
+});
+
+test('a repository that needs no ssh key does not keep unprotected keys', () => {
+    assert.ok(!render().includes('SSH_UNPROTECTED_PRIVATE_KEYS'));
 });

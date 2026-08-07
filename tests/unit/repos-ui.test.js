@@ -449,11 +449,11 @@ test('limitEcho says what an empty limit means, rather than saying nothing', () 
 test('limitEcho echoes the parsed size, which is the point of the free-text box', () => {
     // A bare number is BYTES and a bare letter is DECIMAL — neither is visible
     // unless the form says which one it understood.
-    assert.equal(Ui.limitEcho('500 GB'), 'Understood as 500 GB.');
-    assert.equal(Ui.limitEcho('500G'), 'Understood as 500 GB.');
+    assert.equal(Ui.limitEcho('500 GB'), 'Understood as 465.7 GiB.');
+    assert.equal(Ui.limitEcho('500G'), 'Understood as 465.7 GiB.');
     assert.equal(Ui.limitEcho('500'), 'Understood as 500 B.');
-    assert.equal(Ui.limitEcho('1 TiB'), 'Understood as 1.1 TB.');
-    assert.equal(Ui.limitEcho(' 800m '), 'Understood as 800 MB.');
+    assert.equal(Ui.limitEcho('1 TiB'), 'Understood as 1 TiB.');
+    assert.equal(Ui.limitEcho(' 800m '), 'Understood as 762.9 MiB.');
 });
 
 test('limitEcho never pretends to understand', () => {
@@ -795,7 +795,7 @@ test('resticOptions builds the repo url and the password file path from core', (
     // The options must be enough to build a real restic invocation.
     assert.deepEqual(Restic.buildArgs('snapshots', Ui.resticOptions(repo)),
         ['-r', 'sftp:backup@nas.lan:/vol/restic', '--password-file', '/etc/hangar/repos/nas.key',
-            '--json', 'snapshots']);
+            '--cache-dir', Restic.CACHE_DIR, '--json', 'snapshots']);
 });
 
 test('resticOptions refuses a repository whose id would escape its directory', () => {
@@ -1128,7 +1128,8 @@ test('a READ_ERRORS alert with nothing to list offers no dead button', () => {
 test('every remediation errors.js can emit reaches a component action', () => {
     // The rule is that a typed error becomes a button. A remediation with no
     // handler would be a button that does nothing.
-    const handled = ['unlock', 'init', 'reprompt', 'retry', 'list-unreadable', 'reauthorize'];
+    const handled = ['unlock', 'init', 'reprompt', 'retry', 'list-unreadable', 'reauthorize',
+        'grant-access'];
     for (const r of new Set(Object.values(Errors.REMEDIATION)))
         assert.ok(handled.includes(r) || r === 'free-space', 'unhandled remediation ' + r);
     // free-space has no one-click fix here, so it must at least still be labelled.
@@ -1956,7 +1957,7 @@ test('every remediation still reaches a real method on the list component', () =
     // is exactly what "reauthorize" did not for the row that needed it most.
     const c = Ui.hangarReposUi();
     const method = { unlock: 'unlock', init: 'initRepo', reprompt: 'reprompt',
-        retry: 'loadStats', reauthorize: 'reauthorize' };
+        retry: 'loadStats', reauthorize: 'reauthorize', 'grant-access': 'grantAccess' };
     for (const r of new Set(Object.values(Errors.REMEDIATION))) {
         if (r === 'list-unreadable' || r === 'free-space') continue;
         assert.equal(typeof c[method[r]], 'function', 'no handler for ' + r);

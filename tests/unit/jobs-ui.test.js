@@ -912,7 +912,10 @@ test('a job that cannot be read cannot be edited', async () => {
     });
     // ...and the markup disables the control rather than relying on the guard alone.
     assert.match(Jobs.SCREEN, /@click="edit\(row\)" :disabled="working \|\| row\.unreadable"/);
-    assert.match(Jobs.SCREEN, /@click="runNow\(row\)" :disabled="working \|\| !!run \|\| row\.unreadable"/);
+    // isRunning(row), not !!run: a backup started by the timer or from another
+    // tab must also stop this button offering to start a second one.
+    assert.match(Jobs.SCREEN,
+        /@click="runNow\(row\)" :disabled="working \|\| isRunning\(row\) \|\| row\.unreadable"/);
 });
 
 // --- backup outcomes -----------------------------------------------------
@@ -1525,6 +1528,23 @@ test('a negative byte count does not leave a dangling separator in the progress 
     assert.equal(progressLabel({ percent_done: 0.5, bytes_done: -1 }), '50%');
     assert.equal(progressLabel({ files_done: -3, bytes_done: 1024 }), '1 KiB');
     assert.equal(progressLabel({ percent_done: 0.5, bytes_done: 1024, total_bytes: 0 }), '50% · 1 KiB');
+});
+
+test('a failed run explains itself instead of naming an internal error kind', () => {
+    // "Failed (AUTH_EXPIRED)" was on screen in the jobs table: a user cannot act
+    // on an enum, and the Overview banner already had the sentence for it.
+    assert.equal(lastResultLabel({ status: 'failed', kind: 'AUTH_EXPIRED' }).text,
+        'Failed \u2014 the destination\'s sign-in has expired');
+    assert.equal(lastResultLabel({ status: 'failed', kind: 'REPO_LOCKED' }).text,
+        'Failed \u2014 the repository is locked');
+});
+
+test('an unrecognised kind degrades to plain Failed, never to the raw enum', () => {
+    for (const kind of ['GENERIC', 'SOMETHING_NEW', '', undefined, null])
+        assert.equal(lastResultLabel({ status: 'failed', kind: kind }).text, 'Failed',
+            JSON.stringify(kind));
+    // Inherited keys must not answer either.
+    assert.equal(lastResultLabel({ status: 'failed', kind: 'toString' }).text, 'Failed');
 });
 
 test('lastResultLabel survives a state object built by a hostile writer', () => {
@@ -3151,4 +3171,32 @@ test('a second unshowable source survives an edit rather than being dropped', ()
     assert.equal(back.sources.length, 3);
     assert.deepEqual(back.sources.slice(1), [job.sources[1], job.sources[2]]);
     assert.equal(back.sources[0].user, 'appuser');
+});
+
+// --- a run is a run, whoever started it -----------------------------------
+//
+// Found live: a backup started with `systemctl start` was invisible here — the
+// row said "Never run" while the Overview, reading the same systemd state, said
+// "Running now". This screen only knew about runs it had started itself.
+
+test('a job whose service is active reads as running, even if this tab did not start it', () => {
+    const c = Jobs.hangarJobsUi();
+    const row = { id: 'nightly', job: { id: 'nightly' },
+        unit: { service: { active: true }, timer: { active: true } } };
+    assert.equal(c.isRunning(row), true);
+    assert.equal(c.dotClass(row), 'running');
+});
+
+test('a run this tab started still counts, before systemd catches up', () => {
+    // runNow() sets `run` immediately; the unit takes a moment to go active.
+    const c = Jobs.hangarJobsUi();
+    c.run = { jobId: 'nightly' };
+    assert.equal(c.isRunning({ id: 'nightly', job: { id: 'nightly' } }), true);
+    assert.equal(c.isRunning({ id: 'other', job: { id: 'other' } }), false);
+});
+
+test('an idle job is not running, however incomplete its unit state', () => {
+    const c = Jobs.hangarJobsUi();
+    for (const unit of [undefined, null, {}, { service: null }, { service: { active: false } }])
+        assert.equal(c.isRunning({ id: 'n', job: { id: 'n' }, unit }), false, JSON.stringify(unit));
 });

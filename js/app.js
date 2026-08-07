@@ -34,6 +34,43 @@
             settings: null,
             error: null,
 
+            // Cockpit runs every page with limited access until the user turns
+            // administrative access on, and hangar's entire configuration lives
+            // in root-owned /etc/hangar. Without this the refusal was invisible:
+            // repositories, jobs and settings all read as "nothing configured
+            // yet", and a machine with a working repository was told it had none.
+            adminRequired: false,
+            adminChecking: false,
+
+            // A read of hangar's own configuration directory, used only to find out
+            // whether this session is allowed to make one. Cheap, and the only
+            // reliable signal available: cockpit.superuser is not exposed to pages.
+            async checkAdminAccess() {
+                const Config = root.HangarConfig;
+                if (!Config || typeof Config.listRepos !== 'function') return false;
+                this.adminChecking = true;
+                try {
+                    await Config.listRepos();
+                    this.adminRequired = false;
+                } catch (e) {
+                    this.adminRequired = (e && e.kind) === 'ADMIN_REQUIRED';
+                } finally {
+                    this.adminChecking = false;
+                }
+                return this.adminRequired;
+            },
+
+            // Offered next to the banner: the user grants access in Cockpit's own
+            // header, comes back, and presses this rather than reloading the page
+            // and losing whatever they were in the middle of.
+            async recheckAdminAccess() {
+                const was = this.adminRequired;
+                await this.checkAdminAccess();
+                if (was && !this.adminRequired)
+                    root.dispatchEvent(new CustomEvent('hangar:access-granted'));
+                return !this.adminRequired;
+            },
+
             // --- theming ------------------------------------------------------
             // Applied before anything else renders, so the page never flashes the
             // default palette and then repaint into the chosen one.
@@ -84,6 +121,7 @@
                     this.applyTheme(id);
                 });
 
+                await this.checkAdminAccess();
                 await this.refreshMissing();
 
                 // The prerequisite banner and the header chip are a view of the
@@ -91,6 +129,16 @@
                 // something claims to have changed it, or a successful install
                 // leaves the page still saying tools are missing.
                 root.addEventListener('hangar:provisioned', () => { this.refreshMissing(); });
+
+                // A dead end is worse than a dead control: when a screen has
+                // nothing to offer, it says which screen does and sends the user
+                // there rather than naming a tab and leaving them to find it.
+                root.addEventListener('hangar:recheck-access', () => { this.recheckAdminAccess(); });
+
+                root.addEventListener('hangar:go', (ev) => {
+                    const to = ev && ev.detail && ev.detail.tab;
+                    if (to && TABS.some(function (t) { return t.id === to; })) this.tab = to;
+                });
 
                 // Deliberately after the prerequisite probe and never blocking on it:
                 // an unreachable GitHub must not stop the plugin rendering.
@@ -150,6 +198,68 @@
     // Every DOM touch in this file goes through these two helpers. They no-op when
     // there is no document (under node) or no Bootstrap yet, so component logic
     // stays unit testable and a modal that failed to load cannot take the page down.
+    // --- selects whose options arrive late ---------------------------------
+    //
+    // Alpine binds x-model on a <select> while it walks that element, which is
+    // BEFORE the <template x-for> inside it has produced a single <option>.
+    // Assigning a value no option carries does nothing, so the browser keeps
+    // showing the first option and the control lies about what the component
+    // holds: the password dialog offered "Six words, six numbers" while its
+    // Shape box read "Two words, two numbers — weak".
+    //
+    // x-model still carries user input the other way, so re-applying the model
+    // whenever a select gains options is idempotent — and it fixes dialogs whose
+    // option lists are filled asynchronously long after the page loaded.
+
+    // Exported for the unit tests: pure decision, no DOM.
+    function selectNeedsSync(current, want, values) {
+        if (want === undefined || want === null) return false;
+        const target = String(want);
+        if (String(current) === target) return false;
+        // A model value no option carries is not a display bug to fix — blanking
+        // the box would hide the fact that the stored value is now unavailable.
+        return values.indexOf(target) >= 0;
+    }
+
+    function syncSelect(el) {
+        const expr = el.getAttribute('x-model');
+        const Alpine = root.Alpine;
+        if (!expr || !Alpine || typeof Alpine.evaluate !== 'function') return false;
+        let want;
+        try {
+            want = Alpine.evaluate(el, expr);
+        } catch (e) {
+            return false;                   // a scope that is gone is not ours to fix
+        }
+        const values = Array.prototype.map.call(el.options, (o) => o.value);
+        if (!selectNeedsSync(el.value, want, values)) return false;
+        el.value = String(want);
+        return true;
+    }
+
+    function watchLateOptions(doc) {
+        if (!doc || typeof root.MutationObserver !== 'function') return null;
+        const observer = new root.MutationObserver((records) => {
+            const seen = [];
+            for (const rec of records) {
+                const el = rec.target && rec.target.closest
+                    ? rec.target.closest('select[x-model]') : null;
+                if (el && seen.indexOf(el) < 0) seen.push(el);
+            }
+            seen.forEach(syncSelect);
+        });
+        observer.observe(doc.body, { childList: true, subtree: true });
+        // The options present at first paint arrived before the observer did.
+        Array.prototype.forEach.call(doc.querySelectorAll('select[x-model]'), syncSelect);
+        return observer;
+    }
+
+    if (root.document && typeof root.document.addEventListener === 'function') {
+        root.document.addEventListener('alpine:initialized', function () {
+            watchLateOptions(root.document);
+        });
+    }
+
     function showModal(id) {
         const el = root.document && root.document.getElementById(id);
         if (!el || !root.bootstrap) return null;
@@ -359,7 +469,13 @@
     root.hangarApp = hangarApp;
     root.hangarConfirm = hangarConfirm;
     root.hangarPassword = hangarPassword;
-    root.HangarDialogs = { confirmDialog, passwordDialog };
+    // MERGED, never replaced. HangarDialogs is a shared namespace: fspicker-ui.js
+    // adds pickPath to it, and app.js is the LAST script index.html loads — so a
+    // plain assignment here silently deleted pickPath and every Browse button in
+    // the plugin did nothing at all.
+    root.HangarDialogs = Object.assign({}, root.HangarDialogs || {},
+        { confirmDialog, passwordDialog });
     if (typeof module !== 'undefined' && module.exports)
-        module.exports = { hangarApp, hangarConfirm, hangarPassword, confirmDialog, passwordDialog, TABS };
+        module.exports = { hangarApp, hangarConfirm, hangarPassword, confirmDialog,
+            passwordDialog, TABS, selectNeedsSync };
 })(typeof window !== 'undefined' ? window : globalThis);

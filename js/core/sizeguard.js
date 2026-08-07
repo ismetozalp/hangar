@@ -71,10 +71,16 @@
     // Anchored with no nested quantifier, so it cannot backtrack on long input.
     const SIZE_RE = /^(-?)(\d+(?:\.\d+)?)[ \t]*([A-Za-z]{0,3})$/;
 
-    // Decimal, matching formatBytes() in js/features/logbook-ui.js. Duplicated
-    // rather than imported because core/ must not depend on features/ — the two
-    // are kept in step by tests, not by a shared reference.
-    const DISPLAY_UNITS = ['B', 'kB', 'MB', 'GB', 'TB', 'PB'];
+    // BINARY, matching formatBytes() in features/logbook-ui.js, overview.js and
+    // jobs-ui.js. Duplicated rather than imported because core/ must not depend on
+    // features/ — the two are kept in step by tests, not by a shared reference.
+    //
+    // PARSING is untouched: "1TB" still means 10^12 and "1TiB" still means 2^40,
+    // because that is what the user typed. Only the rendering is unified, which
+    // means a limit entered as 1TB now reads back as "931 GiB" — the same unit as
+    // the repository size it is being compared against, which is the whole point.
+    const DISPLAY_UNITS = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB', 'EiB'];
+    const DISPLAY_STEP = 1024;
 
     // parseSize returns a byte count, or null when the text is not a size.
     //
@@ -134,11 +140,11 @@
         // chain reaches exponential notation ('1e+285 PB'), which is not a size a
         // human reads and not a size a filesystem holds.
         const n = Math.min(raw, Number.MAX_SAFE_INTEGER);
-        if (n < 1000) return Math.round(n) + ' B';
+        if (n < DISPLAY_STEP) return Math.round(n) + ' B';
         let value = n;
         let unit = 0;
-        while (value >= 1000 && unit < DISPLAY_UNITS.length - 1) {
-            value /= 1000;
+        while (value >= DISPLAY_STEP && unit < DISPLAY_UNITS.length - 1) {
+            value /= DISPLAY_STEP;
             unit++;
         }
         const rounded = Math.round(value * 10) / 10;

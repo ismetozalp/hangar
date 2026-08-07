@@ -129,6 +129,9 @@
         'init': 'Initialise repository',
         'list-unreadable': 'Show unreadable files',
         'free-space': 'Show what to free',
+        // Cockpit's own header owns the switch; this page cannot flip it, so
+        // the button says where to look instead of pretending it can.
+        'grant-access': 'How to grant access',
         // Never 'Try again': a destination whose authorisation has lapsed answers
         // every retry the same way, so retrying is how the failure goes unnoticed.
         'reauthorize': 'Sign in again',
@@ -690,6 +693,11 @@
                     root.addEventListener('hangar:rclone-remote-reconnected', (ev) => {
                         this.remoteReconnected((ev && ev.detail) || {});
                     });
+                    // Sent by any screen that had nothing to offer — the job
+                    // dialog with no repository to back up to, for one. The user
+                    // asked to create one, so open the form rather than landing
+                    // them on a screen and making them find the button again.
+                    root.addEventListener('hangar:new-repository', () => { this.openAdd(); });
                 }
                 await this.refresh();
             },
@@ -706,6 +714,17 @@
                     try { await this.loadStats(row); } catch (e) { /* the row shows its own alert */ }
                 }
                 return rows.length;
+            },
+
+            // Every other screen keeps its own copy of the repository list, read
+            // once when that screen loaded. Without this, creating a repository
+            // here left the Jobs screen's list untouched — so "Create job" opened
+            // onto no destination at all, minutes after one was made.
+            announceChange() {
+                if (typeof root.dispatchEvent !== 'function' || typeof root.CustomEvent !== 'function')
+                    return false;
+                root.dispatchEvent(new root.CustomEvent('hangar:repos-changed'));
+                return true;
             },
 
             // Never rejects. x-init has nowhere to put a rejection, and a throw here
@@ -746,7 +765,14 @@
 
                 // Sizes are a per-repository network round trip; the table must not
                 // wait on the slowest backend before it renders anything.
-                rows.forEach((r) => { this.loadStats(r); });
+                //
+                // Deliberately `this.rows`, not the local `rows`: assigning an array
+                // to a component property hands Alpine the raw objects and gives back
+                // reactive proxies. loadStats mutates the row it is handed, and a
+                // write to a raw row updates the data while notifying nothing — the
+                // table would sit at "Reading repository…" with an em dash for a size
+                // until some unrelated change happened to re-render it.
+                this.rows.forEach((r) => { this.loadStats(r); });
             },
 
             existingIds(exceptId) {
@@ -835,6 +861,7 @@
                 } finally {
                     this.loading = false;
                     await this.refresh();
+                    this.announceChange();
                 }
             },
 
@@ -847,6 +874,7 @@
                 } finally {
                     row.busy = '';
                     await this.refresh();
+                    this.announceChange();
                 }
             },
 
@@ -886,6 +914,7 @@
                 } finally {
                     row.busy = '';
                     await this.refresh();
+                    this.announceChange();
                 }
             },
 
@@ -1022,6 +1051,16 @@
 
             // The remediation of a typed error is a button, and this is where the
             // button lands. Unmapped remediations simply expand the detail.
+            // The button behind ADMIN_REQUIRED. hangar cannot flip Cockpit's own
+            // switch from inside the page, so this asks the shell to re-check —
+            // the user turns access on in the header, presses this, and the screen
+            // reloads rather than the whole page.
+            async grantAccess() {
+                if (typeof root.dispatchEvent === 'function' && typeof root.CustomEvent === 'function')
+                    root.dispatchEvent(new root.CustomEvent('hangar:recheck-access'));
+                return this.refresh();
+            },
+
             async remediate(row) {
                 if (!row) return null;
                 const r = row.alert && row.alert.remediation;
@@ -1286,7 +1325,11 @@
     }
 
     const TEMPLATE = [
-        '<div x-data="hangarReposUi()" x-init="init()">',
+        // No x-init="init()": Alpine 3 calls init() itself when the x-data object
+        // defines one. Writing it out ran init TWICE — every listener registered
+        // twice, and a dialog that received its own open event twice resolved the
+        // caller's promise with null before the user had pressed anything.
+        '<div x-data="hangarReposUi()">',
         '  <div class="d-flex align-items-center gap-3 mb-3">',
         '    <h5 class="mb-0 flex-grow-1">Repositories</h5>',
         '    <button type="button" class="btn btn-sm btn-outline-secondary" @click="refresh()"',
@@ -1328,7 +1371,10 @@
 
         '  <div x-show="loading" class="text-secondary small mb-2" role="status">Loading…</div>',
 
-        '  <div x-show="!loading && rows.length === 0" class="hangar-empty">',
+        // `&& !alert`: an empty state may only render when the read SUCCEEDED.
+        // With limited access the listing is refused, and "No repositories yet."
+        // told a user with a working repository that they had none.
+        '  <div x-show="!loading && rows.length === 0 && !alert" class="hangar-empty">',
         '    <p class="mb-2">No repositories yet.</p>',
         '    <p class="small mb-3">A repository is where backups are stored — a folder on this',
         '       machine, a NAS over SFTP, or object storage.</p>',

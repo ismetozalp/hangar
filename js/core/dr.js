@@ -27,7 +27,26 @@
     // ReaR's own TARGET_FS_ROOT and changing it desynchronises the two.
     const TARGET_FS_ROOT = '/mnt/local';
 
-    const DEFAULT_OUTPUT_URL = 'file:///var/lib/rear/output';
+    // Where the rescue ISO lands when nothing is configured. /var/lib/rear/output
+    // is ReaR's own default and is a poor one for a person: it is root-only, easy
+    // to forget, and the one file you must be able to find and copy to a USB stick
+    // BEFORE the machine you built it on is unavailable. The home directory of the
+    // operator who asked for it is somewhere they can actually reach.
+    const DEFAULT_OUTPUT_DIR = '/var/lib/rear/output';
+
+    // Pure: the ReaR OUTPUT_URL for a home directory, or the old default when the
+    // home is unknown or unusable. ReaR takes a URL, not a path.
+    function outputUrlForHome(home) {
+        const dir = str(home).trim().replace(/\/+$/, '');
+        // Absolute, no traversal, and never '/': this string ends up in a config
+        // file that a rescue shell sources as root.
+        if (!dir || dir.charAt(0) !== '/' || dir === '/' || dir.split('/').indexOf('..') >= 0)
+            return 'file://' + DEFAULT_OUTPUT_DIR;
+        if (/[\u0000-\u001f'"\\]/.test(dir)) return 'file://' + DEFAULT_OUTPUT_DIR;
+        return 'file://' + dir;
+    }
+
+    const DEFAULT_OUTPUT_URL = 'file://' + DEFAULT_OUTPUT_DIR;
 
     // The repository password lives beside the repository definition. Duplicated
     // from the layout in docs/CONVENTIONS.md rather than imported, so core/dr.js
@@ -177,6 +196,12 @@
             if (hasCtrl(cfg.keyPath)) problems.push('Repository key path must not contain control characters.');
         }
 
+        if (!blank(cfg.excludeFile)) {
+            if (!/^\//.test(str(cfg.excludeFile))) problems.push('Exclude file must be an absolute path.');
+            else if (hasTraversal(cfg.excludeFile)) problems.push('Exclude file must not contain "..".');
+            if (hasCtrl(cfg.excludeFile)) problems.push('Exclude file must not contain control characters.');
+        }
+
         if (!blank(cfg.isoDefault) && ISO_DEFAULT_VALUES.indexOf(str(cfg.isoDefault)) < 0)
             problems.push('ISO_DEFAULT must be one of: ' + ISO_DEFAULT_VALUES.join(', ') + '.');
 
@@ -187,6 +212,16 @@
             // than a count of seconds.
             if (!Number.isSafeInteger(t) || t < 0)
                 problems.push('User input timeout must be a whole number of seconds.');
+        }
+
+        if (cfg.autoshrinkPercent !== undefined && cfg.autoshrinkPercent !== null
+                && str(cfg.autoshrinkPercent) !== '') {
+            const p = Number(cfg.autoshrinkPercent);
+            // A percentage of a disk size: above 100 is meaningless, and ReaR
+            // compares it against a byte difference, so a fraction would be
+            // silently truncated by the shell arithmetic it lands in.
+            if (!Number.isSafeInteger(p) || p < 0 || p > 100)
+                problems.push('Shrink limit must be a whole percentage between 0 and 100.');
         }
 
         return problems;
@@ -213,27 +248,70 @@
         return lines.join('\n');
     }
 
+    // Must equal CACHE_DIR in js/engine/restic.js; tests/smoke.mjs checks that.
+    const RESTIC_CACHE_DIR = '/var/cache/hangar/restic';
+
     function resticGlobalArgs(repoUrl, keyPath) {
         return ['restic', '--repo', repoUrl, '--password-file', keyPath];
     }
 
     function backupArgv(cfg, repoUrl, keyPath) {
-        const argv = resticGlobalArgs(repoUrl, keyPath).concat(['backup', '--tag', DR_TAG]);
+        // --cache-dir for the same reason every other hangar path passes it: this
+        // runs from ReaR, which is not a login shell, and restic exits 1 rather
+        // than backing anything up when it cannot place its cache.
+        const argv = resticGlobalArgs(repoUrl, keyPath)
+            .concat(['--cache-dir', RESTIC_CACHE_DIR, 'backup', '--tag', DR_TAG]);
+        // The same --exclude-file a backup job uses. A machine's exclusions are a
+        // property of the machine, not of one job: keeping them in one file means
+        // the disaster-recovery snapshot and the nightly one skip the same things,
+        // and editing the file changes both. Without this the DR path would happily
+        // include the hundreds of gigabytes a job was told to leave out.
+        if (!blank(cfg.excludeFile)) {
+            argv.push('--exclude-file');
+            argv.push(str(cfg.excludeFile));
+        }
         let excludes = Array.isArray(cfg.excludes) ? cfg.excludes.map(str) : DEFAULT_EXCLUDES.slice();
         // A local repository sitting inside the tree being backed up would be
         // fed its own growth on every run.
         if (str(cfg.repoKind) === 'local' && excludes.indexOf(repoUrl) < 0) excludes = excludes.concat([repoUrl]);
         excludes.forEach(function (e) { argv.push('--exclude'); argv.push(e); });
-        const paths = Array.isArray(cfg.backupPaths) && cfg.backupPaths.length
+        return argv.concat(backupPaths(cfg));
+    }
+
+    // Shared by both legs on purpose. The restore leg asks restic for the newest
+    // snapshot covering these paths, so if the two ever computed them
+    // differently, recovery would silently select the wrong snapshot.
+    function backupPaths(cfg) {
+        return Array.isArray(cfg.backupPaths) && cfg.backupPaths.length
             ? cfg.backupPaths.map(str) : DEFAULT_BACKUP_PATHS.slice();
-        return argv.concat(paths);
     }
 
     function restoreArgv(cfg, repoUrl, keyPath) {
-        const argv = resticGlobalArgs(repoUrl, keyPath).concat(['restore', 'latest']);
+        // --no-cache, not --cache-dir: this one runs inside the rescue system,
+        // where /var/cache/hangar does not exist and may not be creatable. restic
+        // refuses to start when it can neither find nor make a cache, and the one
+        // place that must never happen is a recovery. A cache would only have sped
+        // up a second run there, and there is no second run.
+        const argv = resticGlobalArgs(repoUrl, keyPath).concat(['--no-cache', 'restore', 'latest']);
         // Without --host, "latest" can select a snapshot written by a different
         // machine into the same repository and restore it onto this one.
         if (!blank(cfg.host)) { argv.push('--host'); argv.push(str(cfg.host)); }
+        // --host alone is not enough to identify the right snapshot. hangar keeps
+        // every job in one repository under one hostname, so "latest" is simply
+        // the newest snapshot ANY job wrote — and if a job backs up a subset,
+        // say /home, that subset becomes the thing a recovery restores. The
+        // result is a machine with no /usr and no /etc, reported as a success.
+        //
+        // restic: "snapshots must include all specified paths", so this asks for
+        // the newest snapshot that covers the same roots this config backs up.
+        //
+        // Deliberately NOT --tag hangar-dr, which is the tighter filter and the
+        // wrong one: EXTERNAL_BACKUP only runs during `rear mkbackup`, so an
+        // image built with `rear mkrescue` has no hangar-dr snapshot to find and
+        // recovery would fail outright with nothing to restore. Filtering by
+        // path accepts an ordinary scheduled backup, which is usually the most
+        // recent copy of this machine anyway.
+        backupPaths(cfg).forEach(function (p) { argv.push('--path'); argv.push(p); });
         argv.push('--target');
         argv.push(TARGET_FS_ROOT);
         return argv;
@@ -254,6 +332,10 @@
 
     function copyAsIs(cfg, keyPath) {
         const paths = [keyPath];
+        // The exclude file goes into the rescue system with the key: a rescue
+        // shell that reruns the backup step must be able to read the same
+        // exclusions, and a missing --exclude-file is a hard error in restic.
+        if (!blank(cfg.excludeFile)) paths.push(str(cfg.excludeFile));
         if (str(cfg.repoKind) === 'sftp') paths.push('/root/.ssh/');
         if (str(cfg.repoKind) === 'rclone') paths.push('/root/.config/rclone/');
         if (Array.isArray(cfg.extraCopyAsIs))
@@ -287,6 +369,28 @@
         out.push('OUTPUT=ISO');
         out.push('OUTPUT_URL=' + shQuote(outputUrl));
         out.push('');
+        // The rescue system talks to the serial port as well as the screen. On real
+        // hardware this costs nothing and helps anyone recovering over a BMC or a
+        // serial cable; in the drill it is the ONLY way hangar hears what happened,
+        // because a VM booted by virt-install has no screen anybody is watching.
+        //
+        // Without it the drill runs perfectly and reports nothing, which reads as a
+        // failure and is really a deaf observer.
+        out.push('USE_SERIAL_CONSOLE=1');
+        // `auto_recover` is what actually starts the restore, and on UEFI it has
+        // to be put here by hand. ReaR adds it for ISO_DEFAULT='automatic' only
+        // while writing the syslinux menu; the GRUB2 entry it builds for UEFI is
+        // plain `linux $kernel root=UUID=... $KERNEL_CMDLINE` with nothing added
+        // (lib/bootloader-functions.sh, create_grub2_rear_boot_entry). Without
+        // this the rescue system boots to a login prompt and waits forever.
+        //
+        // Deliberately not `unattended`, which reboots after a successful
+        // recovery: the drill VM boots the ISO first, so it would recover, boot
+        // the ISO again, and recover again — the endless cycle ReaR warns about
+        // in default.conf. `auto_recover` stops after the restore.
+        out.push('KERNEL_CMDLINE=' + shQuote('console=tty0 console=ttyS0,115200n8'
+            + (isoDefault === 'automatic' ? ' auto_recover' : '')));
+        out.push('');
         out.push('BACKUP=EXTERNAL');
         if (blank(cfg.backupUrl)) {
             out.push('# BACKUP_URL is unset on purpose: EXTERNAL_BACKUP and EXTERNAL_RESTORE move');
@@ -312,12 +416,73 @@
         out.push('# not exist at recovery time, and by then the restore cannot be retried.');
         out.push(arrayBlock('REQUIRED_PROGS+=', requiredProgs(cfg)));
         out.push(arrayBlock('COPY_AS_IS+=', copyAsIs(cfg, keyPath)));
+        // COPY_AS_IS alone does not get root's ssh key into the rescue system.
+        // ReaR defaults to SSH_FILES='avoid_sensitive_files', which copies only
+        // authorized_keys and known_hosts from /root/.ssh and drops every
+        // private key — sensible for a rescue image somebody might leave lying
+        // around, and fatal for an unattended restore over sftp: ssh finds no
+        // key, falls back to asking, and the recovery stops dead at
+        //
+        //   backup@nas.example's password:
+        //
+        // with no terminal to answer it. Naming the files explicitly is the one
+        // form ReaR treats as "copy exactly what is specified"
+        // (rescue/default/500_ssh.sh).
+        //
+        // This does mean the rescue image carries a key that can log into the
+        // backup server. It already carries the repository password, so the
+        // image must be handled as a secret either way.
+        if (str(cfg.repoKind) === 'sftp') {
+            out.push(arrayBlock('SSH_FILES=', ['/root/.ssh/']));
+            // And it still would not be there. ReaR copies the key, then
+            // build/default/501_check_ssh_keys.sh hunts through the rescue root
+            // for private keys with no passphrase and DELETES them, because
+            // SSH_UNPROTECTED_PRIVATE_KEYS defaults to 'no'.
+            //
+            // An unattended restore cannot type a passphrase, so the key it
+            // needs is necessarily unprotected. Keeping it is the only way the
+            // recovery can authenticate — and the reason the finished image has
+            // to be treated as a credential, not just a boot disk.
+            out.push("SSH_UNPROTECTED_PRIVATE_KEYS='yes'");
+        }
         out.push('');
         out.push('# Rescue system behaviour.');
         out.push('ISO_DEFAULT=' + shQuote(isoDefault));
+        // ISO_DEFAULT alone only steers the syslinux menu, which is what a BIOS
+        // machine boots. A UEFI machine boots the GRUB2 menu, and that reads two
+        // different variables — so a config carrying only ISO_DEFAULT boots UEFI
+        // hardware straight past the rescue system into the disk it was meant to
+        // rebuild. Both spellings are written so the ISO behaves the same either
+        // way it is booted.
+        //
+        // GRUB2_DEFAULT_BOOT defaults to "chainloader" ("Boot next EFI"), and
+        // GRUB2_TIMEOUT is set from USER_INPUT_TIMEOUT inside default.conf —
+        // which is sourced BEFORE this file, so setting USER_INPUT_TIMEOUT here
+        // never reaches it and the menu keeps GRUB's own 300s.
+        out.push('GRUB2_DEFAULT_BOOT=' + shQuote(isoDefault === 'boothd' ? 'chainloader' : 'rear'));
+        // Zero means opposite things to the two bootloaders. To syslinux it
+        // disables the countdown and waits for a human indefinitely; to GRUB it
+        // means boot the default at once without even showing the menu. Left
+        // untranslated, "wait for me" on a BIOS machine becomes "don't wait" on
+        // a UEFI one — which is the exact class of bug this block exists to fix.
+        // GRUB spells the indefinite wait -1.
+        out.push('GRUB2_TIMEOUT=' + shQuote(timeout > 0 ? String(timeout) : '-1'));
         if (!blank(cfg.isoPrefix)) out.push('ISO_PREFIX=' + shQuote(str(cfg.isoPrefix)));
         if (!blank(cfg.isoVolid)) out.push('ISO_VOLID=' + shQuote(str(cfg.isoVolid)));
         out.push('USER_INPUT_TIMEOUT=' + shQuote(String(timeout)));
+        // How much smaller a replacement disk may be before ReaR refuses to
+        // shrink the last partition. ReaR's default is 2%, which stops a
+        // recovery onto a disk that is merely a different model of "1 TB".
+        //
+        // Only written when the operator asked for it, because raising it is a
+        // real decision: ReaR shrinks the last PARTITION, and nothing else. If
+        // that partition holds LVM, the volumes inside are still recreated at
+        // their recorded sizes — the first one that does not fit is retried with
+        // '-l 100%FREE' and every volume after it fails outright. A disk that is
+        // substantially smaller needs a hand-adapted disklayout.conf, which is
+        // what ReaR's own documentation says.
+        if (!blank(cfg.autoshrinkPercent))
+            out.push('AUTOSHRINK_DISK_SIZE_LIMIT_PERCENTAGE=' + shQuote(String(Number(cfg.autoshrinkPercent))));
         out.push('# Without DHCP the rescue system has no route to a remote repository, and a');
         out.push('# restore that cannot reach the repository is not a recovery.');
         out.push('USE_DHCLIENT=' + shQuote(cfg.useDhclient === false ? 'no' : 'yes'));
@@ -400,13 +565,42 @@
         return s;
     }
 
+    // Where ReaR DELIVERED the image, which is not where it built it.
+    //
+    // ReaR always builds into its own output directory and then, if OUTPUT_URL
+    // points somewhere else, copies the result there — into a subdirectory named
+    // after the host. Its log says both:
+    //
+    //   Wrote ISO image: /var/lib/rear/output/rear-localhost.iso (905M)
+    //   Copying result files '/var/lib/rear/output/rear-localhost.iso …'
+    //       to /home/operator/localhost at file location
+    //
+    // hangar reported the first and sent people to a path that is not where their
+    // rescue image ended up. The copy destination wins when there is one: that is
+    // the file to put on a USB stick.
     function isoPathFrom(text) {
-        let found = null;
+        let built = null;
+        let deliveredDir = null;
         splitLines(text).forEach(function (raw) {
-            const m = /^Wrote ISO image:\s*(\S.*)$/.exec(strip(raw));
-            if (m) found = stripSize(m[1].trim());   // last one wins: a rerun supersedes
+            const line = strip(raw);
+            const wrote = /^Wrote ISO image:\s*(\S.*)$/.exec(line);
+            if (wrote) {
+                built = stripSize(wrote[1].trim());   // last one wins: a rerun supersedes
+                return;
+            }
+            // The quoted file list can contain anything, so the destination is
+            // read from the end of the line rather than by splitting on spaces.
+            const copied = /^Copying result files\b.*\bto\s+(\S.*?)(?:\s+at\s+\S+\s+location)?$/.exec(line);
+            if (copied) deliveredDir = copied[1].trim();
         });
-        return found === null || found === '' ? null : found;
+        if (built === null || built === '') return null;
+        if (!deliveredDir) return built;
+        // Only a plain local directory: a URL destination (nfs://, sftp://) is not
+        // a path anybody can open here, so the built file is the honest answer.
+        if (deliveredDir.charAt(0) !== '/') return built;
+        const name = built.slice(built.lastIndexOf('/') + 1);
+        if (!name) return built;
+        return deliveredDir.replace(/\/+$/, '') + '/' + name;
     }
 
     // ---------------------------------------------------------------- I/O layer
@@ -460,7 +654,8 @@
     }
 
     const HangarDr = {
-        LOCAL_CONF_PATH, TARGET_FS_ROOT, DEFAULT_OUTPUT_URL, DEFAULT_EXCLUDES,
+        LOCAL_CONF_PATH, TARGET_FS_ROOT, DEFAULT_OUTPUT_URL, DEFAULT_OUTPUT_DIR,
+        outputUrlForHome, DEFAULT_EXCLUDES,
         DEFAULT_BACKUP_PATHS, DR_TAG, ISO_DEFAULT_VALUES, REPO_KINDS, TAIL_LINES, PHASES,
         // pure
         shQuote, keyPathFor, validate, renderLocalConf, parseRearLog, isoPathFrom,

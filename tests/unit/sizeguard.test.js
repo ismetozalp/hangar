@@ -446,12 +446,12 @@ test('the unit table is frozen', () => {
 
 // ============================================================== formatSize
 
-test('formatSize uses the decimal convention the rest of hangar uses', () => {
+test('formatSize uses the binary convention the rest of hangar uses', () => {
     assert.equal(G.formatSize(999), '999 B');
-    assert.equal(G.formatSize(1000), '1 kB');
-    assert.equal(G.formatSize(1500), '1.5 kB');
-    assert.equal(G.formatSize(500e9), '500 GB');
-    assert.equal(G.formatSize(2.5e12), '2.5 TB');
+    assert.equal(G.formatSize(1024), '1 KiB');
+    assert.equal(G.formatSize(1536), '1.5 KiB');
+    assert.equal(G.formatSize(500e9), '465.7 GiB');
+    assert.equal(G.formatSize(2.5e12), '2.3 TiB');
 });
 
 test('formatSize matches formatBytes in js/features/logbook-ui.js', () => {
@@ -473,14 +473,25 @@ test('formatSize renders nothing rather than a fake size for junk', () => {
 });
 
 test('formatSize clamps instead of reaching exponential notation', () => {
-    assert.equal(G.formatSize(1e300), '9 PB');
-    assert.match(G.formatSize(Number.MAX_SAFE_INTEGER), /^[0-9.]+ PB$/);
+    assert.equal(G.formatSize(1e300), '8 PiB');
+    assert.match(G.formatSize(Number.MAX_SAFE_INTEGER), /^[0-9.]+ PiB$/);
 });
 
-test('formatSize round-trips the sizes a user is likely to type', () => {
-    ['500 GB', '1 TB', '250 GB', '2 TB'].forEach((text) => {
+test('a binary size a user types round-trips exactly', () => {
+    ['500 GiB', '1 TiB', '250 GiB', '2 TiB'].forEach((text) => {
         assert.equal(G.formatSize(G.parseSize(text)), text, text);
     });
+});
+
+test('a decimal size a user types is echoed in binary, not silently reinterpreted', () => {
+    // "1TB" still MEANS 10^12 — that is what was typed and what the guard
+    // enforces. It is displayed in GiB so it can be compared, by eye, with the
+    // repository size shown beside it. Showing "1 TB" next to "14.8 GiB" is what
+    // made three correct numbers look like a contradiction.
+    assert.equal(G.parseSize('1TB'), 1e12);
+    assert.equal(G.formatSize(1e12), '931.3 GiB');
+    assert.equal(G.parseSize('500GB'), 500e9);
+    assert.equal(G.formatSize(500e9), '465.7 GiB');
 });
 
 // ============================================================== DEFAULTS
@@ -789,14 +800,14 @@ test('a trim that succeeds ends in none, having deleted only what it needed to',
 test('describeOutcome names the snapshot and the overshoot when forgetting', () => {
     const s = G.describeOutcome(G.planTrim(over(2.3 * GB, FIVE, { minSnapshots: 1 })));
     assert.ok(s.indexOf('zzzz0001') >= 0, s);
-    assert.ok(s.indexOf('2.3 GB') >= 0, s);
+    assert.ok(s.indexOf('2.1 GiB') >= 0, s);   // 2.3 GB, rendered the way everything else is
     assert.ok(/oldest/.test(s), s);
 });
 
 test('describeOutcome is honest about a floor-reached run', () => {
     const s = G.describeOutcome(G.planTrim(over(40 * GB, [S1, S2, S3], { minSnapshots: 3 })));
     assert.ok(/^Stopped/.test(s), s);
-    assert.ok(s.indexOf('still 40 GB over') >= 0, s);
+    assert.ok(s.indexOf('still 37.3 GiB over') >= 0, s);
     assert.ok(/minimum/.test(s), s);
     assert.equal(/success|succeeded|within its size limit\./.test(s), false, s);
 });
@@ -805,7 +816,7 @@ test('describeOutcome is honest about an exhausted run', () => {
     const s = G.describeOutcome(G.planTrim(over(40 * GB, FIVE,
         { minSnapshots: 1, iterations: 20 })));
     assert.ok(/^Stopped/.test(s), s);
-    assert.ok(s.indexOf('still 40 GB over') >= 0, s);
+    assert.ok(s.indexOf('still 37.3 GiB over') >= 0, s);
 });
 
 test('describeOutcome distinguishes an empty repository from a floor', () => {
@@ -1245,7 +1256,7 @@ test('a floor-reached run never reads as a success', () => {
     ['floor', 'no-snapshots', 'undatable'].forEach((reason) => {
         const s = G.describeOutcome({ action: 'floor-reached', reason: reason, remaining: 40e9 });
         assert.match(s, /^Stopped:/, reason);
-        assert.match(s, /still 40 GB over/, reason);
+        assert.match(s, /still 37.3 GiB over/, reason);
         assert.equal(/within its size limit/.test(s), false, reason);
         assert.equal(/success|succeeded|completed/i.test(s), false, reason);
     });
@@ -1254,7 +1265,7 @@ test('a floor-reached run never reads as a success', () => {
 test('an exhausted run never reads as a success', () => {
     const s = G.describeOutcome({ action: 'exhausted', reason: 'budget', remaining: 12e9 });
     assert.match(s, /^Stopped after/);
-    assert.match(s, /still 12 GB over/);
+    assert.match(s, /still 11.2 GiB over/);
     assert.equal(/within its size limit/.test(s), false);
 });
 

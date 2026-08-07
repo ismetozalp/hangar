@@ -3,7 +3,12 @@
      itself is teleported into #hangar-recovery so the markup and the modal share
      one component instance — the drill needs the ISO path the build produced, and
      two x-data roots could not agree on it. -->
-<div x-data="hangarRecoveryUi()" x-init="init()">
+<!-- No x-init="init()" here: Alpine 3 calls init() by itself when the x-data
+     object defines one, so writing it out ran init TWICE — two listeners for
+     every event, and a dialog that received its own open event twice. The
+     second delivery resolved the caller's promise with null, so pressing Save
+     on a job closed the dialog and wrote nothing, in silence. -->
+<div x-data="hangarRecoveryUi()">
 
 <template x-teleport="#hangar-recovery">
 <div>
@@ -36,16 +41,30 @@
         <div class="row g-3">
             <div class="col-md-6">
                 <label class="form-label" for="hangar-dr-repo">Recover from repository</label>
-                <select id="hangar-dr-repo" class="form-select"
-                        x-model="form.repoId" @change="onRepoChange()">
-                    <option value="">Choose a repository…</option>
-                    <template x-for="r in repos" :key="r.id">
-                        <option :value="r.id" x-text="r.id + ' — ' + r.label"></option>
-                    </template>
-                </select>
-                <div class="form-text" x-show="!repos.length">
-                    No repositories are configured yet. Add one on the Repositories tab.
-                </div>
+
+                <!-- No empty dropdowns anywhere in hangar: a picker with nothing in
+                     it offers a choice that does not exist. When there is no
+                     repository, the control is replaced by the action that makes
+                     one. -->
+                <template x-if="repos.length">
+                    <select id="hangar-dr-repo" class="form-select"
+                            x-model="form.repoId" @change="onRepoChange()">
+                        <option value="">Choose a repository…</option>
+                        <template x-for="r in repos" :key="r.id">
+                            <option :value="r.id" x-text="r.id + ' — ' + r.label"></option>
+                        </template>
+                    </select>
+                </template>
+
+                <template x-if="!repos.length">
+                    <div class="hangar-empty py-3">
+                        <p class="mb-2">There is no repository yet.</p>
+                        <p class="small mb-3">Disaster recovery restores from a repository, so there
+                           has to be one before a rescue image can be configured.</p>
+                        <button type="button" class="btn btn-sm btn-primary"
+                                @click="goCreateRepository()">Create one now</button>
+                    </div>
+                </template>
             </div>
 
             <div class="col-md-6">
@@ -106,13 +125,36 @@
                 </div>
             </div>
 
+            <!-- The same exclude file a backup job uses. A machine's exclusions are
+                 a property of the machine, not of one job: pointing both at one file
+                 means the disaster-recovery snapshot skips what the nightly one
+                 skips, and editing the file changes both. -->
+            <div class="col-md-6">
+                <label class="form-label" for="hangar-dr-excludefile">Exclude file</label>
+                <div class="d-flex gap-2 align-items-start">
+                    <div class="flex-grow-1">
+                        <input id="hangar-dr-excludefile" class="form-control hangar-mono"
+                               x-model="form.excludeFile" spellcheck="false" autocomplete="off"
+                               placeholder="/home/you/excludes.txt">
+                        <div class="form-text">
+                            Optional. One pattern per line, passed to restic as
+                            <span class="hangar-mono">--exclude-file</span>. Use the same file as
+                            your backup job so both skip the same things.
+                        </div>
+                    </div>
+                    <button type="button" class="btn btn-outline-secondary text-nowrap align-self-start"
+                            @click="browsePath('excludeFile', { mode: 'file', title: 'Choose the exclude file' })"
+                            aria-label="Browse for the exclude file">Browse…</button>
+                </div>
+            </div>
+
             <div class="col-md-6">
                 <label class="form-label" for="hangar-dr-output">ISO output location</label>
                 <div class="d-flex gap-2 align-items-start">
                     <div class="flex-grow-1">
                         <input id="hangar-dr-output" class="form-control hangar-mono"
                            x-model="form.outputUrl" spellcheck="false" autocomplete="off"
-                           placeholder="file:///var/lib/rear/output">
+                           placeholder="file:///home/you">
                     </div>
                     <button type="button" class="btn btn-outline-secondary text-nowrap align-self-start"
                             @click="browsePath('outputUrl', { mode: 'dir', title: 'Choose where to write the rescue image' })" aria-label="Browse for the rescue image output folder">Browse…</button>
@@ -138,6 +180,23 @@
         <details class="mt-3">
             <summary>Advanced rescue-system options</summary>
             <div class="row g-3 mt-1">
+                <div class="col-md-6">
+                    <label class="form-label" for="hangar-dr-autoshrink">
+                        Allow the replacement disk to be smaller by (%)
+                    </label>
+                    <input id="hangar-dr-autoshrink" class="form-control" type="number"
+                           min="0" max="100" step="1" placeholder="ReaR's default: 2"
+                           x-model="form.autoshrinkPercent">
+                    <div class="form-text">
+                        Recovery recreates the original partition table, so it stops when the
+                        new disk is more than this much smaller than the original. Raising it
+                        lets ReaR shrink the <em>last</em> partition to fit — nothing else.
+                        If that partition holds LVM, the volumes inside are still recreated at
+                        their recorded sizes, so a substantially smaller disk needs a
+                        hand-adapted <code>disklayout.conf</code>. Leave empty to keep ReaR's 2%.
+                    </div>
+                </div>
+
                 <div class="col-md-6">
                     <label class="form-label" for="hangar-dr-copy">Extra files to copy into the rescue system</label>
                     <textarea id="hangar-dr-copy" class="form-control hangar-mono" rows="3"
@@ -234,6 +293,17 @@
         <!-- 2. Build ------------------------------------------------------- -->
         <h2 class="h5 mt-4">2. Build the rescue image</h2>
 
+        <!-- `rear mkrescue` reads /etc/rear/local.conf, not this form. Building with
+             unsaved changes produces an image from the OLD configuration, minutes
+             later, with nothing on screen to say so. -->
+        <div x-show="unwritten" class="alert alert-warning py-2 px-3 small" role="alert">
+            <strong>Write the configuration first.</strong>
+            <span class="hangar-mono">/etc/rear/local.conf</span> does not match the form above,
+            and <span class="hangar-mono">rear mkrescue</span> reads the file, not the form — so
+            this would build an image from the old configuration. Press
+            <strong>Write /etc/rear/local.conf</strong>, then build.
+        </div>
+
         <div class="d-flex align-items-center gap-2">
             <button type="button" class="btn btn-primary"
                     @click="build()" :disabled="building || !valid()">
@@ -313,6 +383,15 @@
                         x-show="remediation()" @click="applyRemediation()"
                         x-text="remediationLabel()"></button>
             </div>
+        </div>
+
+        <!-- A recorded image that is no longer there. Said plainly, because the
+             alternative is a screen that quietly forgets an image ever existed. -->
+        <div x-show="isoMissing" class="alert alert-warning py-2 px-3 small" role="status">
+            <strong>The rescue image is gone.</strong>
+            hangar built <span class="hangar-mono" x-text="isoMissing"></span>, and it is no
+            longer there. If you moved it to a USB stick, that is fine — build a new one here
+            when you want to verify recovery again.
         </div>
 
         <div x-show="iso" class="alert alert-success mt-3 mb-0" role="status">
@@ -409,6 +488,28 @@
                         <input id="hangar-drill-disk" class="form-control" type="number" min="1" max="65536" step="1"
                                x-model.number="drillOpts.diskGb">
                     </div>
+                    <!-- The libvirt pool is on / on a default install, which is the
+                         filesystem of the machine being tested. A drill disk big
+                         enough to hold its restore is big enough to fill it, and
+                         virt-install refuses rather than let that happen. -->
+                    <div class="col-md-6">
+                        <label class="form-label" for="hangar-drill-diskdir">Disk location</label>
+                        <div class="d-flex gap-2 align-items-start">
+                            <div class="flex-grow-1">
+                                <input id="hangar-drill-diskdir" class="form-control hangar-mono"
+                                       x-model="drillOpts.diskDir" spellcheck="false" autocomplete="off"
+                                       placeholder="/var/lib/libvirt/images">
+                                <div class="form-text">
+                                    Where the throwaway disk is created. Point it at a filesystem with
+                                    room for a full restore — not the one you are testing.
+                                </div>
+                            </div>
+                            <button type="button" class="btn btn-outline-secondary text-nowrap align-self-start"
+                                    @click="browsePath('diskDir', { mode: 'dir', bag: 'drillOpts', title: 'Choose where to create the drill disk' })"
+                                    aria-label="Browse for the drill disk location">Browse…</button>
+                        </div>
+                    </div>
+
                     <div class="col-md-3">
                         <label class="form-label" for="hangar-drill-sysgb">System size (GB)</label>
                         <input id="hangar-drill-sysgb" class="form-control" type="number" min="0" step="1"
@@ -433,6 +534,22 @@
                         <input id="hangar-drill-wait" class="form-control" type="number" min="1" max="1440" step="1"
                                x-model.number="drillOpts.timeoutMin">
                     </div>
+                </div>
+
+                <!-- The commonest reason a drill proves nothing: the image boots the
+                     hard disk, the VM has no screen to press a key on, and it waits
+                     until the timeout. Measured on a real host — 100% of a CPU and
+                     zero bytes written to the target disk, for ten minutes. -->
+                <div x-show="drillWillWait()" class="alert alert-warning py-2 px-3 small mt-3" role="alert">
+                    <strong>This image will not start recovery on its own.</strong>
+                    Its boot default is
+                    <span class="hangar-mono"
+                          x-text="form.isoDefault === 'manual' ? 'wait for a human' : 'boot the hard disk'"></span>,
+                    and the drill VM has no screen anyone can type at — so it will sit at the boot
+                    menu until it gives up. Set <strong>Rescue boot default</strong> to
+                    <strong>Recover automatically</strong> and rebuild to make this drill mean
+                    something. That setting is right for a drill and wrong for a rescue USB: one
+                    left in a running server should never start recovering by itself.
                 </div>
 
                 <div class="mt-3" x-show="plan().warnings.length" role="alert">

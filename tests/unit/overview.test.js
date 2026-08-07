@@ -469,7 +469,8 @@ test('sumStats: empty and malformed input is zero, not a crash', () => {
 test('statsArgv: asks restic for repository size on disk, not restore size', () => {
     const argv = O.statsArgv({ id: 'nas', kind: 'local', path: '/srv/backup' });
     assert.deepEqual(argv, ['restic', '-r', '/srv/backup',
-        '--password-file', '/etc/hangar/repos/nas.key', '--json', 'stats',
+        '--password-file', '/etc/hangar/repos/nas.key',
+        '--cache-dir', '/var/cache/hangar/restic', '--json', 'stats',
         '--mode', 'raw-data']);
 });
 

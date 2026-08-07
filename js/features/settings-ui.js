@@ -404,6 +404,9 @@
         'init': 'Initialise repository',
         'list-unreadable': 'Show unreadable files',
         'free-space': 'Show what to free',
+        // Cockpit's header owns the switch; hangar cannot flip it from a page,
+        // so the button says where to look rather than promising an escalation.
+        'grant-access': 'How to grant access',
         'reauthorize': 'Sign in again',
         'retry': 'Try again'
     };
@@ -761,7 +764,11 @@
     // boot.js injecting the modal partials.
 
     const TEMPLATE = [
-        '<div x-data="hangarSettingsUi()" x-init="init()">',
+        // No x-init="init()": Alpine 3 calls init() itself when the x-data object
+        // defines one. Writing it out ran init TWICE — every listener registered
+        // twice, and a dialog that received its own open event twice resolved the
+        // caller's promise with null before the user had pressed anything.
+        '<div x-data="hangarSettingsUi()">',
 
         '  <div class="d-flex align-items-center gap-2 mb-3">',
         '    <h2 class="h6 mb-0">Settings</h2>',

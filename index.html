@@ -11,7 +11,12 @@
 </head>
 <body>
 
-<div class="hangar-shell" x-data="hangarApp()" x-init="init()" x-cloak>
+<!-- No x-init="init()" here: Alpine 3 calls init() by itself when the x-data
+     object defines one, so writing it out ran init TWICE — two listeners for
+     every event, and a dialog that received its own open event twice. The
+     second delivery resolved the caller's promise with null, so pressing Save
+     on a job closed the dialog and wrote nothing, in silence. -->
+<div class="hangar-shell" x-data="hangarApp()" x-cloak>
 
     <!-- Header ---------------------------------------------------------- -->
     <div class="hangar-header d-flex align-items-center gap-3">
@@ -58,6 +63,26 @@
                     <div class="small" x-text="missingSummary()"></div>
                 </div>
                 <button class="btn btn-sm btn-primary" @click="openProvision()">Install</button>
+            </div>
+        </div>
+
+        <!-- Cockpit starts every session with limited access, and hangar cannot
+             read a single thing it owns without administrative access. Stated
+             once, at the top, because the alternative is six screens each
+             reporting that nothing is configured. -->
+        <div x-show="adminRequired" class="alert alert-warning">
+            <div class="d-flex align-items-center gap-3">
+                <div class="flex-grow-1">
+                    <strong>hangar needs administrative access.</strong>
+                    <div class="small">
+                        Its configuration lives in <span class="hangar-mono">/etc/hangar</span>, which
+                        only root can read, so repositories and jobs cannot be listed and nothing can
+                        be saved. Choose <strong>Limited access</strong> at the top right of Cockpit
+                        and turn on administrative access, then press Check again.
+                    </div>
+                </div>
+                <button class="btn btn-sm btn-primary" :disabled="adminChecking"
+                        @click="recheckAdminAccess()">Check again</button>
             </div>
         </div>
 

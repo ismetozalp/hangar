@@ -6,9 +6,14 @@
      The dialog validates but never writes: it resolves with the form state and
      js/features/jobs-ui.js performs every write, so there is exactly one place
      that touches /etc/hangar. -->
+<!-- No x-init="init()" here: Alpine 3 calls init() by itself when the x-data
+     object defines one, so writing it out ran init TWICE — two listeners for
+     every event, and a dialog that received its own open event twice. The
+     second delivery resolved the caller's promise with null, so pressing Save
+     on a job closed the dialog and wrote nothing, in silence. -->
 <div class="modal fade" id="hangar-job-edit" tabindex="-1"
      aria-labelledby="hangar-job-edit-title" aria-hidden="true"
-     x-data="hangarJobEdit()" x-init="init()">
+     x-data="hangarJobEdit()">
     <div class="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable">
         <div class="modal-content">
             <form @submit.prevent="submit()">
@@ -50,18 +55,34 @@
                     <!-- Destination --------------------------------------------- -->
                     <div class="mb-3">
                         <label class="form-label" for="hangar-job-repo">Repository</label>
-                        <select id="hangar-job-repo" class="form-select" x-model="form.repo"
-                                :aria-invalid="invalid('repo')" aria-describedby="hangar-job-repo-help">
-                            <option value="">Choose a repository…</option>
-                            <template x-for="r in repos" :key="r.id">
-                                <option :value="r.id" x-text="r.name || r.id"></option>
-                            </template>
-                        </select>
+
+                        <!-- An empty dropdown is a dead control: it offers a choice,
+                             opens onto nothing, and leaves the user to work out that
+                             the answer is somewhere else entirely. With no
+                             repositories the picker is replaced by the one action
+                             that can help. -->
+                        <template x-if="repos.length">
+                            <select id="hangar-job-repo" class="form-select" x-model="form.repo"
+                                    :aria-invalid="invalid('repo')" aria-describedby="hangar-job-repo-help">
+                                <option value="">Choose a repository…</option>
+                                <template x-for="r in repos" :key="r.id">
+                                    <option :value="r.id" x-text="r.name || r.id"></option>
+                                </template>
+                            </select>
+                        </template>
+
+                        <template x-if="!repos.length">
+                            <div class="hangar-empty py-3">
+                                <p class="mb-2">There is no repository yet.</p>
+                                <p class="small mb-3">A job needs somewhere to put the backup — a folder
+                                   on this machine, a NAS over SFTP, or object storage.</p>
+                                <button type="button" class="btn btn-sm btn-primary"
+                                        @click="goCreateRepository()">Create one now</button>
+                            </div>
+                        </template>
+
                         <div id="hangar-job-repo-help" class="form-text text-danger" x-show="invalid('repo')"
                              x-text="messageFor('repo')"></div>
-                        <div class="form-text" x-show="!repos.length">
-                            No repositories are configured yet. Create one on the Repositories tab first.
-                        </div>
                     </div>
 
                     <hr>
