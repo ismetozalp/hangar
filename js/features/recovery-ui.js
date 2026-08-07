@@ -765,6 +765,10 @@
             unwritten: false,
             drillRunning: false,
             runningPlan: null,
+            // Set only when a drill was told to keep its disk. It is the one
+            // thing hangar leaves on this machine, so it is also the one thing
+            // the screen keeps mentioning until it is gone.
+            keptDisk: '',
             // The guest's serial output, read from the file virt-install writes it
             // to. Kept apart from virt-install's own output so a tool error and a
             // guest message never overwrite one another.
@@ -1321,6 +1325,10 @@
                     try {
                         await this.cleanupDrill(plan);
                     } catch (e) { /* reported by drillCleaned staying false */ }
+                    // cleanupDrill has run, so anything still on disk is there
+                    // on purpose. Remember it: a 47 GB file nobody remembers is
+                    // exactly what "a drill leaves nothing behind" must prevent.
+                    this.keptDisk = (plan && plan.keepDisk) ? str(plan.diskPath) : '';
                 }
             },
 
@@ -1581,7 +1589,7 @@
             async closeDrill() {
                 const running = this.drillRunning;
                 this.hideDrill();
-                if (!running) return false;
+                if (!running) return this.offerToRemoveKeptDisk();
                 const D = root.HangarDialogs;
                 if (!D || typeof D.confirmDialog !== 'function') return false;
                 await D.confirmDialog({
@@ -1594,7 +1602,41 @@
                     cancelLabel: 'Leave it running'
                 });
                 await this.stopDrillGuest(this.runningPlan || { name: this.drillOpts.name });
+                await this.offerToRemoveKeptDisk();
                 return true;
+            },
+
+            // A separate question from stopping the VM, because they are
+            // separate decisions: one ends a drill, the other reclaims the
+            // space of a whole restored system.
+            async offerToRemoveKeptDisk() {
+                if (!this.keptDisk) return false;
+                const D = root.HangarDialogs;
+                if (!D || typeof D.confirmDialog !== 'function') return false;
+                await D.confirmDialog({
+                    title: 'Remove the drill disk?',
+                    message: 'Delete ' + str(this.keptDisk) + '.',
+                    detail: 'It was kept so the recovery log inside it could be read. '
+                        + 'Nothing else uses it, and it is as large as the system that '
+                        + 'was restored.',
+                    danger: true,
+                    confirmLabel: 'Remove it'
+                });
+                return this.removeKeptDisk();
+            },
+
+            async removeKeptDisk() {
+                const target = str(this.keptDisk);
+                if (!target || !hasCockpit() || typeof cockpit.spawn !== 'function') return false;
+                try {
+                    await cockpit.spawn(['rm', '-f', target],
+                        { superuser: 'require', err: 'message' });
+                    this.keptDisk = '';
+                    return true;
+                } catch (e) {
+                    this.setError(e);
+                    return false;
+                }
             },
 
             hideDrill() {

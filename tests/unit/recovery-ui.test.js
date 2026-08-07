@@ -2117,3 +2117,43 @@ test('the console log is removed either way', () => {
         assert.ok(p.cleanup.some((a) => a[0] === 'rm' && a.includes(p.consolePath)));
     });
 });
+
+// ------------------------------------------- not forgetting the kept disk
+//
+// Keeping the disk is opt-in, but forgetting it is not: it is as large as the
+// system that was restored. Closing the dialog is the moment to deal with it.
+
+test('closing offers to remove a disk the drill kept', async () => {
+    const c = hangarRecoveryUi();
+    c.drillRunning = false;
+    c.keptDisk = '/srv/drill/hangar-drill.qcow2';
+    let asked = null, removed = null;
+    global.HangarDialogs = { confirmDialog: async (o) => { asked = o; return true; } };
+    c.removeKeptDisk = async () => { removed = c.keptDisk; return true; };
+    c.hideDrill = () => {};
+    await c.closeDrill();
+    assert.ok(asked, 'the operator must be asked');
+    assert.match(asked.message, /hangar-drill\.qcow2/, 'and told which file');
+    assert.equal(removed, '/srv/drill/hangar-drill.qcow2');
+    delete global.HangarDialogs;
+});
+
+test('closing says nothing when the drill left nothing behind', async () => {
+    const c = hangarRecoveryUi();
+    c.drillRunning = false;
+    c.keptDisk = '';
+    let asked = false;
+    global.HangarDialogs = { confirmDialog: async () => { asked = true; return true; } };
+    c.hideDrill = () => {};
+    await c.closeDrill();
+    assert.equal(asked, false);
+    delete global.HangarDialogs;
+});
+
+test('the kept disk is remembered only when it was actually kept', () => {
+    const kept = drillPlan('/x/rear.iso', { libvirt: true, keepDisk: true });
+    const gone = drillPlan('/x/rear.iso', { libvirt: true });
+    assert.equal(kept.keepDisk, true);
+    assert.equal(gone.keepDisk, false);
+    assert.ok(kept.diskPath, 'the path is what the screen shows afterwards');
+});
