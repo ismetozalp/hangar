@@ -496,12 +496,25 @@
 
     // Decisive markers only, same discipline as core/dr.js: a line hangar does not
     // recognise leaves the outcome inconclusive rather than being read as success.
+    // What ReaR says when it is done. The wording is version-specific and there
+    // is no machine-readable result to parse, so several spellings are matched.
+    //
+    // The first entry used to be the ONLY success marker, and ReaR 2.9 never
+    // prints it: a drill that restored 47 GB and ended with "'rear recover'
+    // finished successfully" was reported as "no output hangar recognises".
+    // A recovery test that cannot recognise a recovery is worse than none,
+    // because it teaches the operator to ignore the verdict.
     const DRILL_MARKERS = [
         { re: /^Finished recovering your system/i,        outcome: 'recovered' },
+        { re: /^'?rear recover'? finished successfully/i, outcome: 'recovered' },
+        { re: /^Finished 'recover'\./i,                   outcome: 'recovered' },
         { re: /^Recovery is not possible/i,               outcome: 'failed' },
+        { re: /^'?rear recover'? failed with exit code/i, outcome: 'failed' },
+        { re: /^Aborting due to an error/i,               outcome: 'failed' },
         { re: /^(?:ERROR|BUG):/,                          outcome: 'failed' },
         { re: /Relax-and-Recover .*Rescue image/i,        outcome: 'booted' },
-        { re: /^Welcome to Relax-and-Recover/i,           outcome: 'booted' }
+        { re: /^Welcome to Relax-and-Recover/i,           outcome: 'booted' },
+        { re: /^Launching 'rear recover' automatically/i, outcome: 'booted' }
     ];
 
     const DRILL_OUTCOMES = ['inconclusive', 'booted', 'recovered', 'failed'];
@@ -735,6 +748,7 @@
             // does not match this form.
             unwritten: false,
             drillRunning: false,
+            runningPlan: null,
             // The guest's serial output, read from the file virt-install writes it
             // to. Kept apart from virt-install's own output so a tool error and a
             // guest message never overwrite one another.
@@ -1188,10 +1202,14 @@
                 }
 
                 this.drillRunning = true;
+                // Kept so "Stop the drill" and a close-while-running know which
+                // domain to destroy: the form can be edited while it runs.
+                this.runningPlan = plan;
                 this.guestLog = '';
                 let watch = null;
                 let toolLog = '';
                 let staged = null;
+                this.drillStopping = false;
                 try {
                     await this.prepareConsole(plan);
                     await this.prepareDiskDir(plan);
@@ -1237,6 +1255,14 @@
                                 this.guestLog = text;
                                 this.drillLog = joinLogs(toolLog, this.guestLog);
                                 this.drillResult = drillOutcome(this.drillLog);
+                                // The rescue system does not power off when it is
+                                // finished: it prints its verdict and offers a menu.
+                                // Waiting for virt-install to return therefore means
+                                // waiting out the ENTIRE timeout after the question
+                                // has already been answered — an hour of a machine
+                                // held for nothing. Once the log is decisive, stop.
+                                if (this.drillResult && this.drillResult.decisive)
+                                    this.stopDrillGuest(plan);
                             });
                         }, GUEST_POLL_MS);
                     }
@@ -1504,6 +1530,84 @@
             // A drill that leaves a domain and a 20 GB disk behind is not a drill,
             // it is a mess. Failures here are ignored on purpose: `destroy` on an
             // already-stopped domain is an error and means nothing.
+            // Ending a drill on purpose. Separate from stopDrillGuest, which is
+            // the automatic path: this one asks first, because a drill that is
+            // still restoring has work to lose.
+            //
+            // hangar's confirm dialog resolves ONLY when the operator accepts —
+            // cancelling leaves the promise pending for ever, which is why every
+            // destructive step in this file sits after the await rather than
+            // behind an `if`. Getting that backwards would delete on cancel.
+            async abortDrill() {
+                if (!this.drillRunning) return false;
+                const D = root.HangarDialogs;
+                if (!D || typeof D.confirmDialog !== 'function') return false;
+                await D.confirmDialog({
+                    title: 'Stop the drill?',
+                    message: 'Destroy the drill VM and remove its disk.',
+                    detail: 'Nothing on this machine is affected, but the drill will '
+                        + 'not be able to tell you whether recovery works.',
+                    danger: true,
+                    confirmLabel: 'Stop the drill'
+                });
+                await this.stopDrillGuest(this.runningPlan || { name: this.drill.name });
+                return true;
+            },
+
+            // The X and Close both come here. The dialog is hidden FIRST and the
+            // question asked after: closing is what the operator just asked for,
+            // and the question is only about the VM. Waiting for an answer that
+            // never comes — cancel does not resolve — would have pinned the
+            // dialog open on "leave it running".
+            //
+            // A drill outlives this dialog quite happily; reopening the screen
+            // picks it back up.
+            async closeDrill() {
+                const running = this.drillRunning;
+                this.hideDrill();
+                if (!running) return false;
+                const D = root.HangarDialogs;
+                if (!D || typeof D.confirmDialog !== 'function') return false;
+                await D.confirmDialog({
+                    title: 'The drill is still running',
+                    message: 'Stop it and remove the drill VM?',
+                    detail: 'Leave this alone and the drill keeps running in the '
+                        + 'background; the Recovery screen picks it up again.',
+                    danger: true,
+                    confirmLabel: 'Stop the drill',
+                    cancelLabel: 'Leave it running'
+                });
+                await this.stopDrillGuest(this.runningPlan || { name: this.drill.name });
+                return true;
+            },
+
+            hideDrill() {
+                const doc = root.document;
+                const el = doc && doc.getElementById('hangar-recovery-drill');
+                if (el && root.bootstrap)
+                    root.bootstrap.Modal.getOrCreateInstance(el).hide();
+            },
+
+            // Destroy the guest, once, without touching the disk or the
+            // domain definition — cleanupDrill still does that afterwards. This
+            // only ends the wait: `virt-install --wait` returns as soon as the
+            // domain is gone, so the normal finish-and-clean path runs exactly
+            // as it would have on a timeout.
+            async stopDrillGuest(plan) {
+                if (this.drillStopping) return false;
+                this.drillStopping = true;
+                if (typeof cockpit === 'undefined' || !cockpit.spawn) return false;
+                try {
+                    await cockpit.spawn(['virsh', 'destroy', drillName(plan.name)],
+                        { superuser: 'require', err: 'message' });
+                    return true;
+                } catch (e) {
+                    // Already gone, or libvirt refused: the timeout is still there
+                    // as a backstop, so this is not worth an alert.
+                    return false;
+                }
+            },
+
             async cleanupDrill(plan) {
                 const p = plan || this.plan();
                 if (!hasCockpit() || typeof cockpit.spawn !== 'function') return;

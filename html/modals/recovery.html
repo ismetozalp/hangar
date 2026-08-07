@@ -457,7 +457,10 @@
 
             <div class="modal-header">
                 <h5 class="modal-title" id="hangar-recovery-drill-title">Verify recovery</h5>
-                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                <!-- Not data-bs-dismiss: closing while a drill is running has to
+                     ask what to do with the VM, and bootstrap would have hidden
+                     the dialog before anyone could be asked. -->
+                <button type="button" class="btn-close" @click="closeDrill()" aria-label="Close"></button>
             </div>
 
             <div class="modal-body">
@@ -604,8 +607,14 @@
             </div>
 
             <div class="modal-footer">
-                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal"
-                        :disabled="drillRunning">Close</button>
+                <!-- me-auto: this is the destructive action, so it sits away from
+                     the two buttons a person reaches for by habit. Disabled when
+                     nothing is running, because there is then nothing to stop. -->
+                <button type="button" class="btn btn-outline-danger me-auto"
+                        @click="abortDrill()" :disabled="!drillRunning">
+                    Stop the drill
+                </button>
+                <button type="button" class="btn btn-secondary" @click="closeDrill()">Close</button>
                 <button type="button" class="btn btn-primary"
                         @click="runDrill()" :disabled="drillRunning || !plan().ok">
                     <span x-show="!drillRunning">Run the drill</span>

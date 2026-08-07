@@ -1981,3 +1981,107 @@ test('a sparse drill disk is not judged as if it were fully allocated', () => {
     assert.ok(argv.some((a) => /sparse=yes/.test(a)), 'and the disk really is sparse');
     assert.ok(!argv.includes('all=off'), 'only the size check is disabled, not every check');
 });
+
+// ---------------------------------------------- recognising a real recovery
+//
+// The success marker used to be "Finished recovering your system", which ReaR
+// 2.9 never prints. A drill that restored 47 GB and ended with "'rear recover'
+// finished successfully" was reported as "no output hangar recognises" — the
+// one feature whose entire purpose is to deliver a verdict, silently declining
+// to deliver it. These strings are copied from a real drill.
+
+test('a real ReaR 2.9 success is recognised as a recovery', () => {
+    [
+        "Finished 'recover'. The target system is mounted at '/mnt/local'.",
+        "'rear recover' finished successfully",
+        'Finished recovering your system'
+    ].forEach((line) => {
+        const r = drillOutcome('Launching rear recover automatically\n' + line);
+        assert.equal(r.outcome, 'recovered', 'not recognised: ' + line);
+        assert.equal(r.decisive, true);
+    });
+});
+
+test('a real ReaR 2.9 failure is recognised as a failure', () => {
+    [
+        "'rear recover' failed with exit code 143",
+        'Aborting due to an error, check /var/log/rear/rear-localhost.log for details',
+        'ERROR: Last partition /dev/sda3 cannot shrink'
+    ].forEach((line) => {
+        assert.equal(drillOutcome(line).outcome, 'failed', 'not recognised: ' + line);
+    });
+});
+
+// A rescue system that has merely booted is not a recovery, and must never be
+// reported as one.
+test('booting is still not recovering', () => {
+    const r = drillOutcome("Launching 'rear recover' automatically");
+    assert.equal(r.outcome, 'booted');
+    assert.equal(r.decisive, false);
+});
+
+test('a decisive verdict is what ends the wait', () => {
+    // The rescue system prints its verdict and then offers a menu — it never
+    // powers off — so `decisive` is the only signal that the drill can stop.
+    assert.equal(drillOutcome("'rear recover' finished successfully").decisive, true);
+    assert.equal(drillOutcome("'rear recover' failed with exit code 143").decisive, true);
+    assert.equal(drillOutcome('Welcome to Relax-and-Recover').decisive, false);
+});
+
+// ------------------------------------------------- stopping a running drill
+//
+// The rescue system never powers off, so a drill can outlive the dialog that
+// started it. Closing must therefore ask what to do with the VM — but only when
+// there is one, and never in a way that leaves the dialog pinned open.
+
+test('the stop button does nothing when no drill is running', async () => {
+    const c = hangarRecoveryUi();
+    c.drillRunning = false;
+    let asked = false;
+    global.HangarDialogs = { confirmDialog: async () => { asked = true; return true; } };
+    assert.equal(await c.abortDrill(), false);
+    assert.equal(asked, false, 'must not ask about a drill that is not running');
+    delete global.HangarDialogs;
+});
+
+test('closing with no drill running asks nothing and still closes', async () => {
+    const c = hangarRecoveryUi();
+    c.drillRunning = false;
+    let asked = false, hidden = false;
+    global.HangarDialogs = { confirmDialog: async () => { asked = true; return true; } };
+    c.hideDrill = () => { hidden = true; };
+    assert.equal(await c.closeDrill(), false);
+    assert.equal(asked, false);
+    assert.equal(hidden, true, 'the dialog must still close');
+    delete global.HangarDialogs;
+});
+
+// Order matters, and not for cosmetic reasons: hangar's confirm resolves only
+// on accept, so awaiting it before hiding would pin the dialog open for anyone
+// who chose "leave it running".
+test('closing during a drill hides the dialog first, then asks about the VM', async () => {
+    const order = [];
+    const c = hangarRecoveryUi();
+    c.drillRunning = true;
+    c.runningPlan = { name: 'drill' };
+    c.hideDrill = () => order.push('hidden');
+    c.stopDrillGuest = async () => { order.push('stopped'); return true; };
+    global.HangarDialogs = { confirmDialog: async () => { order.push('asked'); return true; } };
+    await c.closeDrill();
+    assert.deepEqual(order, ['hidden', 'asked', 'stopped']);
+    delete global.HangarDialogs;
+});
+
+test('the drill dialog cannot be dismissed behind hangar\'s back', () => {
+    const html = fs.readFileSync(path.join(ROOT, 'html/modals/recovery.html'), 'utf8');
+    // Comments stripped first: this file explains WHY the dismiss attribute is
+    // absent, and a naive search finds the explanation instead of the markup.
+    const drill = html.slice(html.indexOf('id="hangar-recovery-drill"'))
+        .replace(/<!--[\s\S]*?-->/g, '');
+    const header = drill.slice(0, drill.indexOf('</div>'));
+    assert.ok(!/data-bs-dismiss/.test(header),
+        'bootstrap would hide the dialog before anyone could be asked about the VM');
+    assert.match(drill, /@click="closeDrill\(\)"/);
+    assert.match(drill, /@click="abortDrill\(\)"[\s\S]*?:disabled="!drillRunning"/,
+        'the stop button must be disabled when there is nothing to stop');
+});
