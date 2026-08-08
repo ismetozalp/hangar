@@ -817,3 +817,79 @@ test('the runner answers no, rather than raising, for a stderr that is not text'
         assert.equal(Rclone.isAuthExpired(v), false);
     });
 });
+
+// Runs the helper for real against the stub host and returns its exit status.
+function runStub(host, jobId) {
+    try {
+        execFileSync('python3', [HELPER, jobId],
+            { env: host.env, encoding: 'utf8', stdio: 'pipe' });
+        return { code: 0, stderr: '' };
+    } catch (e) {
+        return { code: e.status, stderr: String(e.stderr || '') };
+    }
+}
+
+// ------------------------------------------------- prune waits out a lock
+//
+// restic locks the repository for almost everything, and `prune` needs an
+// EXCLUSIVE lock — so retention fails whenever anything else is touching the
+// repository. That something is usually ours: an open Hangar tab polls stats
+// and diff every few seconds, and a Logbook mount holds a lock for as long as
+// it is mounted. Failing outright means old snapshots quietly accumulate.
+
+// exit 11 is EXIT_REPO_LOCKED. Fails the forget twice, then lets it through.
+const RESTIC_STUB_LOCKED_TWICE = `#!/bin/sh
+echo "restic $*" >> "$HANGAR_TEST_CMD_LOG"
+for a in "$@"; do
+  if [ "$a" = forget ]; then
+    n=$(cat "$HANGAR_TEST_CMD_LOG.tries" 2>/dev/null || echo 0)
+    n=$((n + 1)); echo "$n" > "$HANGAR_TEST_CMD_LOG.tries"
+    if [ "$n" -le 2 ]; then
+      echo "unable to create lock in backend: repository is already locked" >&2
+      exit 11
+    fi
+    echo '[]'; exit 0
+  fi
+done
+echo '{"message_type":"summary","snapshot_id":"deadbeef","files_new":1,"data_added":1}'
+exit 0
+`;
+
+test('retention waits for a lock to clear instead of giving up', async () => {
+    const job = Object.assign({}, SIMPLE_JOB, { id: 'vols' });
+    await withStubHost(job, { restic: RESTIC_STUB_LOCKED_TWICE }, async (host) => {
+        host.env.HANGAR_PRUNE_LOCK_WAIT = '0';
+        const res = runStub(host, job.id);
+        assert.equal(res.code, 0, 'a lock that clears is not a failed backup: ' + res.stderr);
+        const forgets = host.commands().filter((c) => / forget /.test(c + ' '));
+        assert.equal(forgets.length, 3, 'two refusals then the one that worked');
+        const state = host.state();
+        assert.equal(state.status, 'ok');
+    });
+});
+
+// Only locks are worth waiting for. Anything else should fail at once rather
+// than sit there for two minutes repeating a command that cannot succeed.
+const RESTIC_STUB_FORGET_BROKEN = `#!/bin/sh
+echo "restic $*" >> "$HANGAR_TEST_CMD_LOG"
+for a in "$@"; do
+  if [ "$a" = forget ]; then
+    echo "Fatal: wrong password" >&2
+    exit 1
+  fi
+done
+echo '{"message_type":"summary","snapshot_id":"deadbeef","files_new":1,"data_added":1}'
+exit 0
+`;
+
+test('a retention failure that is not a lock is not retried', async () => {
+    const job = Object.assign({}, SIMPLE_JOB, { id: 'vols' });
+    await withStubHost(job, { restic: RESTIC_STUB_FORGET_BROKEN }, async (host) => {
+        host.env.HANGAR_PRUNE_LOCK_WAIT = '0';
+        const res = runStub(host, job.id);
+        assert.equal(res.code, 3, 'the documented exit for a failed prune');
+        const forgets = host.commands().filter((c) => / forget /.test(c + ' '));
+        assert.equal(forgets.length, 1, 'tried once, reported, stopped');
+        assert.equal(host.state().status, 'prune-failed');
+    });
+});

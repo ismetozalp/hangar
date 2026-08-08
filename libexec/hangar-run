@@ -1507,6 +1507,37 @@ def install_signal_handlers():
             pass
 
 
+# restic takes a lock for almost everything it does, and `prune` needs an
+# EXCLUSIVE one — so any other restic touching the repository makes retention
+# fail. The other restic is usually ours: an open Hangar tab polls `stats` and
+# `diff` every few seconds, and a Logbook mount holds a lock for as long as it
+# is mounted. Measured on a real repository: retention failed after a perfectly
+# good backup, night after night, purely because a browser tab was open.
+#
+# Failing outright is the wrong answer to a lock that will be gone in seconds.
+# Old snapshots then accumulate silently, which is the failure nobody notices
+# until a disk is full.
+#
+# Only lock errors are retried. Everything else fails at once, as it should.
+# Overridable so the tests can exercise the retry without waiting two minutes
+# for it. Not documented as a knob: the defaults are the behaviour.
+PRUNE_LOCK_RETRIES = int(os.environ.get("HANGAR_PRUNE_LOCK_RETRIES", "6"))
+PRUNE_LOCK_WAIT = float(os.environ.get("HANGAR_PRUNE_LOCK_WAIT", "20"))
+
+
+def forget_with_lock_retry(argv, env):
+    """Run the retention forget, waiting out a lock somebody else is holding."""
+    attempt = 0
+    while True:
+        code, summary, errors, stderr = stream_restic(argv, env, "forget")
+        if code != EXIT_REPO_LOCKED or attempt >= PRUNE_LOCK_RETRIES:
+            return code, summary, errors, stderr
+        attempt += 1
+        log("info", "repository is locked, waiting to prune",
+            attempt=attempt, of=PRUNE_LOCK_RETRIES, seconds=PRUNE_LOCK_WAIT)
+        time.sleep(PRUNE_LOCK_WAIT)
+
+
 def stream_restic(argv, env, label):
     """Run restic, folding its JSON-lines stream into a final summary.
 
@@ -1963,7 +1994,7 @@ def main(argv):
     }
 
     if plan["forget"]:
-        fcode, _fsummary, _ferrors, fstderr = stream_restic(plan["forget"], env, "forget")
+        fcode, _fsummary, _ferrors, fstderr = forget_with_lock_retry(plan["forget"], env)
         if fcode != 0:
             record["status"] = "prune-failed"
             record["prune_exit_code"] = fcode
