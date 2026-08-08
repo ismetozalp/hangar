@@ -701,11 +701,21 @@ test('mount: creates a private mount point, then hands the mount to systemd', as
     };
     try {
         const r = await L.mount({ repoId: 'main', repoUrl: '/srv/repo' });
-        assert.deepEqual(spawns[0].argv,
+        // A dead FUSE mount is cleared before anything stats the path: reading a
+        // mountpoint whose server has died returns ENOTCONN, and `install -d`
+        // reads it.
+        // By content, not by position: the sequence gained a stale-mount check
+        // and pinning indexes only teaches the next person to renumber them.
+        const cmds = spawns.map((sp) => sp.argv.join(' '));
+        const install = spawns.find((sp) => sp.argv[0] === 'install');
+        assert.deepEqual(install.argv,
             ['install', '-d', '-m', '0700', '-o', 'root', '-g', 'root', '/run/hangar/mnt/main']);
-        assert.equal(spawns[0].opts.superuser, 'require');
-        assert.equal(spawns[1].argv[0], 'systemd-run');
-        assert.equal(spawns[1].opts.superuser, 'require');
+        assert.equal(install.opts.superuser, 'require');
+        const run = spawns.find((sp) => sp.argv[0] === 'systemd-run');
+        assert.ok(run, 'and the unit is started');
+        assert.equal(run.opts.superuser, 'require');
+        assert.ok(cmds.indexOf(install.argv.join(' ')) < cmds.indexOf(run.argv.join(' ')),
+            'the directory exists before the mount is asked for');
         assert.deepEqual(r, { unit: 'hangar-mount-main.service', mountPoint: '/run/hangar/mnt/main' });
     } finally {
         delete globalThis.cockpit;
@@ -1520,12 +1530,18 @@ test('I/O: a hostile mount point is refused before anything is spawned', async (
     }
 });
 
-test('mount: both spawns are privileged and ask for message-shaped errors', async () => {
+test('mount: every spawn is privileged and asks for message-shaped errors', async () => {
     const spawns = [];
-    globalThis.cockpit = { spawn(argv, opts) { spawns.push({ argv, opts }); return Promise.resolve(''); } };
+    globalThis.cockpit = {
+        file: () => ({ read: () => Promise.resolve('') }),
+        spawn(argv, opts) { spawns.push({ argv, opts }); return Promise.resolve(''); }
+    };
     try {
         await L.mount({ repoId: 'main', repoUrl: '/srv/repo' });
-        assert.equal(spawns.length, 2);
+        // Not a fixed count: the sequence is allowed to grow, but nothing in it
+        // may reach the system unprivileged or with an error shape the caller
+        // cannot read.
+        assert.ok(spawns.length >= 2, 'the directory and the unit, at least');
         spawns.forEach((s) => {
             assert.equal(s.opts.superuser, 'require');
             assert.equal(s.opts.err, 'message');
@@ -1761,4 +1777,105 @@ test('the mount unit passes a cache directory, matching the engine', () => {
     assert.equal(argv[i + 1], Restic.CACHE_DIR);
     // A global flag, so it must precede the subcommand.
     assert.ok(i < argv.indexOf('mount'));
+});
+
+// ---------------------------------------------- a mount that died badly
+//
+// When the restic process behind a FUSE mount dies without unmounting — a
+// stopped unit, a killed process — the kernel keeps the mountpoint and every
+// access returns ENOTCONN. Seen on a real machine: `restic mount` then failed
+// with "mountpoint is inaccessible" on every attempt afterwards.
+//
+// The check reads /proc/mounts, because everything that stats the path fails
+// the same way the mount does — `mountpoint -q` included, which is why an
+// earlier version of this fix never fired at all.
+
+function cockpitWithMounts(mounts, onSpawn) {
+    return {
+        file: (p) => ({ read: () => Promise.resolve(p === '/proc/mounts' ? mounts : '') }),
+        spawn: (argv) => (onSpawn ? onSpawn(argv) : Promise.resolve(''))
+    };
+}
+
+const STALE = 'restic:beee5a3e4e /run/hangar/mnt/main fuse ro,nosuid,nodev 0 0\n';
+
+test('a stale mountpoint is cleared before the path is touched', async () => {
+    const spawns = [];
+    globalThis.cockpit = cockpitWithMounts(STALE, (argv) => {
+        spawns.push(argv.join(' '));
+        return Promise.resolve('');
+    });
+    try {
+        await L.mount({ repoId: 'main', repoUrl: '/srv/repo' });
+        assert.equal(spawns[0], 'fusermount -u /run/hangar/mnt/main');
+        assert.ok(spawns.some((c) => c.startsWith('install -d')),
+            'and only then is the directory prepared');
+        assert.ok(spawns.indexOf('fusermount -u /run/hangar/mnt/main')
+            < spawns.findIndex((c) => c.startsWith('install -d')));
+    } finally {
+        delete globalThis.cockpit;
+    }
+});
+
+test('a path with no mount behind it is left alone', async () => {
+    const spawns = [];
+    globalThis.cockpit = cockpitWithMounts('/dev/sda1 /boot xfs rw 0 0\n', (argv) => {
+        spawns.push(argv.join(' '));
+        return Promise.resolve('');
+    });
+    try {
+        await L.mount({ repoId: 'main', repoUrl: '/srv/repo' });
+        assert.ok(!spawns.some((c) => c.startsWith('fusermount')));
+        assert.ok(!spawns.some((c) => c.startsWith('umount')));
+    } finally {
+        delete globalThis.cockpit;
+    }
+});
+
+// A path that merely contains the mount point is a different path.
+test('a similar path is not mistaken for the mount point', async () => {
+    const spawns = [];
+    globalThis.cockpit = cockpitWithMounts(
+        'restic:x /run/hangar/mnt/main-other fuse ro 0 0\n', (argv) => {
+            spawns.push(argv.join(' '));
+            return Promise.resolve('');
+        });
+    try {
+        await L.mount({ repoId: 'main', repoUrl: '/srv/repo' });
+        assert.ok(!spawns.some((c) => c.startsWith('fusermount')));
+    } finally {
+        delete globalThis.cockpit;
+    }
+});
+
+test('a system without fusermount still gets its mount cleared', async () => {
+    const spawns = [];
+    globalThis.cockpit = cockpitWithMounts(STALE, (argv) => {
+        spawns.push(argv.join(' '));
+        if (argv[0] === 'fusermount') return Promise.reject(new Error('not found'));
+        return Promise.resolve('');
+    });
+    try {
+        await L.mount({ repoId: 'main', repoUrl: '/srv/repo' });
+        assert.ok(spawns.some((c) => c === 'umount -l /run/hangar/mnt/main'),
+            'lazily, because a stale mount can still hold references');
+    } finally {
+        delete globalThis.cockpit;
+    }
+});
+
+// Clearing is best-effort: a mount must not fail because the cleanup of a
+// previous one did.
+test('a mount is not failed by an unclearable path', async () => {
+    globalThis.cockpit = cockpitWithMounts(STALE, (argv) => {
+        if (argv[0] === 'fusermount' || argv[0] === 'umount')
+            return Promise.reject(new Error('device is busy'));
+        return Promise.resolve('');
+    });
+    try {
+        const r = await L.mount({ repoId: 'main', repoUrl: '/srv/repo' });
+        assert.equal(r.mountPoint, '/run/hangar/mnt/main');
+    } finally {
+        delete globalThis.cockpit;
+    }
 });

@@ -687,6 +687,45 @@
         return attempt();
     }
 
+    // Is the kernel still holding a mountpoint nobody is serving?
+    //
+    // Asked of /proc/mounts, never of the path itself. Everything that stats a
+    // stale FUSE mount fails with ENOTCONN — including `mountpoint -q`, which
+    // reports "not a mountpoint" for exactly the mounts this needs to find, and
+    // including the `install -d` below. /proc/mounts is a kernel table: reading
+    // it touches no filesystem and cannot hang.
+    //
+    // Nothing here may fail a mount. A path that is not stale, or a system
+    // without fusermount, must simply carry on.
+    function clearStaleMount(point) {
+        return Promise.resolve().then(() => {
+            if (!hasCockpit() || typeof cockpit.spawn !== 'function') return false;
+            if (typeof cockpit.file !== 'function') return false;
+            return cockpit.file('/proc/mounts').read()
+                .then((text) => {
+                    const target = str(point);
+                    const listed = str(text).split('\n').some((line) => {
+                        // "<source> <mountpoint> <type> <options> 0 0", and the
+                        // kernel escapes spaces as \040 — our paths have none,
+                        // but split on whitespace rather than searching, so a
+                        // path that merely CONTAINS this one cannot match.
+                        const field = line.split(' ')[1];
+                        return field === target;
+                    });
+                    if (!listed) return false;
+                    const run = (argv) => cockpit.spawn(argv,
+                        { superuser: 'require', err: 'message' });
+                    return run(['fusermount', '-u', target])
+                        // -l, because a stale mount can still hold references and
+                        // a plain umount would refuse: the point is only to stop
+                        // the kernel answering ENOTCONN on this path.
+                        .catch(() => run(['umount', '-l', target]).catch(() => null))
+                        .then(() => true);
+                })
+                .catch(() => false);
+        });
+    }
+
     function mount(opts) {
         return Promise.resolve().then(() => {
             const o = opts || {};
@@ -698,8 +737,16 @@
             if (!hasCockpit() || typeof cockpit.spawn !== 'function') throw noCockpit('mount');
             // 0700 root:root before the mount: an unprivileged process must not
             // be able to sit in the mount point directory and watch a restore.
-            return cockpit.spawn(['install', '-d', '-m', MOUNT_DIR_MODE, '-o', 'root', '-g', 'root', point],
-                { superuser: 'require', err: 'message' })
+            // Clear a dead mount before touching the path at all. When the restic
+            // process behind a FUSE mount dies without unmounting — the unit was
+            // stopped, the machine was busy, anything — the KERNEL keeps the
+            // mountpoint and every access to it returns ENOTCONN. `install -d`
+            // below stats that path, so without this the next mount fails on the
+            // wreckage of the last one, for ever, and the only cure is a hand-run
+            // fusermount. Observed exactly that: "mountpoint is inaccessible".
+            return clearStaleMount(point)
+                .then(() => cockpit.spawn(['install', '-d', '-m', MOUNT_DIR_MODE, '-o', 'root', '-g', 'root', point],
+                    { superuser: 'require', err: 'message' }))
                 .then(() => cockpit.spawn(argv, { superuser: 'require', err: 'message' }))
                 .then(() => ({ unit: mountUnitService(repoId), mountPoint: point }))
                 .catch((e) => { throw ioError(e, 'mount'); });
@@ -740,6 +787,7 @@
         MOUNT_ROOT, MOUNT_UNIT_PREFIX, SNAPSHOT_DIR, MOUNT_DIR_MODE,
         GRANULARITY, WINDOWS, BADGE,
         // pure
+        clearStaleMount,
         buildTimeline, granularityFor, bucketStart, bucketKey, bandLabel,
         snapshotTimestampDir, snapshotPath,
         diffToBadges, badgeForModifier,
