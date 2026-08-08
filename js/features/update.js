@@ -84,7 +84,7 @@
     }
 
     function blankState() {
-        return { checking: false, available: false, error: '', version: '', tag: '', assetUrl: '', notes: '', prerelease: false };
+        return { checking: false, available: false, error: '', version: '', tag: '', assetUrl: '', notes: '', prerelease: false, none: false };
     }
 
     // ---------------------------------------------------------------- I/O
@@ -148,10 +148,33 @@
                 this.update = Object.assign(blankState(), { checking: true });
                 try {
                     // NOT fetch(): CSP connect-src 'self' blocks api.github.com.
-                    const out = await spawn(['curl', '-fsSL', '--max-time', '20',
+                    //
+                    // Deliberately not `-f`. With it, curl exits non-zero on any
+                    // HTTP error and the status is lost, so a repository that has
+                    // simply never published a release — GitHub answers 404 for
+                    // releases/latest — was reported as "Update check failed",
+                    // indistinguishable from a broken network. The status code is
+                    // appended on its own line instead and read back here.
+                    const out = await spawn(['curl', '-sSL', '--max-time', '20',
+                        '-w', '\n%{http_code}',
                         '-H', 'Accept: application/vnd.github+json', '--', api]);
-                    const rel = parseRelease(out, this.installedVersion || '0.0.0');
-                    this.update = Object.assign(blankState(), rel, { checking: false });
+                    const raw = String(out);
+                    const cut = raw.lastIndexOf('\n');
+                    const status = (cut >= 0 ? raw.slice(cut + 1) : raw).trim();
+                    const body = cut >= 0 ? raw.slice(0, cut) : '';
+
+                    if (status === '404') {
+                        // Not an error: there is nothing to update TO. Said plainly
+                        // so nobody goes looking for a fault that is not there.
+                        this.update = Object.assign(blankState(), { none: true });
+                    } else if (status !== '200') {
+                        this.update = Object.assign(blankState(), {
+                            error: 'GitHub answered HTTP ' + (status || '(no status)')
+                        });
+                    } else {
+                        const rel = parseRelease(body, this.installedVersion || '0.0.0');
+                        this.update = Object.assign(blankState(), rel, { checking: false });
+                    }
                 } catch (e) {
                     this.update = Object.assign(blankState(), {
                         error: (e && e.message) || String(e)
@@ -253,6 +276,8 @@
                 if (this.update.error) return 'Update check failed: ' + this.update.error + ' — click to try again';
                 if (this.update.available)
                     return 'Version ' + this.update.version + ' is available — click to install';
+                if (this.update.none)
+                    return 'That repository has published no releases yet. Click to check again.';
                 if (!this.updateRepo) return 'Set a GitHub repository in Settings to check for updates';
                 if (this.checkedAt) return 'No update found. Click to check again.';
                 return 'Click to check for updates';

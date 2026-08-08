@@ -355,10 +355,13 @@ async function main() {
 
         // ---- self-update badge
         {
+            // The trailing status line is what `curl -w '%{http_code}'` appends,
+            // and hangar reads it to tell "no releases yet" (404) from a real
+            // failure. A stub that omits it is not standing in for curl.
             const release = JSON.stringify({
                 tag_name: 'v9.9.9', body: 'notes', prerelease: false,
                 assets: [{ name: 'hangar-9.9.9.zip', browser_download_url: 'https://github.com/o/r/releases/download/v9.9.9/hangar-9.9.9.zip' }]
-            });
+            }) + '\n200';
             const { ctx, page } = await open(browser, {
                 spawn: Object.assign({}, DEFAULT_STUB.spawn, { 'api.github.com': release }),
                 files: Object.assign({}, DEFAULT_STUB.files, {
@@ -395,7 +398,7 @@ async function main() {
 
         // ---- current version shown when up to date
         {
-            const release = JSON.stringify({ tag_name: 'v0.0.1', assets: [] });
+            const release = JSON.stringify({ tag_name: 'v0.0.1', assets: [] }) + '\n200';
             const { ctx, page } = await open(browser, {
                 spawn: Object.assign({}, DEFAULT_STUB.spawn, { 'api.github.com': release }),
                 files: Object.assign({}, DEFAULT_STUB.files, {

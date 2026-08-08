@@ -5,6 +5,24 @@ All notable changes to the Hangar Cockpit plugin are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] — 2026-08-08
+
+### Fixed
+
+- **The Logbook could be wedged by a mount that died.** When the restic process
+  behind a FUSE mount ends without unmounting — a stopped unit, a killed
+  process — the kernel keeps the mountpoint and every access to it returns
+  ENOTCONN. Each new mount then failed on the remains of the last one, and the
+  Logbook fell back to its slower reader indefinitely; the only cure was a
+  hand-run `fusermount -u`. A dead mountpoint is now cleared before mounting.
+  Detection reads `/proc/mounts`, because anything that stats the path fails the
+  same way the mount does.
+- **A repository with no releases reported "Update check failed".** GitHub
+  answers 404 for `releases/latest` until something is published, and `curl -f`
+  turned that into an exit code with no status attached — indistinguishable from
+  a broken network. The check now reads the status and says plainly that nothing
+  has been published yet.
+
 ## [1.0.0] — 2026-08-08
 
 First stable release. File-level backup with automatic retention thinning, a

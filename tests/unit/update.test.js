@@ -366,3 +366,61 @@ test('badgeClass marks an available update and a failed check differently', () =
     c.update = Object.assign(U.blankState(), { error: 'x' });
     assert.match(c.badgeClass(), /failed/);
 });
+
+// ------------------------------------------------- a repo with no releases
+//
+// GitHub answers 404 for releases/latest when a repository has never published
+// one. With `curl -f` that is exit 22 and the status is lost, so a brand-new
+// repository reported "Update check failed" — a fault where there is none.
+
+test('a repository with no releases is not a failed check', async () => {
+    const c = U.hangarUpdateUi();
+    c.installedVersion = '1.0.0';
+    let argv = null;
+    globalThis.cockpit = {
+        spawn(a) { argv = a; return Promise.resolve('{"message":"Not Found"}\n404'); }
+    };
+    try {
+        await c.checkForUpdate(true, { updateRepo: 'someone/fresh' });
+        assert.equal(c.update.none, true, 'said plainly, not reported as broken');
+        assert.equal(c.update.error, '', 'and it is NOT an error');
+        assert.equal(c.update.available, false);
+        assert.ok(!argv.includes('-fsSL'),
+            'curl -f throws the status away, which is how this was missed');
+        assert.ok(argv.includes('-w') && argv.includes('\n%{http_code}'));
+    } finally {
+        delete globalThis.cockpit;
+    }
+});
+
+test('a published release is still read normally', async () => {
+    const c = U.hangarUpdateUi();
+    c.installedVersion = '1.0.0';
+    const body = JSON.stringify({
+        tag_name: 'v1.1.0',
+        assets: [{ name: 'hangar-1.1.0.zip', browser_download_url: 'https://github.com/a/b/x.zip' }]
+    });
+    globalThis.cockpit = { spawn() { return Promise.resolve(body + '\n200'); } };
+    try {
+        await c.checkForUpdate(true, { updateRepo: 'a/b' });
+        assert.equal(c.update.available, true);
+        assert.equal(c.update.version, '1.1.0');
+        assert.equal(c.update.none, false);
+        assert.equal(c.update.error, '');
+    } finally {
+        delete globalThis.cockpit;
+    }
+});
+
+test('a real HTTP failure is still an error, and says which', async () => {
+    const c = U.hangarUpdateUi();
+    c.installedVersion = '1.0.0';
+    globalThis.cockpit = { spawn() { return Promise.resolve('<html>oops</html>\n503'); } };
+    try {
+        await c.checkForUpdate(true, { updateRepo: 'a/b' });
+        assert.match(c.update.error, /503/);
+        assert.equal(c.update.none, false);
+    } finally {
+        delete globalThis.cockpit;
+    }
+});
