@@ -5,6 +5,20 @@ All notable changes to the Hangar Cockpit plugin are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.4] — 2026-08-09
+
+### Fixed
+
+- **The update badge kept offering an update that had already been installed.**
+  The installed version was read once when the screen loaded and cached, but
+  this screen can update the plugin in place — which changes the served files
+  without reloading the tab. Every later check compared a fresh release against
+  that stale value, so the badge went on saying "Update to X" after X was
+  running, until the page was reloaded. A check now re-reads the version it is
+  actually serving before comparing. An unreadable VERSION leaves the known
+  value alone rather than falling back to 0.0.0, which would make every release
+  look newer.
+
 ## [1.0.3] — 2026-08-09
 
 ### Fixed

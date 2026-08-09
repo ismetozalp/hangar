@@ -145,6 +145,20 @@
                     return this.update;
                 }
 
+                // Re-read what is installed, every time. The value is cached at
+                // init, and a plugin updated IN PLACE — by this very screen —
+                // changes the served files without reloading the tab. Comparing
+                // a fresh release against a stale local version reports an
+                // update that has already been applied, and the badge kept
+                // offering it until somebody reloaded the page.
+                //
+                // The served VERSION file is the right source: it is whatever
+                // this page is actually running, which is the question being
+                // asked. /etc/hangar/installed-version is written by `make
+                // install` and would miss an in-place update entirely.
+                const installed = await this.readInstalledVersion();
+                if (installed) this.installedVersion = installed;
+
                 this.update = Object.assign(blankState(), { checking: true });
                 try {
                     // NOT fetch(): CSP connect-src 'self' blocks api.github.com.

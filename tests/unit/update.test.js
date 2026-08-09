@@ -424,3 +424,74 @@ test('a real HTTP failure is still an error, and says which', async () => {
         delete globalThis.cockpit;
     }
 });
+
+// --------------------------------------- the badge after an in-place update
+//
+// installedVersion is read once at init. This screen can update the plugin in
+// place, which changes the served files without reloading the tab — so the
+// cached value goes stale the moment the update it just performed succeeds, and
+// the badge kept offering an update that was already applied until somebody
+// reloaded the page.
+
+test('a check re-reads the installed version before comparing', async () => {
+    const c = U.hangarUpdateUi();
+    c.installedVersion = '1.0.0';                 // what init() saw, now stale
+    c.readInstalledVersion = async () => '1.0.3'; // what is actually served now
+    const body = JSON.stringify({ tag_name: 'v1.0.3', assets: [] });
+    globalThis.cockpit = { spawn() { return Promise.resolve(body + '\n200'); } };
+    try {
+        await c.checkForUpdate(true, { updateRepo: 'a/b' });
+        assert.equal(c.installedVersion, '1.0.3', 'the cache is refreshed');
+        assert.equal(c.update.available, false,
+            'an update already applied must not be offered again');
+    } finally {
+        delete globalThis.cockpit;
+    }
+});
+
+test('a genuinely newer release is still offered', async () => {
+    const c = U.hangarUpdateUi();
+    c.installedVersion = '1.0.0';
+    c.readInstalledVersion = async () => '1.0.3';
+    const body = JSON.stringify({ tag_name: 'v1.1.0', assets: [] });
+    globalThis.cockpit = { spawn() { return Promise.resolve(body + '\n200'); } };
+    try {
+        await c.checkForUpdate(true, { updateRepo: 'a/b' });
+        assert.equal(c.update.available, true);
+        assert.equal(c.update.version, '1.1.0');
+    } finally {
+        delete globalThis.cockpit;
+    }
+});
+
+// An unreadable VERSION must not wipe what we know: reporting "0.0.0" would
+// make every release look newer and offer an endless update.
+test('an unreadable VERSION leaves the known version alone', async () => {
+    const c = U.hangarUpdateUi();
+    c.installedVersion = '1.0.3';
+    c.readInstalledVersion = async () => '';
+    const body = JSON.stringify({ tag_name: 'v1.0.3', assets: [] });
+    globalThis.cockpit = { spawn() { return Promise.resolve(body + '\n200'); } };
+    try {
+        await c.checkForUpdate(true, { updateRepo: 'a/b' });
+        assert.equal(c.installedVersion, '1.0.3');
+        assert.equal(c.update.available, false);
+    } finally {
+        delete globalThis.cockpit;
+    }
+});
+
+test('the up-to-date label quotes the version that is actually running', async () => {
+    const c = U.hangarUpdateUi();
+    c.installedVersion = '1.0.0';
+    c.readInstalledVersion = async () => '1.0.3';
+    const body = JSON.stringify({ tag_name: 'v1.0.3', assets: [] });
+    globalThis.cockpit = { spawn() { return Promise.resolve(body + '\n200'); } };
+    try {
+        await c.checkForUpdate(true, { updateRepo: 'a/b' });
+        c.checkedAt = Date.now();
+        assert.match(c.updateBadgeLabel(), /v1\.0\.3 — up to date/);
+    } finally {
+        delete globalThis.cockpit;
+    }
+});
