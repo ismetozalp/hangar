@@ -70,6 +70,72 @@ body {
     .hangar-dot.running { animation: none; }
 }
 
+/* --- Loading ------------------------------------------------------------
+ *
+ * A skeleton of the rows that are coming, not a spinner. The Overview always
+ * renders the same shape — a card per job — so the wait can show that shape
+ * instead of a word: nothing jumps when the data lands, and the screen says how
+ * much is on its way rather than merely that something is.
+ *
+ * Built from Bootstrap's own theme tokens, so it follows every hangar theme
+ * without naming a single colour of its own.
+ */
+.hangar-skel-card {
+    border: 1px solid var(--bs-border-color, rgba(128, 128, 128, 0.25));
+    border-radius: var(--bs-border-radius, 0.375rem);
+    padding: 0.85rem 1rem;
+    margin-bottom: 0.5rem;
+}
+
+.hangar-skel-line {
+    height: 0.7rem;
+    border-radius: 999px;
+    background: var(--bs-secondary-bg, rgba(128, 128, 128, 0.2));
+    position: relative;
+    overflow: hidden;
+}
+
+.hangar-skel-line + .hangar-skel-line {
+    margin-top: 0.55rem;
+}
+
+/* Same size and rhythm as .hangar-dot, so the wait occupies the row the data
+ * will occupy. */
+.hangar-skel-dot {
+    width: 0.6rem;
+    height: 0.6rem;
+    border-radius: 50%;
+    flex: 0 0 auto;
+    background: var(--bs-secondary-bg, rgba(128, 128, 128, 0.2));
+}
+
+.hangar-skel-card .d-flex + .hangar-skel-line {
+    margin-top: 0.55rem;
+}
+
+/* One sweep across the bars, at the pace of the status dot's pulse, so the
+ * screen has a single idiom for "working" rather than two. */
+.hangar-skel-line::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    transform: translateX(-100%);
+    background: linear-gradient(90deg,
+        transparent,
+        var(--bs-tertiary-bg, rgba(255, 255, 255, 0.14)),
+        transparent);
+    animation: hangar-sweep 1.4s ease-in-out infinite;
+}
+
+@keyframes hangar-sweep {
+    to { transform: translateX(100%); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    /* The bars still describe the layout; only the travelling highlight goes. */
+    .hangar-skel-line::after { animation: none; }
+}
+
 /* --- Logbook ----------------------------------------------------------- */
 
 .hangar-logbook {

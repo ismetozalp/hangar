@@ -1329,21 +1329,42 @@
             // idle page makes no periodic calls at all. The final poll after a run
             // ends is what replaces "Running now" with the actual result.
             _watch: null,
+            _watchMs: 0,
             WATCH_MS: 5000,
+
+            // Idle screens still look, just rarely. Watching ONLY while a run is
+            // in flight meant a run started anywhere else — the timer at 3am,
+            // `systemctl start`, another browser tab — was invisible: the screen
+            // kept whatever it last knew until somebody reloaded the page, and
+            // said "Running" long after the run had finished.
+            //
+            // This costs a systemd unit-state read every 30 seconds. It reads no
+            // repository and takes no restic lock, so an idle tab cannot get in
+            // the way of a backup or its retention.
+            IDLE_WATCH_MS: 30000,
 
             anyRunning() {
                 return (this.jobs || []).some((r) => this.isRunning(r));
             },
 
             syncWatch() {
-                const running = this.anyRunning();
-                if (running && !this._watch && root.setInterval) {
-                    this._watch = root.setInterval(() => { this.reload(); }, this.WATCH_MS);
-                } else if (!running && this._watch && root.clearInterval) {
-                    root.clearInterval(this._watch);
-                    this._watch = null;
-                }
-                return !!this._watch;
+                const wanted = this.anyRunning() ? this.WATCH_MS : this.IDLE_WATCH_MS;
+                // Idempotent, and it re-times itself when the pace should change:
+                // repeated refreshes must not stack timers, and a finished run
+                // must drop back to the slow cadence rather than keep polling
+                // every five seconds for ever.
+                if (this._watch && this._watchMs === wanted) return true;
+                if (this._watch && root.clearInterval) root.clearInterval(this._watch);
+                this._watch = null;
+                this._watchMs = 0;
+                if (!root.setInterval) return false;
+                this._watch = root.setInterval(() => { this.reload(); }, wanted);
+                // A browser has no unref and does not need one; node does, and
+                // without it an idle screen's timer keeps a test runner alive
+                // for ever. Guarded rather than assumed either way.
+                if (this._watch && typeof this._watch.unref === 'function') this._watch.unref();
+                this._watchMs = wanted;
+                return true;
             },
 
             async reload() {

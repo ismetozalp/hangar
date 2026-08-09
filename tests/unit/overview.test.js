@@ -2081,3 +2081,126 @@ test('a banner announces itself, and its action is a real button', () => {
     assert.ok(O.TEMPLATE.includes('hangar-banner-'));
     assert.match(O.TEMPLATE, /:aria-expanded="b\.canReconnect \? null/);
 });
+
+// ------------------------------------------- a screen that watches when idle
+//
+// Watching only while a run is in flight meant a run started anywhere else —
+// the timer at 3am, `systemctl start`, another tab — was invisible until
+// somebody reloaded the page, and the screen could sit on "Running" long after
+// the run had finished. An idle screen now looks slowly rather than not at all.
+
+test('an idle screen still watches, just rarely', () => {
+    const c = O.hangarOverview();
+    const timers = [];
+    const realSet = globalThis.setInterval, realClear = globalThis.clearInterval;
+    globalThis.setInterval = (fn, ms) => { timers.push(ms); return { id: timers.length }; };
+    globalThis.clearInterval = () => {};
+    try {
+        c.jobs = [{ id: 'a', unit: { service: { active: false } } }];
+        c.syncWatch();
+        assert.equal(timers[timers.length - 1], c.IDLE_WATCH_MS,
+            'nothing running, so the slow cadence');
+    } finally {
+        globalThis.setInterval = realSet; globalThis.clearInterval = realClear;
+    }
+});
+
+test('a running job switches the screen to the fast cadence', () => {
+    const c = O.hangarOverview();
+    const timers = [];
+    const realSet = globalThis.setInterval, realClear = globalThis.clearInterval;
+    globalThis.setInterval = (fn, ms) => { timers.push(ms); return { id: timers.length }; };
+    globalThis.clearInterval = () => {};
+    try {
+        c.jobs = [{ id: 'a', unit: { service: { active: false } } }];
+        c.syncWatch();
+        c.jobs = [{ id: 'a', unit: { service: { active: true } } }];
+        c.syncWatch();
+        assert.equal(timers[timers.length - 1], c.WATCH_MS);
+        // And back down again when it ends, rather than polling every five
+        // seconds for the rest of the session.
+        c.jobs = [{ id: 'a', unit: { service: { active: false } } }];
+        c.syncWatch();
+        assert.equal(timers[timers.length - 1], c.IDLE_WATCH_MS);
+    } finally {
+        globalThis.setInterval = realSet; globalThis.clearInterval = realClear;
+    }
+});
+
+test('repeated refreshes do not stack timers', () => {
+    const c = O.hangarOverview();
+    let created = 0;
+    const realSet = globalThis.setInterval, realClear = globalThis.clearInterval;
+    globalThis.setInterval = () => { created++; return { id: created }; };
+    globalThis.clearInterval = () => {};
+    try {
+        c.jobs = [{ id: 'a', unit: { service: { active: false } } }];
+        c.syncWatch(); c.syncWatch(); c.syncWatch();
+        assert.equal(created, 1, 'one timer, however often the screen refreshes');
+    } finally {
+        globalThis.setInterval = realSet; globalThis.clearInterval = realClear;
+    }
+});
+
+// jobRow was given the unit state and threw it away, so anyRunning() — which
+// reads row.unit.service.active — could never be true. The screen therefore
+// only ever noticed backups it had started itself: one from the timer, from
+// `systemctl start`, or from another tab left it showing stale information
+// until somebody reloaded the page. Verified against a live Cockpit: systemd
+// reported the service activating while the Overview reported nothing running.
+test('a job row carries the unit state it was built from', () => {
+    const unit = { service: { active: true, activeState: 'activating' }, timer: { active: true } };
+    const row = O.jobRow({ id: 'nightly' }, null, unit, Date.now());
+    assert.deepEqual(row.unit, unit, 'the row must keep what it was given');
+});
+
+test('the Overview sees a run it did not start', () => {
+    const c = O.hangarOverview();
+    c.jobs = [O.jobRow({ id: 'nightly' }, null,
+        { service: { active: true }, timer: { active: true } }, Date.now())];
+    assert.equal(c.anyRunning(), true);
+    c.jobs = [O.jobRow({ id: 'nightly' }, null,
+        { service: { active: false }, timer: { active: true } }, Date.now())];
+    assert.equal(c.anyRunning(), false);
+});
+
+test('a job with no systemd answer is not reported as running', () => {
+    const row = O.jobRow({ id: 'nightly' }, null, null, Date.now());
+    assert.equal(row.unit, null);
+    const c = O.hangarOverview();
+    c.jobs = [row];
+    assert.equal(c.anyRunning(), false);
+});
+
+// ------------------------------------------------------- the wait itself
+//
+// A skeleton of the rows that are coming, not a spinner: the Overview always
+// renders a card per job, so the wait can show that shape. Nothing jumps when
+// the data lands, and the screen says how much is on its way.
+
+test('the wait draws as many rows as there were last time', () => {
+    const c = O.hangarOverview();
+    assert.equal(c.skeletonRows(), 2, 'two until we know better');
+    c._lastCount = 4;
+    assert.equal(c.skeletonRows(), 4, 'the shape of the answer, not a guess');
+    c._lastCount = 99;
+    assert.equal(c.skeletonRows(), 6, 'a hundred jobs is not a hundred grey bars');
+    c._lastCount = 0;
+    assert.equal(c.skeletonRows(), 2);
+});
+
+test('the skeleton is hidden the moment there is anything real to show', () => {
+    const html = O.TEMPLATE;
+    assert.match(html, /x-show="loading && !jobs\.length"/,
+        'a refresh must not blank good data to redraw it identically');
+    assert.match(html, /aria-hidden="true"/,
+        'a screen reader has no use for a picture of a row');
+    assert.match(html, /x-show="loading && jobs\.length"[^>]*>Checking…/,
+        'a refresh says it is checking instead');
+});
+
+test('the wait is announced once, in words, for anyone not looking at it', () => {
+    const html = O.TEMPLATE;
+    assert.match(html, /visually-hidden[^>]*role="status"[^>]*aria-live="polite"/);
+    assert.match(html, /Reading backup status/);
+});

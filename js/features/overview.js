@@ -434,6 +434,12 @@
         const files = unreadableList(state);
         return {
             id: id,
+            // Kept on the row, not merely consulted while building it. anyRunning()
+            // reads it to decide whether anything is in flight, and without it the
+            // screen could never see a run it had not started itself: a backup
+            // from the timer, from `systemctl start`, or from another tab left the
+            // Overview showing whatever it last knew until the page was reloaded.
+            unit: unit || null,
             name: (typeof j.name === 'string' && j.name.trim()) ? j.name.trim() : (id || 'Unnamed job'),
             repoId: typeof j.repo === 'string' ? j.repo : (obj(j.repo) && typeof j.repo.id === 'string' ? j.repo.id : ''),
             status: summary.status,
@@ -929,7 +935,30 @@
             // idle page makes no periodic calls at all. The final poll after a run
             // ends is what replaces "Running now" with the actual result.
             _watch: null,
+            _watchMs: 0,
+            // How many jobs there were last time, so the wait is the shape of
+            // the answer rather than a guess. Two until we know better: enough
+            // to read as a list, few enough not to promise jobs nobody has.
+            _lastCount: 0,
             WATCH_MS: 5000,
+
+            // Idle screens still look, just rarely. Watching ONLY while a run is
+            // in flight meant a run started anywhere else — the timer at 3am,
+            // `systemctl start`, another browser tab — was invisible: the screen
+            // kept whatever it last knew until somebody reloaded the page, and
+            // said "Running" long after the run had finished.
+            //
+            // This costs a systemd unit-state read every 30 seconds. It reads no
+            // repository and takes no restic lock, so an idle tab cannot get in
+            // the way of a backup or its retention.
+            IDLE_WATCH_MS: 30000,
+
+            // Clamped: a hundred jobs must not draw a hundred grey bars, and a
+            // machine with none still needs something to wait on.
+            skeletonRows() {
+                const n = this._lastCount || 2;
+                return Math.min(Math.max(n, 1), 6);
+            },
 
             anyRunning() {
                 return (this.jobs || []).some(function (j) {
@@ -942,14 +971,23 @@
             // stops when the last one ends. Idempotent, so repeated refreshes do
             // not stack timers.
             syncWatch() {
-                const running = this.anyRunning();
-                if (running && !this._watch && root.setInterval) {
-                    this._watch = root.setInterval(() => { this.refresh(); }, this.WATCH_MS);
-                } else if (!running && this._watch && root.clearInterval) {
-                    root.clearInterval(this._watch);
-                    this._watch = null;
-                }
-                return !!this._watch;
+                const wanted = this.anyRunning() ? this.WATCH_MS : this.IDLE_WATCH_MS;
+                // Idempotent, and it re-times itself when the pace should change:
+                // repeated refreshes must not stack timers, and a finished run
+                // must drop back to the slow cadence rather than keep polling
+                // every five seconds for ever.
+                if (this._watch && this._watchMs === wanted) return true;
+                if (this._watch && root.clearInterval) root.clearInterval(this._watch);
+                this._watch = null;
+                this._watchMs = 0;
+                if (!root.setInterval) return false;
+                this._watch = root.setInterval(() => { this.refresh(); }, wanted);
+                // A browser has no unref and does not need one; node does, and
+                // without it an idle screen's timer keeps a test runner alive
+                // for ever. Guarded rather than assumed either way.
+                if (this._watch && typeof this._watch.unref === 'function') this._watch.unref();
+                this._watchMs = wanted;
+                return true;
             },
 
             async refresh() {
@@ -970,6 +1008,7 @@
                     // read is still shown next to the error, and stale rows from the
                     // previous refresh are worse than none.
                     this.jobs = jobs;
+                    this._lastCount = jobs.length;
                     this.repos = repos;
                     this.totals = sumStats(repos);
                     this.overall = overallStatus(jobs);
@@ -1400,8 +1439,13 @@
         '    <span class="badge" :class="statusBadgeClass(overall)" x-text="overallText()"',
         '          x-show="!loading && jobs.length"></span>',
         '    <span class="flex-grow-1"></span>',
-        '    <span x-show="loading" class="text-secondary small" role="status"',
-        '          aria-live="polite">Loading…</span>',
+        // Two different waits, said differently. A first load has nothing to
+        // show, so the skeleton below carries it; a refresh already has the
+        // answer on screen and only needs to say it is checking again — blanking
+        // good data to redraw it identically is a flicker, not feedback.
+        '    <span x-show="loading && jobs.length" class="text-secondary small">Checking…</span>',
+        '    <span class="visually-hidden" role="status" aria-live="polite"',
+        '          x-text="loading ? \'Reading backup status\' : \'\'"></span>',
         '    <button type="button" class="btn btn-sm btn-outline-secondary"',
         '            @click="refresh()" :disabled="loading">Refresh</button>',
         '  </div>',
@@ -1513,6 +1557,22 @@
         '  </div>',
 
         // Jobs.
+        // aria-hidden: the live region in the header already announces the wait,
+        // and a screen reader has no use for a picture of a row.
+        '  <div x-show="loading && !jobs.length" aria-hidden="true">',
+        '    <template x-for="i in skeletonRows()" :key="i">',
+        '      <div class="hangar-skel-card">',
+        // The dot first, as in every real row: the shape is the point, and a
+        // placeholder that omits it is a picture of a different screen.
+        '        <div class="d-flex align-items-center gap-2">',
+        '          <div class="hangar-skel-dot"></div>',
+        '          <div class="hangar-skel-line flex-grow-1" style="max-width: 34%"></div>',
+        '        </div>',
+        '        <div class="hangar-skel-line" style="width: 62%"></div>',
+        '      </div>',
+        '    </template>',
+        '  </div>',
+
         '  <section x-show="jobs.length" aria-labelledby="hangar-overview-jobs">',
         '    <h3 class="visually-hidden" id="hangar-overview-jobs">Jobs</h3>',
         '    <template x-for="j in jobs" :key="j.id">',

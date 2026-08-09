@@ -5,6 +5,33 @@ All notable changes to the Hangar Cockpit plugin are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.3] — 2026-08-09
+
+### Fixed
+
+- **The Overview could not see a backup it had not started itself.** The row it
+  builds was handed the systemd unit state and dropped it, so the check for
+  "is anything running" always answered no. A run started by the timer, by
+  `systemctl start`, or from another browser tab left the screen showing
+  whatever it last knew — including "Running now" long after the run had
+  finished — until the page was reloaded.
+- **Screens correct themselves without a reload.** The Overview and Jobs
+  screens watched only while they believed a run was in flight, which is no
+  help when the belief is wrong. They now check every 30 seconds when idle and
+  every 5 while a run is going, dropping back when it ends. The idle check reads
+  systemd unit state only: it touches no repository and takes no restic lock, so
+  an open tab cannot get in the way of a backup or its retention.
+
+### Changed
+
+- **The Overview shows what it is loading, not just that it is.** The bare
+  "Loading…" is replaced by placeholder rows in the shape of the real ones — a
+  status dot, a name, a status line — drawn as many times as there were jobs
+  last time. A refresh keeps the data already on screen and says "Checking…"
+  instead, rather than blanking good rows to redraw them identically. The
+  highlight that sweeps across them is disabled for anyone who has asked their
+  system for less motion.
+
 ## [1.0.2] — 2026-08-09
 
 ### Fixed
