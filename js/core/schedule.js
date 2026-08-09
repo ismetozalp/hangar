@@ -603,6 +603,30 @@
         return d.call(MANAGER_PATH, MANAGER_IFACE, method, args).then((reply) => reply && reply[0]);
     }
 
+    // Is ANY backup running right now?
+    //
+    // Asked before this plugin reads a repository, because reading takes a
+    // restic lock and `prune` needs the repository to itself. hangar's own
+    // screens poll sizes and diffs every few seconds, so an open tab could hold
+    // a lock more or less continuously and retention would never reclaim
+    // anything — measured: prune blocked by a different PID on every attempt,
+    // all of them this plugin's own polling.
+    //
+    // ListUnitsByPatterns rather than a name: any job may be running, and the
+    // caller does not know which. Unreachable systemd answers "no", because
+    // refusing to show a repository size on a hunch is worse than a lock.
+    function anyBackupRunning() {
+        const d = bus();
+        if (!d) return Promise.resolve(false);
+        return d.call(MANAGER_PATH, MANAGER_IFACE, 'ListUnitsByPatterns',
+            [['activating', 'active', 'reloading'], ['hangar-backup@*.service']])
+            .then((reply) => {
+                const units = (reply && reply[0]) || [];
+                return Array.isArray(units) && units.length > 0;
+            })
+            .catch(() => false);
+    }
+
     // Live state for a job's timer and its service. Everything reads through
     // here so no caller is ever tempted to scrape `systemctl` text.
     function unitState(jobId) {
@@ -671,7 +695,7 @@
         renderService, renderTimer,
         unwrapProps, usecToMillis, normalizeUnitState,
         // impure
-        available, unitState, enable, disable, start, stop, runNow, daemonReload
+        available, unitState, anyBackupRunning, enable, disable, start, stop, runNow, daemonReload
     };
     root.HangarSchedule = HangarSchedule;
     if (typeof module !== 'undefined' && module.exports) module.exports = HangarSchedule;

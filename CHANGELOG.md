@@ -5,6 +5,23 @@ All notable changes to the Hangar Cockpit plugin are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.2] — 2026-08-09
+
+### Fixed
+
+- **Retention could be blocked for ever by a lock nobody owned.** restic's
+  `forget` needs an exclusive lock, and a lock left behind by a process that
+  died — a killed mount, an interrupted run — is never cleaned up on its own.
+  Measured on a real repository: a lock thirteen hours old, its process long
+  gone, and every backup in between reporting "retention failed" while the
+  backups themselves succeeded. A blocked retention now clears locks whose
+  owner is gone (`restic unlock`, which leaves a live lock alone) and retries.
+- **hangar competed with itself for the repository.** A Logbook mount holds a
+  lock while somebody browses, and the Repositories screen polled sizes every
+  few seconds, each poll taking one of its own. The backup now releases its own
+  Logbook mount when that is what blocks it, and size polling pauses while a
+  backup is running.
+
 ## [1.0.1] — 2026-08-08
 
 ### Fixed

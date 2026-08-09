@@ -1360,6 +1360,10 @@ def build_plan(job, repo):
     }
     ret = retention_args(job.get("retention"))
     if ret:
+        # One command, not two. `forget` takes an EXCLUSIVE lock of its own —
+        # measured, after splitting it from --prune on the assumption that it
+        # did not — so separating them only creates a second operation that can
+        # be blocked by the same thing.
         plan["forget"] = base + ["forget", "--json", "--prune"] + ret
 
     guard = guard_config(repo, warnings)
@@ -1525,13 +1529,80 @@ PRUNE_LOCK_RETRIES = int(os.environ.get("HANGAR_PRUNE_LOCK_RETRIES", "6"))
 PRUNE_LOCK_WAIT = float(os.environ.get("HANGAR_PRUNE_LOCK_WAIT", "20"))
 
 
-def forget_with_lock_retry(argv, env):
+# hangar's own Logbook mount, which holds a repository lock for as long as
+# somebody is browsing. Named here rather than imported because this helper
+# shares no code with the browser side; core/logbook.js builds the same name.
+MOUNT_UNIT_PREFIX = "hangar-mount-"
+
+
+def release_own_mount(repo_id):
+    """Stop the Logbook mount for this repository, if one is running.
+
+    Only ever hangar's own unit, and only after a lock has actually blocked the
+    prune: a browsing session should not be interrupted on the off-chance. The
+    Logbook remounts on the next click and heals a mount that went away, so the
+    cost is a moment's delay for whoever is browsing — against retention that
+    would otherwise never run at all while a tab stays open.
+    """
+    if not isinstance(repo_id, str) or not ID_RE.match(repo_id):
+        return False
+    unit = MOUNT_UNIT_PREFIX + repo_id + ".service"
+    try:
+        active = subprocess.run(["systemctl", "is-active", "--quiet", unit],
+                                check=False).returncode == 0
+        if not active:
+            return False
+        log("info", "stopping the Logbook mount so retention can run", unit=unit)
+        subprocess.run(["systemctl", "stop", unit], check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except OSError:
+        return False        # no systemctl, or it cannot be run: not fatal
+
+
+def unlock_stale(forget_argv, env):
+    """Remove locks whose owning process is gone. Never touches a live one."""
+    # The global options are everything before the subcommand, so the unlock
+    # speaks to the same repository with the same credentials.
+    try:
+        cut = forget_argv.index("forget")
+    except ValueError:
+        return False
+    argv = forget_argv[:cut] + ["unlock"]
+    try:
+        code, _s, _e, _err = stream_restic(argv, env, "unlock")
+    except Exception:
+        return False
+    if code == 0:
+        log("info", "removed locks left behind by processes that are gone")
+        return True
+    return False
+
+
+def forget_with_lock_retry(argv, env, repo_id=None):
     """Run the retention forget, waiting out a lock somebody else is holding."""
     attempt = 0
+    released = False
     while True:
         code, summary, errors, stderr = stream_restic(argv, env, "forget")
         if code != EXIT_REPO_LOCKED or attempt >= PRUNE_LOCK_RETRIES:
             return code, summary, errors, stderr
+        # First lock wins two free attempts, because the usual holders are ours
+        # and not alive:
+        #
+        #  - our own Logbook mount, which holds a lock while somebody browses;
+        #  - a lock left behind by a process that died without removing it.
+        #    Seen here: a lock thirteen hours old whose PID was long gone,
+        #    blocking every retention run in between. `restic unlock` removes
+        #    exactly those — it leaves a lock alone while its owner lives — so
+        #    it is safe to run unattended.
+        if not released:
+            released = True
+            freed = release_own_mount(repo_id)
+            if unlock_stale(argv, env):
+                freed = True
+            if freed:
+                continue
         attempt += 1
         log("info", "repository is locked, waiting to prune",
             attempt=attempt, of=PRUNE_LOCK_RETRIES, seconds=PRUNE_LOCK_WAIT)
@@ -1994,7 +2065,7 @@ def main(argv):
     }
 
     if plan["forget"]:
-        fcode, _fsummary, _ferrors, fstderr = forget_with_lock_retry(plan["forget"], env)
+        fcode, _fsummary, _ferrors, fstderr = forget_with_lock_retry(plan["forget"], env, repo_id)
         if fcode != 0:
             record["status"] = "prune-failed"
             record["prune_exit_code"] = fcode

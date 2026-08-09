@@ -2042,3 +2042,60 @@ test('browseFor is a no-op for a field that does not declare browsing', async ()
         assert.equal(c.form.host, 'nas.lan');
     } finally { globalThis.HangarDialogs = prev; }
 });
+
+// ------------------------------------------- reading yields to a backup
+//
+// Reading a repository takes a restic lock, and the backup's prune needs an
+// exclusive one. Polling sizes every few seconds is how this plugin denied its
+// own retention the lock it needed: measured on a real repository, prune was
+// blocked by a different PID on every attempt, all of them hangar's own stats
+// and diff calls.
+
+test('repository sizes are not polled while a backup is running', async () => {
+    const prev = globalThis.HangarSchedule;
+    globalThis.HangarSchedule = { anyBackupRunning: () => Promise.resolve(true) };
+    let spawned = false;
+    globalThis.cockpit = { spawn() { spawned = true; return Promise.resolve(''); } };
+    try {
+        const c = Ui.hangarReposUi();
+        const row = { id: 'main', repo: { id: 'main', kind: 'local', path: '/srv/r' }, busy: 'x' };
+        await c.loadStats(row);
+        assert.equal(spawned, false, 'nothing may touch the repository during a backup');
+        assert.equal(row.busy, '', 'and the row must not be left spinning');
+    } finally {
+        globalThis.HangarSchedule = prev;
+        delete globalThis.cockpit;
+    }
+});
+
+test('an idle machine is polled as before', async () => {
+    const prev = globalThis.HangarSchedule;
+    globalThis.HangarSchedule = { anyBackupRunning: () => Promise.resolve(false) };
+    let spawned = false;
+    globalThis.cockpit = { spawn() { spawned = true; return Promise.resolve('[]'); } };
+    try {
+        const c = Ui.hangarReposUi();
+        const row = { id: 'main', repo: { id: 'main', kind: 'local', path: '/srv/r' }, busy: '' };
+        await c.loadStats(row);
+        assert.equal(spawned, true, 'no backup, no reason to hold back');
+    } finally {
+        globalThis.HangarSchedule = prev;
+        delete globalThis.cockpit;
+    }
+});
+
+// A guard that fails must never blank the screen.
+test('an unavailable Schedule does not stop the Repositories screen', async () => {
+    const prev = globalThis.HangarSchedule;
+    globalThis.HangarSchedule = { anyBackupRunning: () => Promise.reject(new Error('no bus')) };
+    let spawned = false;
+    globalThis.cockpit = { spawn() { spawned = true; return Promise.resolve('[]'); } };
+    try {
+        const c = Ui.hangarReposUi();
+        await c.loadStats({ id: 'main', repo: { id: 'main', kind: 'local', path: '/srv/r' }, busy: '' });
+        assert.equal(spawned, true, 'carry on rather than show nothing');
+    } finally {
+        globalThis.HangarSchedule = prev;
+        delete globalThis.cockpit;
+    }
+});

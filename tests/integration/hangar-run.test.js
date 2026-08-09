@@ -85,11 +85,13 @@ test('forget command carries the retention policy and --prune', () => {
     withConfig([LOCAL_REPO], [SIMPLE_JOB], (dir) => {
         const p = plan(dir, 'nightly');
         assert.ok(p.forget.includes('forget'));
-        assert.ok(p.forget.includes('--prune'));
         assert.ok(p.forget.includes('--keep-hourly'));
         assert.ok(p.forget.includes('24'));
         assert.ok(p.forget.includes('--group-by'));
         assert.ok(p.forget.includes('host,paths'));
+        // One command: forget takes an exclusive lock of its own, so splitting
+        // --prune out of it only adds a second operation to be blocked.
+        assert.ok(p.forget.includes('--prune'));
     });
 });
 
@@ -891,5 +893,149 @@ test('a retention failure that is not a lock is not retried', async () => {
         const forgets = host.commands().filter((c) => / forget /.test(c + ' '));
         assert.equal(forgets.length, 1, 'tried once, reported, stopped');
         assert.equal(host.state().status, 'prune-failed');
+    });
+});
+
+// ------------------------------------------- retention outlives a Logbook
+//
+// A Logbook mount holds a repository lock for as long as somebody is browsing,
+// and prune needs an exclusive one — so an open tab means old snapshots are
+// never thinned. Waiting does not help: a browsing session outlasts any
+// patience. hangar's own mount is therefore released, but only after a lock has
+// actually blocked the prune, so browsing is never interrupted on spec.
+
+const RESTIC_STUB_LOCKED_ONCE = `#!/bin/sh
+echo "restic $*" >> "$HANGAR_TEST_CMD_LOG"
+for a in "$@"; do
+  if [ "$a" = forget ]; then
+    n=$(cat "$HANGAR_TEST_CMD_LOG.tries" 2>/dev/null || echo 0)
+    n=$((n + 1)); echo "$n" > "$HANGAR_TEST_CMD_LOG.tries"
+    if [ "$n" -le 1 ]; then
+      echo "unable to create lock in backend: repository is already locked" >&2
+      exit 11
+    fi
+    echo '[]'; exit 0
+  fi
+done
+echo '{"message_type":"summary","snapshot_id":"deadbeef","files_new":1,"data_added":1}'
+exit 0
+`;
+
+// A restic that simply works: no locks, nothing to wait for.
+const RESTIC_STUB_OK = `#!/bin/sh
+echo "restic $*" >> "$HANGAR_TEST_CMD_LOG"
+for a in "$@"; do
+  if [ "$a" = forget ]; then echo '[]'; exit 0; fi
+done
+echo '{"message_type":"summary","snapshot_id":"deadbeef","files_new":1,"data_added":1}'
+exit 0
+`;
+
+const SYSTEMCTL_STUB_MOUNT_ACTIVE = `#!/bin/sh
+echo "systemctl $*" >> "$HANGAR_TEST_CMD_LOG"
+[ "$1" = is-active ] && exit 0        # yes, the mount is running
+exit 0
+`;
+
+test('a Logbook mount is released so retention can run', async () => {
+    const job = Object.assign({}, SIMPLE_JOB, { id: 'vols' });
+    await withStubHost(job, {
+        restic: RESTIC_STUB_LOCKED_ONCE,
+        systemctl: SYSTEMCTL_STUB_MOUNT_ACTIVE
+    }, async (host) => {
+        host.env.HANGAR_PRUNE_LOCK_WAIT = '0';
+        const res = runStub(host, job.id);
+        assert.equal(res.code, 0, 'the backup and its retention both succeed: ' + res.stderr);
+        const cmds = host.commands();
+        assert.ok(cmds.some((c) => c === 'systemctl stop hangar-mount-main.service'),
+            'our own mount is stopped, by name: ' + cmds.filter((c) => c.startsWith('systemctl')).join(' | '));
+        assert.equal(cmds.filter((c) => / forget /.test(c + ' ')).length, 2,
+            'one refusal, then the retry that worked');
+    });
+});
+
+const SYSTEMCTL_STUB_NO_MOUNT = `#!/bin/sh
+echo "systemctl $*" >> "$HANGAR_TEST_CMD_LOG"
+[ "$1" = is-active ] && exit 3        # nothing mounted
+exit 0
+`;
+
+test('nothing is stopped when the lock is somebody else', async () => {
+    const job = Object.assign({}, SIMPLE_JOB, { id: 'vols' });
+    await withStubHost(job, {
+        restic: RESTIC_STUB_LOCKED_ONCE,
+        systemctl: SYSTEMCTL_STUB_NO_MOUNT
+    }, async (host) => {
+        host.env.HANGAR_PRUNE_LOCK_WAIT = '0';
+        runStub(host, job.id);
+        assert.ok(!host.commands().some((c) => c.startsWith('systemctl stop')),
+            'a lock hangar does not own is waited out, not fought');
+    });
+});
+
+// A backup that never hits a lock must leave a browsing session alone.
+test('an unblocked retention does not disturb the Logbook', async () => {
+    const job = Object.assign({}, SIMPLE_JOB, { id: 'vols' });
+    await withStubHost(job, {
+        restic: RESTIC_STUB_OK,
+        systemctl: SYSTEMCTL_STUB_MOUNT_ACTIVE
+    }, async (host) => {
+        runStub(host, job.id);
+        assert.ok(!host.commands().some((c) => c.startsWith('systemctl stop')),
+            'no lock, no interruption');
+    });
+});
+
+// A lock whose owner has died blocks every retention run that follows, for
+// ever. Seen on a real repository: a lock thirteen hours old, its PID long
+// gone, and every backup since reporting "retention failed". `restic unlock`
+// removes exactly those and leaves a live one alone.
+const RESTIC_STUB_STALE_LOCK = `#!/bin/sh
+echo "restic $*" >> "$HANGAR_TEST_CMD_LOG"
+for a in "$@"; do
+  if [ "$a" = unlock ]; then echo "successfully removed 1 locks"; exit 0; fi
+  if [ "$a" = forget ]; then
+    n=$(cat "$HANGAR_TEST_CMD_LOG.tries" 2>/dev/null || echo 0)
+    n=$((n + 1)); echo "$n" > "$HANGAR_TEST_CMD_LOG.tries"
+    # Blocked until the stale lock is removed.
+    if ! grep -q " unlock" "$HANGAR_TEST_CMD_LOG"; then
+      echo "unable to create lock in backend: repository is already locked" >&2
+      exit 11
+    fi
+    echo '[]'; exit 0
+  fi
+done
+echo '{"message_type":"summary","snapshot_id":"deadbeef","files_new":1,"data_added":1}'
+exit 0
+`;
+
+test('a lock left by a dead process is cleared so retention can run', async () => {
+    const job = Object.assign({}, SIMPLE_JOB, { id: 'vols' });
+    await withStubHost(job, {
+        restic: RESTIC_STUB_STALE_LOCK,
+        systemctl: SYSTEMCTL_STUB_NO_MOUNT
+    }, async (host) => {
+        host.env.HANGAR_PRUNE_LOCK_WAIT = '0';
+        const res = runStub(host, job.id);
+        assert.equal(res.code, 0, 'retention succeeds once the dead lock is gone: ' + res.stderr);
+        const cmds = host.commands();
+        assert.ok(cmds.some((c) => / unlock$| unlock /.test(c + ' ')),
+            'unlock was attempted: ' + cmds.join(' | ').slice(0, 200));
+        assert.ok(cmds.filter((c) => / forget /.test(c + ' ')).length >= 2,
+            'and the forget was retried afterwards');
+    });
+});
+
+// unlock only ever removes locks nobody owns, so it must not be withheld — but
+// it must also not be the first thing tried on a healthy repository.
+test('an unblocked run never unlocks anything', async () => {
+    const job = Object.assign({}, SIMPLE_JOB, { id: 'vols' });
+    await withStubHost(job, {
+        restic: RESTIC_STUB_OK,
+        systemctl: SYSTEMCTL_STUB_NO_MOUNT
+    }, async (host) => {
+        runStub(host, job.id);
+        assert.ok(!host.commands().some((c) => / unlock/.test(c)),
+            'nothing was blocked, so nothing is unlocked');
     });
 });

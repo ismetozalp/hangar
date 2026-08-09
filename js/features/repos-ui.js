@@ -604,6 +604,14 @@
             detail || { stderr: str(e.message) });
     }
 
+    // Schedule owns the unit state; this is only a guard, so an unavailable
+    // Schedule means "carry on" rather than a blank screen.
+    function backupRunning() {
+        const S = root.HangarSchedule || (req ? req('../core/schedule.js') : null);
+        if (!S || typeof S.anyBackupRunning !== 'function') return Promise.resolve(false);
+        return S.anyBackupRunning().catch(() => false);
+    }
+
     function resticOptions(repo) {
         return {
             repoUrl: Repos.buildUrl(repo),
@@ -781,6 +789,12 @@
             },
 
             async loadStats(row) {
+                // Reading a repository takes a restic lock, and the backup's
+                // prune needs an exclusive one. Polling sizes while a backup
+                // runs is how this plugin denied its own retention the lock it
+                // needed, over and over. The numbers already on screen stay
+                // there; they are a few minutes old at worst.
+                if (await backupRunning()) { row.busy = ''; return; }
                 row.busy = 'stats';
                 row.alert = null;
                 try {
