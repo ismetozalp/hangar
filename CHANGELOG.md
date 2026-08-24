@@ -5,6 +5,20 @@ All notable changes to the Hangar Cockpit plugin are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.5] — 2026-08-24
+
+### Fixed
+
+- **Leaving the Overview open could stop retention from ever running.** 1.0.3
+  taught the Repositories screen to stop reading the repository while a backup
+  is in progress, because every read takes a restic lock and retention needs an
+  exclusive one. The Overview lists repository sizes through its own path and
+  was missed, so the default screen — the one most likely to be left open —
+  went on polling and denying retention its lock. Observed on a real machine:
+  the Logbook mount released, no stale locks left, and retention still blocked
+  by this screen's own `stats` calls. A missing size now shows as a gap in the
+  summary rather than a backup that cannot finish.
+
 ## [1.0.4] — 2026-08-09
 
 ### Fixed

@@ -1136,7 +1136,31 @@
             // single JSON document, so its numbers are not reachable through run().
             // The engine still owns both restic-specific decisions here: buildArgs
             // makes the command line, parseStats reads the answer.
+            // Schedule owns the unit state. An unavailable Schedule means "carry
+            // on": refusing to show a size on a hunch is worse than a lock.
+            async backupRunning() {
+                // Resolved on the call, not at module load: the browser hands
+                // Schedule over on the global, and reading it late is also what
+                // lets a test stand in for systemd.
+                const S = (root && root.HangarSchedule) || Schedule;
+                if (!S || typeof S.anyBackupRunning !== 'function') return false;
+                return S.anyBackupRunning().catch(() => false);
+            },
+
             async fetchStats(repo) {
+                if (await this.backupRunning()) return null;
+
+                // Reading a repository takes a restic lock, and the backup's
+                // retention needs an exclusive one. This summary polls while the
+                // screen is open, so leaving the Overview up was enough to deny
+                // retention the lock it needed — the same fault fixed in the
+                // Repositories screen, missed here because the Overview reads
+                // repositories through its own path.
+                //
+                // null, not a throw: no size is a gap in a summary line, and a
+                // backup in progress is not an error to report.
+
+
                 // The definition is checked before cockpit is: a repository with an
                 // unknown kind is broken whether or not a channel is available, and
                 // saying "cockpit is not available" about it sends the user looking

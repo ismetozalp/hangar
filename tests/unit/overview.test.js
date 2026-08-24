@@ -2204,3 +2204,45 @@ test('the wait is announced once, in words, for anyone not looking at it', () =>
     assert.match(html, /visually-hidden[^>]*role="status"[^>]*aria-live="polite"/);
     assert.match(html, /Reading backup status/);
 });
+
+// ----------------------------------------- the summary yields to a backup
+//
+// The Overview lists each repository's size, and reading a repository takes a
+// restic lock while retention needs an exclusive one. The Repositories screen
+// was taught to hold back during a backup; the Overview reads repositories
+// through its own path and was missed, so simply leaving this screen open kept
+// retention from ever reclaiming space. Measured: mount stopped, retention
+// still blocked, 58 restic processes belonging to this poll.
+
+test('the repository summary is not read while a backup is running', async () => {
+    const prev = globalThis.HangarSchedule;
+    globalThis.HangarSchedule = { anyBackupRunning: () => Promise.resolve(true) };
+    let spawned = false;
+    globalThis.cockpit = { spawn() { spawned = true; return Promise.resolve('{}'); } };
+    try {
+        const c = O.hangarOverview();
+        const out = await c.fetchStats({ id: 'main', kind: 'local', path: '/srv/r' });
+        assert.equal(spawned, false, 'nothing may touch the repository during a backup');
+        assert.equal(out, null, 'a missing size is a gap in a summary, not an error');
+    } finally {
+        globalThis.HangarSchedule = prev;
+        delete globalThis.cockpit;
+    }
+});
+
+test('an idle machine still gets its sizes', async () => {
+    const prev = globalThis.HangarSchedule;
+    globalThis.HangarSchedule = { anyBackupRunning: () => Promise.resolve(false) };
+    let spawned = false;
+    globalThis.cockpit = {
+        spawn() { spawned = true; return Promise.resolve('{"total_size":1,"total_file_count":1}'); }
+    };
+    try {
+        const c = O.hangarOverview();
+        await c.fetchStats({ id: 'main', kind: 'local', path: '/srv/r' }).catch(() => null);
+        assert.equal(spawned, true, 'no backup, no reason to hold back');
+    } finally {
+        globalThis.HangarSchedule = prev;
+        delete globalThis.cockpit;
+    }
+});
