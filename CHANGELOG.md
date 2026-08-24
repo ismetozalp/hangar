@@ -5,6 +5,34 @@ All notable changes to the Hangar Cockpit plugin are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.8] — 2026-08-25
+
+Nothing here changes what the plugin does. Every screen, every command and every
+file it writes behaves exactly as in 1.0.7 — this is development tooling, and it
+is tagged only so the repository and the published archive agree on a version.
+
+### Added
+
+- **Coverage is reported whenever the tests run.** `make test` measures line,
+  branch and function coverage over `js/` and fails below a floor of 94/89/90 —
+  a shade under what the suite achieves today, so code that arrives untested
+  turns the run red rather than quietly moving the number down.
+- **`make coverage`** writes `coverage/lcov.info` for editors, and a committed
+  `COVERAGE.html`: a row per source file, sortable by any column, opening
+  worst-first and colour-banded at the floors the build enforces. The report
+  names what it does **not** measure — `libexec/hangar-run` is Python, driven end
+  to end by the integration suite and invisible to node's instrumentation —
+  because one number that silently omits 2200 lines is worse than no number.
+- **`make release`** chains the steps of cutting a release: test, build, write
+  the coverage report, commit it, publish. It does not bump the version or move
+  a tag; deciding that a change is the next version is a judgement, not a recipe.
+
+### Changed
+
+- The archive and the installed copy no longer carry `libexec/__pycache__`,
+  `COVERAGE.html` or `coverage/`. They are build and development artifacts, and
+  an installed plugin has no business holding a record of how it was tested.
+
 ## [1.0.7] — 2026-08-25
 
 ### Added
