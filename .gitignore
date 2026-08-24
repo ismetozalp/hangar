@@ -12,3 +12,6 @@ docs/
 # Python leaves these beside libexec/hangar-run; they are build output.
 __pycache__/
 *.pyc
+
+# make coverage writes here.
+coverage/

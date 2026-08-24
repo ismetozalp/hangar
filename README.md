@@ -502,12 +502,34 @@ handling is isolated in one module so TPM-bound storage can replace it later.
 
 ```sh
 npm install          # only for the Playwright-based UI tests
-npm run test:unit    # pure logic, no system state touched
+make test            # unit tests with a coverage report and its floors
+npm run test:unit    # the same tests, no coverage, for a fast inner loop
+make coverage        # writes COVERAGE.html and coverage/lcov.info
 npm run test:smoke   # structural checks on the shipped plugin
 npm run test:integration   # real restic against a temp repository
 npm run test:e2e     # Playwright, against a stubbed cockpit bridge
 npm run test:ui      # Playwright, inside a real Cockpit session
 ```
+
+### Coverage
+
+`make test` measures line, branch and function coverage over `js/` and fails if
+it drops below the floors in the Makefile — floors set a shade under what the
+suite achieves today, so code that arrives untested turns the run red instead of
+quietly moving the number down.
+
+`make coverage` writes two files. `coverage/lcov.info` is the machine copy for
+editors and is not committed. **`COVERAGE.html`** is the human one that is: one
+row per source file, sortable by any column, opening worst-first. It is HTML
+rather than Markdown because a Markdown table cannot sort, which means GitHub
+shows it as source — open it from a checkout. It records percentages only; line
+numbers would make it churn on every insertion above them, and a report that
+changes when the testing did not is a report people stop reading.
+
+The figure covers the browser sources and nothing else. `libexec/hangar-run` is
+about 2200 lines of Python, driven end to end by the integration suite and
+invisible to node's instrumentation; the report names that omission rather than
+letting one number imply more than it measures.
 
 The integration suite runs a real restic binary against a throwaway local
 repository and asserts the round trip: backup, thin, restore, byte-for-byte
