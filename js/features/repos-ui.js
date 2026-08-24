@@ -23,6 +23,10 @@
     const Restic = root.HangarRestic || (req ? req('../engine/restic.js') : null);
     const Rclone = root.HangarRclone || (req ? req('../core/rclone.js') : null);
     const SizeGuard = root.HangarSizeGuard || (req ? req('../core/sizeguard.js') : null);
+    const RepoSize = root.HangarRepoSize || (req ? req('../core/reposize.js') : null);
+    // Only for formatRelative: the date beside a size has to read the same way
+    // as every other date hangar shows.
+    const Logbook = root.HangarLogbook || (req ? req('../core/logbook.js') : null);
 
     // app.js loads AFTER the feature scripts, so HangarDialogs cannot be captured
     // at load time — it is resolved on first use instead.
@@ -789,6 +793,18 @@
             },
 
             async loadStats(row) {
+                // Whatever was measured last — by this screen, by the Overview, or
+                // by last night's size guard — goes up first. This screen still
+                // measures every time it loads, because it is where you come to
+                // look AT a repository; the remembered number just means the row
+                // is not an em dash for the minute that takes.
+                const cached = RepoSize
+                    ? await RepoSize.read(row.id).catch(function () { return null; })
+                    : null;
+                if (cached && !row.stats) {
+                    row.stats = { snapshots: cached.snapshots, size: cached.size,
+                        at: cached.at };
+                }
                 // Reading a repository takes a restic lock, and the backup's
                 // prune needs an exclusive one. Polling sizes while a backup
                 // runs is how this plugin denied its own retention the lock it
@@ -803,10 +819,18 @@
                     // Published before the (much slower) size query, and never
                     // discarded by its failure: a count we already have is true
                     // whether or not `stats` comes back.
-                    row.stats = { snapshots: snaps.length, size: null };
+                    row.stats = { snapshots: snaps.length,
+                        size: cached ? cached.size : null,
+                        at: cached ? cached.at : null };
                     const stats = Restic.parseStats(await runDocument('stats',
                         Object.assign({ mode: 'raw-data' }, opts)));
-                    row.stats = { snapshots: snaps.length, size: stats.totalSize };
+                    // Remembered for the Overview, which would otherwise pay for
+                    // the same minute to show the same number.
+                    const saved = RepoSize
+                        ? await RepoSize.write(row.id, stats).catch(function () { return null; })
+                        : null;
+                    row.stats = { snapshots: snaps.length, size: stats.totalSize,
+                        at: (saved && saved.at) || Date.now() };
                 } catch (e) {
                     // Same reclassification as the Test button: the row that
                     // failed to load its size is usually the first sight of an
@@ -1126,6 +1150,15 @@
             // --- display helpers -------------------------------------------
 
             size(row) { return row.stats ? formatSize(row.stats.size) : '—'; },
+            // When that size was taken. Empty until something has measured, so
+            // the line disappears rather than reading "measured never".
+            measuredAt(row) {
+                const at = row && row.stats && row.stats.at;
+                if (typeof at !== 'number' || !isFinite(at)) return '';
+                const rel = Logbook && typeof Logbook.formatRelative === 'function'
+                    ? Logbook.formatRelative(at) : null;
+                return rel ? 'measured ' + rel : '';
+            },
             snapshots(row) { return row.stats ? formatCount(row.stats.snapshots) : '—'; },
             busyLabel(row) { return busyLabelFor(row && row.busy); },
             alertClass(alert) {
@@ -1413,6 +1446,8 @@
         '            <div class="hangar-mono" x-text="size(row)"></div>',
         '            <div class="small text-secondary">',
         '              <span x-text="snapshots(row)"></span> snapshot(s)</div>',
+        '            <div class="small text-secondary" x-show="measuredAt(row)"',
+        '                 x-text="measuredAt(row)"></div>',
         '          </div>',
         '          <div class="btn-group btn-group-sm" role="group"',
         '               :aria-label="\'Actions for \' + row.title">',

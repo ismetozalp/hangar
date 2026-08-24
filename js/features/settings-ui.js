@@ -24,10 +24,10 @@
 
     // ------------------------------------------------------------------ pure
 
-    // The three settings a user may edit. `version` is in DEFAULT_GLOBAL too, but
+    // The settings a user may edit. `version` is in DEFAULT_GLOBAL too, but
     // it is a schema marker owned by core/config.js, not a preference.
     const EDITABLE = ['mountRoot', 'mountIdleTimeoutSec', 'notifyOnFailure',
-        'updateRepo', 'updateCheckOnStartup'];
+        'updateRepo', 'updateCheckOnStartup', 'repoSizeMaxAgeHours'];
 
     // Bounds for the idle timeout, with reasons, because "absurd" has to mean
     // something specific to be testable:
@@ -37,6 +37,19 @@
     const NEVER_IDLE = 0;
     const MIN_IDLE_SEC = 60;
     const MAX_IDLE_SEC = 86400;
+
+    // Bounds for how long a measured repository size is trusted:
+    //   0        never refresh on its own — the Measure now button still works,
+    //            which is what makes this a legitimate choice rather than a way
+    //            to end up with a number nobody can update
+    //   < 15min  is not an interval for something that takes one to two minutes
+    //            to run: it would measure continuously, which is the exact
+    //            problem the remembered size exists to solve
+    //   > 8760h  a year; past that the setting is indistinguishable from 0 and
+    //            saying so is kinder than pretending it means something
+    const NEVER_REFRESH_SIZE = 0;
+    const MIN_SIZE_AGE_HOURS = 0.25;
+    const MAX_SIZE_AGE_HOURS = 8760;
 
     // Linux PATH_MAX. A longer mountRoot cannot be created, so rejecting it here
     // beats a mount failing three screens later with an errno.
@@ -116,6 +129,33 @@
         return problems;
     }
 
+    // `restic stats` reads the whole repository — a minute or two against a NAS
+    // over SFTP — so this is the interval at which the screen is allowed to spend
+    // that. Fractions are permitted: half an hour is a reasonable answer for a
+    // local repository, and rejecting 0.5 to keep the field tidy would be the
+    // form dictating the policy.
+    function sizeAgeProblems(value) {
+        const problems = [];
+        const n = toNumber(value);
+
+        if (n === null) {
+            problems.push('Size refresh must be a number of hours.');
+            return problems;
+        }
+        if (n < 0) {
+            problems.push('Size refresh cannot be negative.');
+            return problems;
+        }
+        if (n === NEVER_REFRESH_SIZE) return problems;   // explicit "only on demand"
+        if (n < MIN_SIZE_AGE_HOURS)
+            problems.push('Size refresh must be at least 15 minutes (0.25 hours), ' +
+                'or 0 to only measure when asked.');
+        if (n > MAX_SIZE_AGE_HOURS)
+            problems.push('Size refresh must be at most ' + MAX_SIZE_AGE_HOURS +
+                ' hours (a year), or 0 to only measure when asked.');
+        return problems;
+    }
+
     function notifyProblems(value) {
         // The checkbox can only produce a boolean; anything else came from a
         // hand-edited config.json, and guessing its truthiness would silently turn
@@ -179,7 +219,8 @@
             mountIdleTimeoutSec: timeoutProblems(f.mountIdleTimeoutSec),
             notifyOnFailure: notifyProblems(f.notifyOnFailure),
             updateRepo: updateRepoProblems(f.updateRepo),
-            updateCheckOnStartup: checkOnStartupProblems(f.updateCheckOnStartup)
+            updateCheckOnStartup: checkOnStartupProblems(f.updateCheckOnStartup),
+            repoSizeMaxAgeHours: sizeAgeProblems(f.repoSizeMaxAgeHours)
         };
     }
 
@@ -202,7 +243,8 @@
             mountIdleTimeoutSec: merged.mountIdleTimeoutSec,
             notifyOnFailure: !!merged.notifyOnFailure,
             updateRepo: str(merged.updateRepo),
-            updateCheckOnStartup: !!merged.updateCheckOnStartup
+            updateCheckOnStartup: !!merged.updateCheckOnStartup,
+            repoSizeMaxAgeHours: merged.repoSizeMaxAgeHours
         };
     }
 
@@ -211,12 +253,14 @@
     function settingsFromForm(form) {
         const f = (form && typeof form === 'object') ? form : {};
         const n = toNumber(f.mountIdleTimeoutSec);
+        const h = toNumber(f.repoSizeMaxAgeHours);
         return {
             mountRoot: trimmed(f.mountRoot),
             mountIdleTimeoutSec: n === null ? null : n,
             notifyOnFailure: !!f.notifyOnFailure,
             updateRepo: trimmed(f.updateRepo),
-            updateCheckOnStartup: !!f.updateCheckOnStartup
+            updateCheckOnStartup: !!f.updateCheckOnStartup,
+            repoSizeMaxAgeHours: h === null ? null : h
         };
     }
 
@@ -229,7 +273,7 @@
     // still reads as dirty instead of collapsing to "unchanged".
     function sameValue(name, a, b) {
         if (name === 'notifyOnFailure' || name === 'updateCheckOnStartup') return !!a === !!b;
-        if (name === 'mountIdleTimeoutSec') {
+        if (name === 'mountIdleTimeoutSec' || name === 'repoSizeMaxAgeHours') {
             const x = toNumber(a);
             const y = toNumber(b);
             if (x === null || y === null) return trimmed(a) === trimmed(b);
@@ -381,6 +425,7 @@
             lines.push(pad('mountRoot', 22) + s.mountRoot);
             lines.push(pad('mountIdleTimeoutSec', 22) + s.mountIdleTimeoutSec);
             lines.push(pad('notifyOnFailure', 22) + s.notifyOnFailure);
+            lines.push(pad('repoSizeMaxAgeHours', 22) + s.repoSizeMaxAgeHours);
         }
 
         const notes = Array.isArray(i.notes)
@@ -473,6 +518,25 @@
         return 'Unmounts after ' + shown + ' hours of no activity.';
     }
 
+    // "24 hours" is already plain, but "0" and "0.5" are not, and the sentence
+    // is where the button gets mentioned — a user who sets 0 should not have to
+    // discover that sizes can still be measured on demand.
+    function describeSizeAge(value) {
+        const n = toNumber(value);
+        if (n === null || n < 0) return '';
+        if (n === NEVER_REFRESH_SIZE)
+            return 'Sizes are only measured when you press Measure now.';
+        if (n < 1) return 'Sizes are measured again after ' + Math.round(n * 60) + ' minutes.';
+        if (n < 48) {
+            const shown = Number.isInteger(n) ? String(n) : n.toFixed(1);
+            return 'Sizes are measured again after ' + shown + ' hour' +
+                (n === 1 ? '' : 's') + '.';
+        }
+        const days = n / 24;
+        const shown = Number.isInteger(days) ? String(days) : days.toFixed(1);
+        return 'Sizes are measured again after ' + shown + ' days.';
+    }
+
     const STATUS_CLASS = {
         ok: 'text-bg-success',
         missing: 'text-bg-secondary',
@@ -542,6 +606,7 @@
             remediationLabel: remediationLabel,
             errorText: errorText,
             describeTimeout: describeTimeout,
+            describeSizeAge: describeSizeAge,
             statusClass: statusClass,
             themes: (Themes ? Themes.selectable() : []),
             swatchClass: (Themes ? Themes.swatchClass : function () { return 'hangar-swatch'; }),
@@ -870,6 +935,24 @@
         '      </template>',
         '    </div>',
 
+        '    <div class="mb-3">',
+        '      <label class="form-label" for="hangar-size-age">Measure repository sizes every (hours)</label>',
+        '      <input class="form-control" id="hangar-size-age" type="number"',
+        '             min="0" step="1" x-model.number="form.repoSizeMaxAgeHours" @input="touched()"',
+        '             :class="hasProblem(\'repoSizeMaxAgeHours\') ? \'is-invalid\' : \'\'"',
+        '             :aria-invalid="hasProblem(\'repoSizeMaxAgeHours\') ? \'true\' : \'false\'"',
+        '             aria-describedby="hangar-size-age-help">',
+        '      <div class="form-text" id="hangar-size-age-help">',
+        '        <span x-text="describeSizeAge(form.repoSizeMaxAgeHours)"></span>',
+        '        Reading a repository size can take a minute or two on a remote',
+        '        destination, so the Overview shows the last measurement and its',
+        '        date. Use 0 to only measure on demand.',
+        '      </div>',
+        '      <template x-for="p in problemsFor(\'repoSizeMaxAgeHours\')" :key="p">',
+        '        <div class="invalid-feedback d-block" x-text="p"></div>',
+        '      </template>',
+        '    </div>',
+
         '    <div class="form-check mb-3">',
         '      <input class="form-check-input" id="hangar-notify" type="checkbox"',
         '             x-model="form.notifyOnFailure" @change="touched()"',
@@ -1009,15 +1092,16 @@
 
     const HangarSettingsUi = {
         EDITABLE, NEVER_IDLE, MIN_IDLE_SEC, MAX_IDLE_SEC, MAX_PATH_LEN, MAX_REPO_LEN,
+        NEVER_REFRESH_SIZE, MIN_SIZE_AGE_HOURS, MAX_SIZE_AGE_HOURS,
         VERSION_PATH, REMEDIATION_LABEL, STATUS_CLASS, TEMPLATE,
-        toNumber, pathProblems, timeoutProblems, notifyProblems,
+        toNumber, pathProblems, timeoutProblems, notifyProblems, sizeAgeProblems,
         updateRepoProblems, checkOnStartupProblems, looksLikeRepo,
         fieldProblems, validateSettings,
         formFromSettings, settingsFromForm,
         sameValue, isDirty, changedFields,
         parseVersionFile, versionText, bannerText, toolStatus, toolRows, fuseState,
         pad, diagnosticsText,
-        remediationLabel, errorText, describeTimeout, statusClass,
+        remediationLabel, errorText, describeTimeout, describeSizeAge, statusClass,
         isPartial, unreadableFrom, routeError,
         readInstalledVersion, mount, hangarSettingsUi
     };

@@ -36,6 +36,14 @@
         theme: 'system',
         mountRoot: '/run/hangar/mnt',
         mountIdleTimeoutSec: 900,
+        // How long a measured repository size is trusted before it is taken
+        // again. `restic stats` reads the whole repository — 50 to 118 seconds
+        // against a NAS over SFTP — so the number is remembered and shown with
+        // the time it was taken. A day is the default because the nightly
+        // backup measures the size anyway for its size guard, and a size that
+        // moved during the day is still a size from this morning. 0 means never
+        // refresh on its own; the Measure now button always works.
+        repoSizeMaxAgeHours: 24,
         notifyOnFailure: true,
         // Self-update. This is hangar's own upstream, so a fresh install can offer
         // updates without being configured first. Note the consequence: the plugin

@@ -1093,3 +1093,113 @@ test('a prune that fails on the second pass stops there, still over and saying s
             assert.match(r.stderr, /still .* over its size limit/);
         });
 });
+
+// --- the size the guard measured is left where the Overview can find it -----
+//
+// `restic stats` costs fifty seconds to two minutes against a remote repository.
+// The size guard pays that every night anyway, so the number it gets is written
+// to the same file js/core/reposize.js reads — a machine that backs up nightly
+// then has a fresh size on screen without anyone ever waiting for one.
+//
+// The risk being tested for is a cache that lies: a size recorded from the wrong
+// mode, from before a trim, or for a repository whose measurement failed.
+
+function sizeCache(host, repoId) {
+    const p = path.join(host.dir, 'state', 'size-' + (repoId || 'main') + '.json');
+    return fs.existsSync(p) ? JSON.parse(fs.readFileSync(p, 'utf8')) : null;
+}
+
+test('a guarded run records the size and the snapshot count for the Overview', () => {
+    const before = Date.now();
+    withHost(repoWithGuard({ limit: '500 GB' }), JOB,
+        { raw: 10 * GB, grow: GB, snapshots: SNAPS }, (host) => {
+            assert.equal(host.run().status, 0);
+            const c = sizeCache(host);
+            assert.ok(c, 'the guard measured, so the size must have been recorded');
+            assert.equal(c.size, 11 * GB, 'raw-data, the same number the guard used');
+            assert.equal(c.snapshots, SNAPS.length + 1, 'including tonight\'s');
+            // Milliseconds, because the browser reads it with Date.
+            assert.ok(c.at >= before && c.at <= Date.now() + 1000,
+                'the timestamp is when it was measured, in ms: ' + c.at);
+        });
+});
+
+test('the recorded size is the one AFTER a trim, not the one that triggered it', () => {
+    // 5 snapshots at 100 GB, limit 70 GB, 20 GB freed per forget: two passes end
+    // at 60 GB. Recording 100 GB here would put the pre-trim size on screen and
+    // leave the operator believing the guard did nothing.
+    withHost(repoWithGuard({ limit: '70 GB', minSnapshots: 1 }), JOB,
+        { raw: 99 * GB, grow: GB, snapshots: SNAPS, free_per_forget: 20 * GB },
+        (host) => {
+            assert.equal(host.run().status, 0);
+            const c = sizeCache(host);
+            assert.equal(c.size, 60 * GB);
+            assert.equal(c.snapshots, 3, 'and the count the trim left behind');
+        });
+});
+
+test('the recorded size is world-readable, since the browser is not root', () => {
+    withHost(repoWithGuard({ limit: '500 GB' }), JOB,
+        { raw: 10 * GB, snapshots: SNAPS }, (host) => {
+            assert.equal(host.run().status, 0);
+            const p = path.join(host.dir, 'state', 'size-main.json');
+            // hangar-run writes this as root from a systemd unit; the Overview
+            // reads it as the logged-in user. 0600 would make the whole cache
+            // invisible to the one thing that uses it.
+            assert.equal(fs.statSync(p).mode & 0o777, 0o644);
+        });
+});
+
+test('a repository with no size guard records nothing rather than a guess', () => {
+    // Nothing measured it, so there is nothing to remember. Writing a zero, or
+    // last night's number with tonight's date, would be worse than no file.
+    withHost(LOCAL_REPO, JOB, { raw: 10 * GB, snapshots: SNAPS }, (host) => {
+        assert.equal(host.run().status, 0);
+        assert.equal(sizeCache(host), null);
+        assert.deepEqual(subcommandsOf(host.calls()), ['backup'],
+            'and nothing was measured for its own sake');
+    });
+});
+
+test('a failed measurement leaves no size behind', () => {
+    withHost(repoWithGuard({ limit: '500 GB' }), JOB,
+        { raw: 10 * GB, snapshots: SNAPS, fail: { stats: true } }, (host) => {
+            const r = host.run();
+            assert.equal(r.status, 0, 'a failed guard never fails the backup');
+            assert.equal(r.state.size_guard.reason, 'unknown-size');
+            assert.equal(sizeCache(host), null, 'and it must not cache an unknown');
+        });
+});
+
+test('a stale recorded size is replaced, not left beside a newer one', () => {
+    withHost(repoWithGuard({ limit: '500 GB' }), JOB,
+        { raw: 10 * GB, grow: GB, snapshots: SNAPS }, (host) => {
+            const dir = path.join(host.dir, 'state');
+            fs.mkdirSync(dir, { recursive: true });
+            fs.writeFileSync(path.join(dir, 'size-main.json'),
+                JSON.stringify({ size: 1, snapshots: 1, at: 1 }));
+            assert.equal(host.run().status, 0);
+            const c = sizeCache(host);
+            assert.equal(c.size, 11 * GB);
+            assert.ok(c.at > 1);
+        });
+});
+
+test('the file hangar-run writes is the file js/core/reposize.js reads', () => {
+    // Two implementations, one contract. The JS side names the path and vets the
+    // shape; if either drifts the Overview silently stops finding the size and
+    // goes back to costing a minute a visit.
+    const RepoSize = require('../../js/core/reposize.js');
+    withHost(repoWithGuard({ limit: '500 GB' }), JOB,
+        { raw: 10 * GB, grow: GB, snapshots: SNAPS }, (host) => {
+            assert.equal(host.run().status, 0);
+            const written = path.join(host.dir, 'state', 'size-main.json');
+            // Same name, module-independent of HANGAR_STATE_DIR.
+            assert.equal(path.basename(RepoSize.sizePath('main')), path.basename(written));
+            const raw = JSON.parse(fs.readFileSync(written, 'utf8'));
+            assert.deepEqual(RepoSize.normalize(raw),
+                { size: 11 * GB, snapshots: SNAPS.length + 1, at: raw.at },
+                'the JS side must accept it as a measurement, not reject its shape');
+            assert.equal(RepoSize.isStale(raw, raw.at + 1000), false, 'and call it fresh');
+        });
+});

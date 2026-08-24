@@ -8,3 +8,7 @@ tests/tmp/
 
 # Planning/spec docs — not part of the shipped plugin
 docs/
+
+# Python leaves these beside libexec/hangar-run; they are build output.
+__pycache__/
+*.pyc

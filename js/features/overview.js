@@ -20,6 +20,7 @@
     const Errors = need('HangarErrors', '../core/errors.js');
     const Config = need('HangarConfig', '../core/config.js');
     const Schedule = need('HangarSchedule', '../core/schedule.js');
+    const RepoSize = need('HangarRepoSize', '../core/reposize.js');
     const Repos = need('HangarRepos', '../core/repos.js');
     const Secrets = need('HangarSecrets', '../core/secrets.js');
     const Logbook = need('HangarLogbook', '../core/logbook.js');
@@ -752,6 +753,11 @@
             repo: r,
             destination: i,
             sizing: false,
+            // When the number in `size` was measured. A size with no date is a
+            // claim about now; a remembered one is a claim about a moment, and
+            // the difference matters when it is a day old.
+            measuredAt: null,
+            measuredAtText: '',
             kind: typeof r.kind === 'string' ? r.kind : '',
             remote: typeof i.remote === 'string' ? i.remote : '',
             providerId: provider && typeof provider.id === 'string' ? provider.id : '',
@@ -836,6 +842,7 @@
             restic: d.restic || Restic,
             logbook: d.logbook || Logbook,
             rclone: d.rclone || Rclone,
+            reposize: d.reposize || RepoSize,
             // app.js loads after the feature scripts, so the dialogs global is only
             // guaranteed to exist by the time a handler runs.
             dialogs: d.dialogs || null
@@ -879,6 +886,16 @@
             busyIds: [],
             expanded: null,
             now: 0,
+            // The in-flight size pass from the last refresh, or null. Never
+            // awaited by the screen itself — see refresh().
+            sizesDone: null,
+            // Global settings, re-read on every size pass so a change to the
+            // refresh interval takes effect without reloading the page.
+            settings: null,
+            // True while a manual "Measure now" is in flight, so the button can
+            // disable itself rather than queue a second pass over the same
+            // repositories.
+            measuring: false,
 
             // --- pure helpers reused by the template ---------------------
             statusClass: statusClass,
@@ -1023,7 +1040,10 @@
                     // Deliberately not awaited: the screen is complete without
                     // sizes, and a size that takes a minute must not be able to
                     // delay it. Each row fills itself in when its query returns.
-                    this.fillRepoSizes();
+                    // The promise is kept so anything that DOES need to know when
+                    // the sizes have settled can await it rather than guess at a
+                    // number of ticks.
+                    this.sizesDone = this.fillRepoSizes();
                     this.syncWatch();
                 }
             },
@@ -1108,23 +1128,91 @@
                 return rows;
             },
 
+            // The date on a size, stored and rendered in one place so a row can
+            // never carry a timestamp its label disagrees with. Alpine renders
+            // strings, not calls, so the text is computed here rather than in the
+            // template — the same reason sizeText exists.
+            setMeasuredAt(row, at) {
+                row.measuredAt = isNum(at) ? at : null;
+                const rel = relative(row.measuredAt, this.now || Date.now());
+                row.measuredAtText = rel === null ? '' : 'measured ' + rel;
+            },
+
+            // Measure now. Forces a reading however recent the remembered one is,
+            // because "how big is it RIGHT NOW" is the one question a cache
+            // cannot answer by definition.
+            async measureSizesNow() {
+                if (this.measuring) return false;
+                this.measuring = true;
+                this.now = Date.now();
+                try {
+                    await this.fillRepoSizes(true);
+                } finally {
+                    this.measuring = false;
+                }
+                return true;
+            },
+
             // The sizes, afterwards and out of band. Each row updates as its own
             // query returns, so one slow repository cannot delay another — and a
             // repository that cannot be read shows its error in its own row
             // rather than failing the screen.
-            async fillRepoSizes() {
+            async fillRepoSizes(force) {
                 const rows = this.repos || [];
+                const RS = D.reposize;
+                // Re-read rather than cached on the component: Settings can change
+                // the interval while this screen is open, and the next pass should
+                // honour it. Unreadable settings mean the built-in default, never
+                // a screen that stops measuring.
+                try {
+                    this.settings = await D.config.readGlobal();
+                } catch (e) {
+                    this.settings = null;
+                }
+                const maxAge = RS.maxAgeMsFrom(this.settings);
+                const now = Date.now();
                 await Promise.all(rows.map(async (row) => {
                     if (!row || !row.repo) return;
                     // Already known to be broken: asking again would only produce
                     // the same error a minute later.
                     if (row.error) return;
+
+                    // Last time's number, on screen immediately. Even a stale one
+                    // goes up first: a size from this morning, labelled as such,
+                    // beats an empty cell for the two minutes a fresh reading of a
+                    // remote repository takes.
+                    let cached = null;
+                    try { cached = await RS.read(row.id); } catch (e) { cached = null; }
+                    if (cached) {
+                        Object.assign(row, repoRow(row.repo,
+                            { totalSize: cached.size, snapshotsCount: cached.snapshots },
+                            null, D, row.destination));
+                        this.setMeasuredAt(row, cached.at);
+                        this.totals = sumStats(this.repos || []);
+                    }
+                    if (!force && !RS.isStale(cached, now, maxAge)) return;
+
                     row.sizing = true;
                     try {
                         const stats = await this.fetchStats(row.repo);
-                        if (stats) Object.assign(row, repoRow(row.repo, stats, null, D, row.destination));
+                        if (stats) {
+                            Object.assign(row, repoRow(row.repo, stats, null, D, row.destination));
+                            let saved = null;
+                            try { saved = await RS.write(row.id, stats); } catch (e) { saved = null; }
+                            this.setMeasuredAt(row, (saved && saved.at) || Date.now());
+                        } else if (cached) {
+                            // Skipped because a backup is running. The remembered
+                            // size stays, with its own date on it.
+                            this.setMeasuredAt(row, cached.at);
+                        }
                     } catch (e) {
-                        Object.assign(row, repoRow(row.repo, null, e, D, row.destination));
+                        // A failed measurement must not erase a good remembered
+                        // one. The repository was that size this morning whether
+                        // or not it can be reached this minute; replacing the
+                        // number with an error would lose a true fact to report a
+                        // transient one.
+                        if (cached) this.setMeasuredAt(row, cached.at);
+                        else Object.assign(row, repoRow(row.repo, null, e, D, row.destination));
                     } finally {
                         row.sizing = false;
                         // Recomputed as each row lands, not only at the end: the
@@ -1709,6 +1797,14 @@
         '        <span x-text="totalSizeText()"></span> in',
         '        <span x-text="totals.snapshots"></span> snapshot(s)',
         '      </span>',
+        // Measuring a remote repository costs a minute, so it is not something
+        // the screen should do on every visit — but it must always be something
+        // the user can ask for.
+        '      <button type="button" class="btn btn-sm btn-link p-0 ms-auto"',
+        '              :disabled="measuring"',
+        '              aria-label="Measure repository sizes now"',
+        '              @click="measureSizesNow()"',
+        '              x-text="measuring ? \'Measuring\\u2026\' : \'Measure now\'"></button>',
         '    </div>',
         '    <div class="table-responsive">',
         '      <table class="table table-sm align-middle mb-0">',
@@ -1739,6 +1835,11 @@
         // wrong answer, not a slow one.
         '              <td class="text-end">',
         '                <span x-show="!r.sizing" x-text="r.sizeText"></span>',
+        // When the number was taken, under it. A size with no date invites the
+        // reader to assume it is current, and after a day that assumption is
+        // wrong -- so the date is part of the answer, not an extra.
+        '                <div class="text-secondary small" x-show="!r.sizing && r.measuredAtText"',
+        '                     x-text="r.measuredAtText"></div>',
         // The toggle goes on a plain wrapper: Bootstrap's display utilities are
         // !important and beat the inline display x-show sets, so the two must
         // never share an element or the placeholder never goes away.

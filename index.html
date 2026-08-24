@@ -129,6 +129,9 @@
 <script src="js/core/passgen.js"></script>
 <script src="js/core/semver.js"></script>
 <script src="js/core/config.js"></script>
+<!-- AFTER config.js: reposize.js reads and writes under the state directory, and
+     it is core/config.js that owns that path. -->
+<script src="js/core/reposize.js"></script>
 
 <!-- Engine -------------------------------------------------------------- -->
 <script src="js/engine/restic.js"></script>

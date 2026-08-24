@@ -118,8 +118,8 @@ this dialog matter more than they look; the section below explains why.*
 
 ![The Settings screen: eleven themes, mount options and update settings](screenshots/settings.png)
 
-*Settings — themes, how long a browsed snapshot stays mounted, and where updates
-come from.*
+*Settings — themes, how long a browsed snapshot stays mounted, how often
+repository sizes are measured, and where updates come from.*
 
 ---
 

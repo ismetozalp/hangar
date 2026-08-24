@@ -538,6 +538,7 @@ test('component constructs with no DOM, no cockpit and no core globals', () => {
 test('refresh loads jobs, repositories, totals and the overall status', async () => {
     const c = component();
     await c.refresh();
+    await c.sizesDone;
     assert.equal(c.loading, false);
     assert.equal(c.error, null);
     assert.equal(c.jobs.length, 1);
@@ -556,6 +557,7 @@ test('nothing configured shows the empty state that leads to a repository', asyn
         listJobs: async () => [], listRepos: async () => []
     }) });
     await c.refresh();
+    await c.sizesDone;
     assert.equal(c.isEmpty(), true);
     assert.equal(c.needsJob(), false);
     assert.equal(c.overall, 'never');
@@ -564,6 +566,7 @@ test('nothing configured shows the empty state that leads to a repository', asyn
 test('a repository with no job asks for a job, not for another repository', async () => {
     const c = component({ config: Object.assign(fakeDeps().config, { listJobs: async () => [] }) });
     await c.refresh();
+    await c.sizesDone;
     assert.equal(c.isEmpty(), false);
     assert.equal(c.needsJob(), true);
 });
@@ -579,6 +582,7 @@ test('an unreadable job file is a warning beside the rows we did get', async () 
         }
     }) });
     await c.refresh();
+    await c.sizesDone;
     assert.equal(c.error, null, 'a partial listing must not blank the screen');
     assert.equal(c.jobs.length, 1);
     assert.equal(c.warnings.length, 1);
@@ -591,6 +595,7 @@ test('a missing systemd answer still renders the last recorded run', async () =>
         runNow: async () => true
     } });
     await c.refresh();
+    await c.sizesDone;
     assert.equal(c.error, null);
     assert.equal(c.jobs[0].status, 'ok');
     assert.equal(c.jobs[0].nextRunText, 'not scheduled');
@@ -601,6 +606,7 @@ test('a failure listing jobs surfaces as a screen error with a retry', async () 
         listJobs: async () => { throw Errors.create('GENERIC', 'nope'); }
     }) });
     await c.refresh();
+    await c.sizesDone;
     assert.equal(c.loading, false);
     assert.ok(c.error);
     assert.equal(c.errorText(c.error), 'nope');
@@ -610,6 +616,7 @@ test('a repository whose stats fail keeps the rest of the screen alive', async (
     const c = component();
     c.fetchStats = async () => { throw Errors.create('REPO_LOCKED', 'locked'); };
     await c.refresh();
+    await c.sizesDone;
     assert.equal(c.error, null);
     assert.equal(c.repos[0].remediation, 'unlock');
     assert.equal(c.totals.errors, 1);
@@ -623,6 +630,7 @@ test('Back up now starts the service and refreshes', async () => {
         runNow: async (id) => { started.push(id); }
     } });
     await c.refresh();
+    await c.sizesDone;
     await c.backupNow(c.jobs[0]);
     assert.deepEqual(started, ['nightly']);
     assert.equal(c.isBusy('nightly'), false, 'the button must be re-enabled afterwards');
@@ -635,6 +643,7 @@ test('a failed Back up now reports the error and clears the busy flag', async ()
         runNow: async () => { throw Errors.create('GENERIC', 'unit not found'); }
     } });
     await c.refresh();
+    await c.sizesDone;
     await c.backupNow(c.jobs[0]);
     assert.equal(c.errorText(c.actionError), 'unit not found');
     assert.equal(c.isBusy('nightly'), false);
@@ -646,6 +655,7 @@ test('the unlock remediation runs restic unlock against the job\'s repository', 
         run: async (op, opts) => { calls.push([op, opts.repoUrl, opts.passwordFile]); }
     }) });
     await c.refresh();
+    await c.sizesDone;
     await c.remediate({ id: 'nightly', repoId: 'nas', remediation: 'unlock' });
     assert.deepEqual(calls, [['unlock', '/srv/backup', '/etc/hangar/repos/nas.key']]);
     assert.equal(c.actionError, null);
@@ -1084,6 +1094,7 @@ test('a failure listing repositories keeps the jobs that did load', async () => 
         listRepos: async () => { throw Errors.create('GENERIC', 'ls: permission denied'); }
     }) });
     await c.refresh();
+    await c.sizesDone;
     assert.equal(c.jobs.length, 1, 'the jobs we read must not vanish because repos failed');
     assert.equal(c.repos.length, 0);
     assert.ok(c.error);
@@ -1095,6 +1106,7 @@ test('a screen-level failure does not masquerade as "nothing configured yet"', a
         listJobs: async () => { throw Errors.create('GENERIC', 'nope'); }
     }) });
     await c.refresh();
+    await c.sizesDone;
     assert.equal(c.isEmpty(), false, '"No backups yet" would be a lie here');
     assert.ok(O.TEMPLATE.includes('@click="refresh()"'), 'the screen error offers a retry');
 });
@@ -1105,6 +1117,7 @@ test('listJobs answering something that is not a list does not crash the screen'
             listJobs: async () => bad, listRepos: async () => bad
         }) });
         await c.refresh();
+    await c.sizesDone;
         assert.equal(c.error, null, String(bad));
         assert.deepEqual(c.jobs, []);
     }
@@ -1116,6 +1129,7 @@ test('a job file holding a JSON scalar is a warning, not a broken row', async ()
         readJob: async (id) => (id === 'weird' ? 'not-an-object' : { id: 'nightly', repo: 'nas' })
     }) });
     await c.refresh();
+    await c.sizesDone;
     assert.equal(c.error, null);
     assert.equal(c.jobs.length, 1);
     assert.equal(c.warnings.length, 1);
@@ -1130,6 +1144,7 @@ test('a repository file holding a JSON array is a warning, not a thrown TypeErro
             readRepo: async () => bad
         }) });
         await c.refresh();
+    await c.sizesDone;
         assert.equal(c.error, null, JSON.stringify(bad));
         assert.equal(c.repos.length, 0);
         assert.equal(c.warnings.length, 1);
@@ -1147,6 +1162,7 @@ test('a job and a repository sharing an id produce two distinct warnings', async
         readRepo: async () => { throw Errors.create('GENERIC', 'denied'); }
     }) });
     await c.refresh();
+    await c.sizesDone;
     assert.equal(c.warnings.length, 2);
     assert.notEqual(c.warnings[0].key, c.warnings[1].key);
     assert.equal(new Set(c.warnings.map((w) => w.key)).size, 2);
@@ -1167,6 +1183,7 @@ test('the filename is the job identity, not the "id" field inside the file', asy
         }
     });
     await c.refresh();
+    await c.sizesDone;
     assert.deepEqual(asked, ['nightly']);
     assert.equal(c.jobs[0].id, 'nightly');
     await c.backupNow(c.jobs[0]);
@@ -1178,6 +1195,7 @@ test('a readState that rejects still leaves a renderable row', async () => {
         readState: async () => { throw Errors.create('GENERIC', '/var/lib is not readable'); }
     }) });
     await c.refresh();
+    await c.sizesDone;
     assert.equal(c.error, null);
     assert.equal(c.jobs.length, 1);
     assert.equal(c.jobs[0].status, 'never');
@@ -1188,6 +1206,7 @@ test('a state file that is not an object is treated as no state at all', async (
         readState: async () => 'corrupt'
     }) });
     await c.refresh();
+    await c.sizesDone;
     assert.equal(c.jobs[0].status, 'never');
 });
 
@@ -1202,6 +1221,7 @@ test('a partial run renders as a warning listing the unreadable files, never as 
         })
     }) });
     await c.refresh();
+    await c.sizesDone;
 
     assert.equal(c.error, null, 'a partial run is not a screen failure');
     assert.equal(c.actionError, null);
@@ -1238,6 +1258,7 @@ test('a failed action surfaces the remediation its kind implies as a button', as
         runNow: async () => { throw Errors.create('REPO_LOCKED', 'repository is locked'); }
     } });
     await c.refresh();
+    await c.sizesDone;
     await c.backupNow(c.jobs[0]);
     assert.ok(c.actionError);
     assert.equal(c.actionRemediation(), 'unlock');
@@ -1258,6 +1279,7 @@ test('running the action-error remediation performs it against the right reposit
         }
     });
     await c.refresh();
+    await c.sizesDone;
     await c.backupNow(c.jobs[0]);
     await c.runActionRemediation();
     assert.deepEqual(calls, [['unlock', '/srv/backup']]);
@@ -1270,6 +1292,7 @@ test('an action error with no remediation offers no button rather than a mislead
         runNow: async () => { throw Errors.create('GO_RUNTIME', 'restic crashed'); }
     } });
     await c.refresh();
+    await c.sizesDone;
     await c.backupNow(c.jobs[0]);
     assert.equal(c.actionRemediation(), null);
 });
@@ -1280,6 +1303,7 @@ test('the action error can be dismissed', async () => {
         runNow: async () => { throw Errors.create('GENERIC', 'nope'); }
     } });
     await c.refresh();
+    await c.sizesDone;
     await c.backupNow(c.jobs[0]);
     assert.ok(c.actionError);
     c.clearAction();
@@ -1300,6 +1324,7 @@ test('a locked repository offers Unlock, and it runs restic unlock', async () =>
     }));
     c.fetchStats = async () => { throw Errors.create('REPO_LOCKED', 'locked'); };
     await c.refresh();
+    await c.sizesDone;
     assert.equal(c.repos[0].remediation, 'unlock');
     await c.remediateRepo(c.repos[0]);
     assert.deepEqual(calls, [['unlock', '/srv/backup', '/etc/hangar/repos/nas.key']]);
@@ -1317,6 +1342,7 @@ test('a missing repository offers Initialise, and it runs restic init', async ()
     }));
     c.fetchStats = async () => { throw Errors.create('REPO_MISSING', 'does not exist'); };
     await c.refresh();
+    await c.sizesDone;
     assert.equal(c.repos[0].remediation, 'init');
     await c.remediateRepo(c.repos[0]);
     assert.deepEqual(ops, ['init']);
@@ -1331,6 +1357,7 @@ test('a repository with a rejected password re-prompts and stores the new one', 
     }));
     c.fetchStats = async () => { throw Errors.create('WRONG_PASSWORD', 'wrong password'); };
     await c.refresh();
+    await c.sizesDone;
     assert.equal(c.repos[0].remediation, 'reprompt');
     await c.remediateRepo(c.repos[0]);
     assert.deepEqual(written, [['nas', 'hunter2']]);
@@ -1341,6 +1368,7 @@ test('a repository remediation with no one-click fix just re-reads its health', 
     const c = O.hangarOverview(fakeDeps());
     c.fetchStats = async () => { reads++; throw Errors.create('GO_RUNTIME', 'crashed'); };
     await c.refresh();
+    await c.sizesDone;
     assert.equal(reads, 1);
     await c.remediateRepo(c.repos[0]);
     assert.equal(reads, 2, 'retry means look again, not start a backup');
@@ -1355,6 +1383,7 @@ test('a repository remediation that fails reports it and clears the busy flag', 
     }));
     c.fetchStats = async () => { throw Errors.create('REPO_LOCKED', 'locked'); };
     await c.refresh();
+    await c.sizesDone;
     await c.remediateRepo(c.repos[0]);
     assert.match(c.errorText(c.actionError), /no route to host/);
     assert.equal(c.actionRemediation(), 'retry');
@@ -1458,6 +1487,7 @@ test('a malformed repository definition fails per row, not per screen', async ()
         readRepo: async () => ({ id: 'nas', kind: 'nonsense' })
     }) }));
     await c.refresh();
+    await c.sizesDone;
     assert.equal(c.error, null);
     assert.equal(c.repos.length, 1);
     assert.ok(c.repos[0].error);
@@ -1543,6 +1573,7 @@ test('the component is fully constructible with every core module absent', () =>
 test('a core module that is present but broken is reported, not thrown out of refresh', async () => {
     const c = O.hangarOverview(fakeDeps({ config: { listJobs: 'not a function' } }));
     await c.refresh();
+    await c.sizesDone;
     assert.equal(c.loading, false, 'the spinner must not be left running');
     assert.ok(c.error);
     assert.deepEqual(c.jobs, []);
@@ -1552,6 +1583,7 @@ test('a core module that is present but broken is reported, not thrown out of re
 test('a broken scheduler is reported on the row, not thrown out of the click handler', async () => {
     const c = component({ schedule: { unitState: async () => unit() } });
     await c.refresh();
+    await c.sizesDone;
     await c.backupNow({ id: 'nightly' });
     assert.ok(c.actionError);
     assert.equal(c.isBusy('nightly'), false, 'the button must be usable again');
@@ -1623,6 +1655,7 @@ test('a disk-full job offers "space" help, and the panel it opens is about space
         readState: async () => state({ status: 'failed', kind: 'NO_SPACE', exit_code: 1 })
     }) });
     await c.refresh();
+    await c.sizesDone;
     const row = c.jobs[0];
     assert.equal(row.status, 'failed');
     assert.equal(row.remediation, 'free-space');
@@ -1944,6 +1977,7 @@ function cloudDeps(over) {
 test('the screen raises the banner for an expired destination after a failed night', async () => {
     const c = component(cloudDeps());
     await c.refresh();
+    await c.sizesDone;
     assert.equal(c.banners.length, 1);
     const b = c.banners[0];
     assert.equal(b.repoId, 'nas');
@@ -1956,12 +1990,14 @@ test('the screen raises the banner for an expired destination after a failed nig
 test('the banner disappears when the destination stops failing', async () => {
     const c = component(cloudDeps({ config: { readState: async () => state({ status: 'ok' }) } }));
     await c.refresh();
+    await c.sizesDone;
     assert.deepEqual(c.banners, []);
 });
 
 test('Reconnect opens the same wizard the destination was created in', async () => {
     const c = component(cloudDeps());
     await c.refresh();
+    await c.sizesDone;
     const seen = [];
     const saved = [globalThis.CustomEvent, globalThis.dispatchEvent,
         Object.prototype.hasOwnProperty.call(globalThis, 'CustomEvent')];
@@ -1987,6 +2023,7 @@ test('the job row\'s own button performs the repair rather than describing it', 
     assert.equal(O.expands('reauthorize'), false);
     const c = component(cloudDeps());
     await c.refresh();
+    await c.sizesDone;
     const seen = [];
     globalThis.CustomEvent = class { constructor(n, o) { this.type = n; this.detail = (o || {}).detail; } };
     globalThis.dispatchEvent = (ev) => { seen.push(ev); return true; };
@@ -2003,6 +2040,7 @@ test('the job row\'s own button performs the repair rather than describing it', 
 test('a repository row remediation reaches the same repair', async () => {
     const c = component(cloudDeps({ config: { readState: async () => state({ status: 'ok' }) } }));
     await c.refresh();
+    await c.sizesDone;
     const seen = [];
     globalThis.CustomEvent = class { constructor(n, o) { this.type = n; this.detail = (o || {}).detail; } };
     globalThis.dispatchEvent = (ev) => { seen.push(ev); return true; };
@@ -2021,6 +2059,7 @@ test('a repository with no remote reports why it cannot be signed in to', async 
         config: { readRepo: async () => ({ id: 'nas', kind: 'local', path: '/srv/b' }) }
     }));
     await c.refresh();
+    await c.sizesDone;
     assert.equal(c.repos[0].remote, '');
     assert.equal(c.reconnect({ repoId: 'nas' }), false);
     assert.ok(c.actionError, 'a silent no-op on a pressed button is the failure mode');
@@ -2032,6 +2071,7 @@ test('an unreadable rclone configuration costs the banner nothing but the provid
         providerOfRemote: async () => { throw Errors.create('GENERIC', 'no rclone here'); }
     } }));
     await c.refresh();
+    await c.sizesDone;
     assert.equal(c.repos.length, 1, 'the repository is still on screen');
     assert.equal(c.banners.length, 1);
     assert.equal(c.banners[0].providerLabel, 'The cloud destination');
@@ -2051,6 +2091,7 @@ test('the proactive warning reaches the screen from the provider table', async (
     }));
     c.now = NOW;
     await c.refresh();
+    await c.sizesDone;
     // refresh() stamps its own clock, so assert on the shape rather than the day.
     assert.equal(c.banners.length, 1);
     assert.equal(c.banners[0].kind, 'expiring');
@@ -2064,6 +2105,7 @@ test('instructions for an external provider come from externalSetup', async () =
         externalSetup: (id) => Rclone.externalSetup(id)
     } }));
     await c.refresh();
+    await c.sizesDone;
     const b = c.banners[0];
     assert.equal(b.canReconnect, false);
     // Pressing it opens the instructions instead of a flow that cannot run.
@@ -2267,6 +2309,8 @@ test('jobs appear while a slow repository is still being measured', async () => 
     c.fetchStats = async () => { await pending; return { totalSize: 1, snapshotsCount: 3 }; };
     c.loadRepoIds = undefined;
 
+    // Deliberately NOT awaiting c.sizesDone: the whole point is that the screen
+    // is up before it settles.
     await c.refresh();
     // The size query has not resolved, and must not have been waited for.
     assert.equal(c.loading, false, 'the screen is up');
@@ -2275,4 +2319,246 @@ test('jobs appear while a slow repository is still being measured', async () => 
     release();
     await c.fillRepoSizes();
     assert.equal(c.loading, false);
+});
+
+// ------------------------------------------- the size the screen remembers
+//
+// Measuring costs a minute against a remote repository, so the Overview shows
+// the last measurement and its date, and measures again only when that has gone
+// stale or the user asks. The risk this introduces is the opposite of the one it
+// removes: a number on screen that nobody can tell is old. So the date, and the
+// refusal to lose a good remembered size to a transient failure, are as much the
+// contract here as the caching is.
+
+const HOUR_MS = 60 * 60 * 1000;
+
+// A size store in memory, shaped like js/core/reposize.js.
+function sizeStore(seed) {
+    const RepoSize = require('../../js/core/reposize.js');
+    const files = Object.assign({}, seed || {});
+    const reads = [];
+    const writes = [];
+    return {
+        files: files, reads: reads, writes: writes,
+        maxAgeMsFrom: RepoSize.maxAgeMsFrom,
+        isStale: RepoSize.isStale,
+        normalize: RepoSize.normalize,
+        sizePath: RepoSize.sizePath,
+        read: async (id) => { reads.push(id); return files[id] || null; },
+        write: async (id, stats, now) => {
+            const e = { size: stats.totalSize, snapshots: stats.snapshotsCount,
+                at: typeof now === 'number' ? now : Date.now() };
+            writes.push([id, e]);
+            files[id] = e;
+            return e;
+        }
+    };
+}
+
+// A component whose repository sizes come from `store`, counting measurements.
+function sized(store, over) {
+    const c = component(Object.assign({ reposize: store }, over || {}));
+    c.measured = [];
+    c.fetchStats = async () => {
+        c.measured.push('nas');
+        return { totalSize: 900, snapshotsCount: 9 };
+    };
+    return c;
+}
+
+test('a remembered size is on screen without measuring anything', async () => {
+    const at = Date.now() - HOUR_MS;
+    const store = sizeStore({ nas: { size: 500, snapshots: 5, at: at } });
+    const c = sized(store);
+    await c.refresh();
+    await c.sizesDone;
+    assert.deepEqual(c.measured, [], 'a fresh cache means the repository is not touched');
+    assert.equal(c.repos[0].size, 500);
+    assert.equal(c.repos[0].snapshots, 5);
+    assert.equal(c.totals.size, 500, 'and it counts toward the summary');
+    assert.equal(c.repos[0].measuredAt, at);
+});
+
+test('the row says when the size was measured, in words', async () => {
+    const store = sizeStore({ nas: { size: 500, snapshots: 5, at: Date.now() - 3 * HOUR_MS } });
+    const c = sized(store);
+    await c.refresh();
+    await c.sizesDone;
+    // A number with no date invites the reader to assume it is current.
+    assert.equal(c.repos[0].measuredAtText, 'measured 3 hours ago');
+    assert.ok(O.TEMPLATE.includes('r.measuredAtText'),
+        'and the template must actually render it');
+});
+
+test('a stale size is shown first, then replaced by a fresh measurement', async () => {
+    const store = sizeStore({ nas: { size: 500, snapshots: 5, at: Date.now() - 30 * HOUR_MS } });
+    const c = sized(store);
+    const pass = c.fillRepoSizes.bind(c);
+    await c.refresh();
+    // The remembered number is up before the measurement has been asked for.
+    assert.equal(c.repos[0].size, 500, 'the old size renders immediately');
+    await c.sizesDone;
+    assert.deepEqual(c.measured, ['nas'], 'and then it is measured again');
+    assert.equal(c.repos[0].size, 900);
+    assert.equal(c.totals.size, 900);
+    assert.equal(store.writes.length, 1, 'the new measurement is remembered');
+    assert.equal(store.writes[0][1].size, 900);
+    // A second pass now finds it fresh.
+    c.measured = [];
+    await pass();
+    assert.deepEqual(c.measured, []);
+});
+
+test('a repository that was never measured is measured, and remembered', async () => {
+    const store = sizeStore();
+    const c = sized(store);
+    await c.refresh();
+    await c.sizesDone;
+    assert.deepEqual(c.measured, ['nas']);
+    assert.equal(c.repos[0].size, 900);
+    assert.deepEqual(store.writes.map((w) => w[0]), ['nas']);
+    assert.ok(c.repos[0].measuredAt > 0, 'and it carries its own date');
+    assert.match(c.repos[0].measuredAtText, /^measured /);
+});
+
+test('Measure now ignores a perfectly fresh cache', async () => {
+    const store = sizeStore({ nas: { size: 500, snapshots: 5, at: Date.now() } });
+    const c = sized(store);
+    await c.refresh();
+    await c.sizesDone;
+    assert.deepEqual(c.measured, [], 'nothing on its own');
+    assert.equal(await c.measureSizesNow(), true);
+    assert.deepEqual(c.measured, ['nas'], '"how big is it right now" is not a cache question');
+    assert.equal(c.repos[0].size, 900);
+    assert.equal(c.measuring, false, 'and the button comes back');
+    assert.ok(O.TEMPLATE.includes('measureSizesNow()'),
+        'the screen must offer that as a button');
+});
+
+test('Measure now does not queue a second pass over the same repositories', async () => {
+    const store = sizeStore();
+    const c = sized(store);
+    await c.refresh();
+    await c.sizesDone;
+    c.measured = [];
+    let release;
+    const pending = new Promise((r) => { release = r; });
+    c.fetchStats = async () => { c.measured.push('nas'); await pending; return { totalSize: 1 }; };
+    const first = c.measureSizesNow();
+    assert.equal(c.measuring, true);
+    // Bounded, so that a regression here fails the test rather than wedging the
+    // run: without the guard the second press waits on the first one's query.
+    const second = await Promise.race([
+        c.measureSizesNow(),
+        new Promise((r) => { setTimeout(() => r('queued behind the first'), 50); })
+    ]);
+    assert.equal(second, false, 'the second press is refused, not queued');
+    release();
+    await first;
+    assert.deepEqual(c.measured, ['nas'], 'measured once, not twice');
+});
+
+test('a failed measurement keeps the remembered size instead of blanking it', async () => {
+    // The repository WAS that size this morning whether or not the NAS answers
+    // this minute. Replacing a true number with a transient error loses more
+    // than it reports.
+    const at = Date.now() - 30 * HOUR_MS;
+    const store = sizeStore({ nas: { size: 500, snapshots: 5, at: at } });
+    const c = sized(store);
+    c.fetchStats = async () => { throw Errors.create('NETWORK', 'no route to host'); };
+    await c.refresh();
+    await c.sizesDone;
+    assert.equal(c.repos[0].size, 500, 'the remembered size survives');
+    assert.equal(c.repos[0].measuredAt, at, 'still dated when it was actually taken');
+    assert.equal(c.repos[0].error, null);
+    assert.equal(c.totals.errors, 0);
+    assert.equal(store.writes.length, 0, 'and nothing bad was written to the cache');
+});
+
+test('with no remembered size a failed measurement is still reported', async () => {
+    const c = sized(sizeStore());
+    c.fetchStats = async () => { throw Errors.create('REPO_LOCKED', 'locked'); };
+    await c.refresh();
+    await c.sizesDone;
+    assert.equal(c.repos[0].remediation, 'unlock');
+    assert.equal(c.totals.errors, 1);
+});
+
+test('a skipped measurement during a backup keeps the remembered size and its date', async () => {
+    const at = Date.now() - 30 * HOUR_MS;
+    const store = sizeStore({ nas: { size: 500, snapshots: 5, at: at } });
+    const c = sized(store);
+    c.fetchStats = async () => null;          // what fetchStats answers mid-backup
+    await c.refresh();
+    await c.sizesDone;
+    assert.equal(c.repos[0].size, 500);
+    assert.equal(c.repos[0].measuredAt, at);
+    assert.equal(c.repos[0].sizeText, '500 B', 'not a dash');
+});
+
+test('the refresh interval comes from settings, not from this file', async () => {
+    const store = sizeStore({ nas: { size: 500, snapshots: 5, at: Date.now() - 8 * HOUR_MS } });
+    const deps = fakeDeps();
+    deps.config.readGlobal = async () => ({ repoSizeMaxAgeHours: 24 });
+    const c = sized(store, deps);
+    await c.refresh();
+    await c.sizesDone;
+    assert.deepEqual(c.measured, [], '8 hours is fresh under a 24 hour setting');
+
+    deps.config.readGlobal = async () => ({ repoSizeMaxAgeHours: 6 });
+    await c.fillRepoSizes();
+    assert.deepEqual(c.measured, ['nas'], 'and stale under a 6 hour one');
+});
+
+test('a setting change takes effect without reloading the screen', async () => {
+    // The settings are re-read on every pass rather than captured at load, so
+    // saving a new interval in Settings does not need a page reload to matter.
+    const store = sizeStore({ nas: { size: 500, snapshots: 5, at: Date.now() - 2 * HOUR_MS } });
+    const deps = fakeDeps();
+    let hours = 24;
+    deps.config.readGlobal = async () => ({ repoSizeMaxAgeHours: hours });
+    const c = sized(store, deps);
+    await c.refresh();
+    await c.sizesDone;
+    assert.deepEqual(c.measured, []);
+    hours = 1;
+    await c.fillRepoSizes();
+    assert.deepEqual(c.measured, ['nas']);
+});
+
+test('zero hours means only on demand, and Measure now still works', async () => {
+    const store = sizeStore({ nas: { size: 500, snapshots: 5, at: 1 } });
+    const deps = fakeDeps();
+    deps.config.readGlobal = async () => ({ repoSizeMaxAgeHours: 0 });
+    const c = sized(store, deps);
+    await c.refresh();
+    await c.sizesDone;
+    assert.deepEqual(c.measured, [], 'an ancient size is left alone');
+    assert.equal(c.repos[0].size, 500);
+    await c.measureSizesNow();
+    assert.deepEqual(c.measured, ['nas'], 'but the button is never disabled by a setting');
+});
+
+test('unreadable settings fall back to the default rather than stopping measurement', async () => {
+    const store = sizeStore({ nas: { size: 500, snapshots: 5, at: Date.now() - 30 * HOUR_MS } });
+    const deps = fakeDeps();
+    deps.config.readGlobal = async () => { throw Errors.create('GENERIC', 'nope'); };
+    const c = sized(store, deps);
+    await c.refresh();
+    await c.sizesDone;
+    assert.deepEqual(c.measured, ['nas'], '30 hours is stale under the shipped default');
+    assert.equal(c.error, null, 'and it is not a screen error');
+});
+
+test('a repository with a broken definition is never measured or cached', async () => {
+    const store = sizeStore();
+    const c = sized(store, { config: Object.assign(fakeDeps().config, {
+        readRepo: async () => ({ id: 'nas', kind: 'martian' })
+    }) });
+    await c.refresh();
+    await c.sizesDone;
+    assert.ok(c.repos[0].error, 'the bad definition is reported at once');
+    assert.deepEqual(c.measured, [], 'and nothing remote is attempted');
+    assert.deepEqual(store.reads, [], 'nor is a cache consulted for it');
+    assert.deepEqual(store.writes, []);
 });

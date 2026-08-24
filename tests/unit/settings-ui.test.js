@@ -284,20 +284,22 @@ test('validateSettings reports every field, in field order', () => {
         mountIdleTimeoutSec: -5,
         notifyOnFailure: 'yes',
         updateRepo: 'not a repo',
-        updateCheckOnStartup: 'sometimes'
+        updateCheckOnStartup: 'sometimes',
+        repoSizeMaxAgeHours: 'often'
     });
-    assert.equal(problems.length, 5);
+    assert.equal(problems.length, 6);
     assert.match(problems[0], /Mount folder/);
     assert.match(problems[1], /Idle timeout/);
     assert.match(problems[2], /Notify on failure/);
     assert.match(problems[3], /Update repository/);
     assert.match(problems[4], /Check for updates/);
+    assert.match(problems[5], /Size refresh/);
 });
 
 test('validateSettings on an empty or missing form still answers', () => {
-    assert.equal(UI.validateSettings(null).length, 4);
-    assert.equal(UI.validateSettings(undefined).length, 4);
-    assert.equal(UI.validateSettings('nonsense').length, 4);
+    assert.equal(UI.validateSettings(null).length, 5);
+    assert.equal(UI.validateSettings(undefined).length, 5);
+    assert.equal(UI.validateSettings('nonsense').length, 5);
 });
 
 test('fieldProblems keys the problems by field', () => {
@@ -316,7 +318,8 @@ test('formFromSettings fills defaults and drops unknown keys', () => {
         mountIdleTimeoutSec: DEFAULTS.mountIdleTimeoutSec,
         notifyOnFailure: DEFAULTS.notifyOnFailure,
         updateRepo: DEFAULTS.updateRepo,
-        updateCheckOnStartup: DEFAULTS.updateCheckOnStartup
+        updateCheckOnStartup: DEFAULTS.updateCheckOnStartup,
+        repoSizeMaxAgeHours: DEFAULTS.repoSizeMaxAgeHours
     });
     assert.equal(form.nonsense, undefined);
 });
@@ -327,7 +330,8 @@ test('formFromSettings on null is the shipped defaults', () => {
         mountIdleTimeoutSec: DEFAULTS.mountIdleTimeoutSec,
         notifyOnFailure: DEFAULTS.notifyOnFailure,
         updateRepo: DEFAULTS.updateRepo,
-        updateCheckOnStartup: DEFAULTS.updateCheckOnStartup
+        updateCheckOnStartup: DEFAULTS.updateCheckOnStartup,
+        repoSizeMaxAgeHours: DEFAULTS.repoSizeMaxAgeHours
     });
 });
 
@@ -337,9 +341,11 @@ test('settingsFromForm trims and coerces exactly once', () => {
         mountIdleTimeoutSec: '1200',
         notifyOnFailure: 1,
         updateRepo: '  appuser/hangar  ',
-        updateCheckOnStartup: 1
+        updateCheckOnStartup: 1,
+        repoSizeMaxAgeHours: '12'
     }), { mountRoot: '/srv/mnt', mountIdleTimeoutSec: 1200, notifyOnFailure: true,
-          updateRepo: 'appuser/hangar', updateCheckOnStartup: true });
+          updateRepo: 'appuser/hangar', updateCheckOnStartup: true,
+          repoSizeMaxAgeHours: 12 });
 });
 
 test('settingsFromForm keeps an unparseable timeout as null rather than zero', () => {
@@ -349,7 +355,7 @@ test('settingsFromForm keeps an unparseable timeout as null rather than zero', (
 
 test('a form round-trips through settings unchanged', () => {
     const settings = { mountRoot: '/srv/mnt', mountIdleTimeoutSec: 120, notifyOnFailure: false,
-        updateRepo: 'appuser/hangar', updateCheckOnStartup: true };
+        updateRepo: 'appuser/hangar', updateCheckOnStartup: true, repoSizeMaxAgeHours: 6 };
     const back = UI.settingsFromForm(UI.formFromSettings(settings));
     assert.deepEqual(back, settings);
     assert.equal(UI.isDirty(UI.formFromSettings(settings), settings), false);
@@ -537,6 +543,7 @@ test('the diagnostics report is exactly this text', () => {
         'mountRoot             /run/hangar/mnt',
         'mountIdleTimeoutSec   900',
         'notifyOnFailure       true',
+        'repoSizeMaxAgeHours   24',
         ''
     ].join('\n');
     assert.equal(UI.diagnosticsText(REPORT_INFO), expected);
@@ -707,7 +714,8 @@ test('save() writes the coerced settings and clears the dirty state', async () =
     assert.equal(await c.save(), true);
     assert.deepEqual(deps.written, [
         { mountRoot: '/srv/mnt', mountIdleTimeoutSec: 1800, notifyOnFailure: false,
-          updateRepo: DEFAULTS.updateRepo, updateCheckOnStartup: DEFAULTS.updateCheckOnStartup }
+          updateRepo: DEFAULTS.updateRepo, updateCheckOnStartup: DEFAULTS.updateCheckOnStartup,
+          repoSizeMaxAgeHours: DEFAULTS.repoSizeMaxAgeHours }
     ]);
     assert.equal(c.dirty(), false);
     assert.equal(c.savedAt, '2026-08-01T09:00:00.000Z');
@@ -1498,4 +1506,86 @@ test('nothing anywhere in this screen says Time Machine', () => {
     assert.doesNotMatch(source, /time\s*machine/i);
     // The screen names the feature, and it names it Logbook.
     assert.match(UI.TEMPLATE, /Logbook/);
+});
+
+// ----------------------------------------- how often sizes are measured
+//
+// `restic stats` reads the whole repository, so this setting decides how often
+// the Overview is allowed to spend a minute or two. Two things must hold: 0 has
+// to mean "only when asked" rather than "broken", and a value that is NOT a
+// number must never be mistaken for 0 — a settings file missing the key would
+// otherwise pin every size on screen for ever.
+
+test('the shipped default is a day', () => {
+    assert.equal(DEFAULTS.repoSizeMaxAgeHours, 24);
+    assert.equal(UI.formFromSettings({}).repoSizeMaxAgeHours, 24);
+});
+
+test('sizeAgeProblems accepts hours, including fractions and zero', () => {
+    assert.deepEqual(UI.sizeAgeProblems(24), []);
+    assert.deepEqual(UI.sizeAgeProblems('24'), []);
+    assert.deepEqual(UI.sizeAgeProblems(0.5), [], 'half an hour is reasonable locally');
+    assert.deepEqual(UI.sizeAgeProblems(UI.MIN_SIZE_AGE_HOURS), []);
+    // Zero has to skip the minimum, or "only when asked" would be rejected as
+    // too frequent — the one reading it cannot possibly have.
+    assert.deepEqual(UI.sizeAgeProblems(0), [], 'zero is a choice, not an error');
+    assert.deepEqual(UI.sizeAgeProblems(UI.MAX_SIZE_AGE_HOURS), []);
+});
+
+test('sizeAgeProblems refuses what is not a number of hours', () => {
+    assert.match(UI.sizeAgeProblems('often')[0], /number of hours/);
+    assert.match(UI.sizeAgeProblems('')[0], /number of hours/);
+    assert.match(UI.sizeAgeProblems(null)[0], /number of hours/);
+    assert.match(UI.sizeAgeProblems(undefined)[0], /number of hours/);
+    assert.match(UI.sizeAgeProblems(-1)[0], /negative/);
+    assert.match(UI.sizeAgeProblems(UI.MAX_SIZE_AGE_HOURS + 1)[0], /at most/);
+    // A minute is not an interval for a query that takes two: it would measure
+    // continuously, which is what the remembered size exists to prevent.
+    assert.match(UI.sizeAgeProblems(0.01)[0], /at least 15 minutes/);
+});
+
+test('the help text explains zero rather than leaving it looking broken', () => {
+    assert.match(UI.describeSizeAge(0), /only measured when you press Measure now/i);
+    assert.match(UI.describeSizeAge(24), /24 hours/);
+    assert.match(UI.describeSizeAge(1), /1 hour\./, 'not "1 hours"');
+    assert.match(UI.describeSizeAge(0.5), /30 minutes/);
+    assert.match(UI.describeSizeAge(168), /7 days/);
+    assert.equal(UI.describeSizeAge('nonsense'), '', 'nothing to say about a non-number');
+});
+
+test('the form has the field, wired to the model and its problems', () => {
+    assert.ok(UI.TEMPLATE.includes('form.repoSizeMaxAgeHours'),
+        'the input must be bound to the form');
+    assert.ok(UI.TEMPLATE.includes("problemsFor('repoSizeMaxAgeHours')"),
+        'and it must show its own problems');
+    assert.ok(/Measure repository sizes every \(hours\)/.test(UI.TEMPLATE),
+        'and be labelled in hours, since that is what it takes');
+    assert.ok(UI.TEMPLATE.includes('describeSizeAge(form.repoSizeMaxAgeHours)'),
+        'with the plain-English echo beneath it');
+});
+
+test('changing the interval makes the form dirty, and saving keeps it', async () => {
+    const deps = stubDeps();
+    const c = UI.hangarSettingsUi(deps);
+    await c.load();
+    assert.equal(c.dirty(), false);
+    // The input hands back a string on some paths and a number on others;
+    // "24" and 24 are the same interval, and reporting unsaved changes for a
+    // field nobody touched trains people to ignore the warning.
+    c.form.repoSizeMaxAgeHours = DEFAULTS.repoSizeMaxAgeHours + '.0';
+    assert.equal(c.dirty(), false, 'the same interval written differently is not a change');
+    c.form.repoSizeMaxAgeHours = 6;
+    assert.equal(c.dirty(), true);
+    assert.equal(await c.save(), true);
+    assert.equal(deps.written[0].repoSizeMaxAgeHours, 6);
+});
+
+test('an unparseable interval blocks the save rather than being written as zero', async () => {
+    const deps = stubDeps();
+    const c = UI.hangarSettingsUi(deps);
+    await c.load();
+    c.form.repoSizeMaxAgeHours = 'often';
+    assert.equal(c.hasProblem('repoSizeMaxAgeHours'), true);
+    assert.equal(await c.save(), false);
+    assert.deepEqual(deps.written, []);
 });

@@ -5,6 +5,26 @@ All notable changes to the Hangar Cockpit plugin are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.7] — 2026-08-25
+
+### Added
+
+- **Repository sizes are remembered, with the date they were taken.** `restic
+  stats` reads the whole repository — 50 to 118 seconds against a NAS over SFTP
+  — so the Overview and the Repositories screen now show the last measurement
+  and when it was made, and measure again only when it has gone stale. A row
+  says "measured 3 hours ago" beside its size rather than presenting an
+  hours-old number as if it were current.
+- **A "Measure now" button** on the Overview, which ignores the remembered size
+  and asks the repository directly. "How big is it right now" is the one
+  question a cache cannot answer.
+- **A setting for how often sizes are measured**, in hours, defaulting to 24.
+  Accepts anything from 15 minutes to a year, or 0 to only measure when asked.
+- **The nightly backup keeps the number fresh for free.** A job with a size
+  limit already measures the repository for its size guard; that measurement is
+  now written where the browser reads it, so a machine that backs up nightly has
+  a current size on screen without anyone ever waiting for one.
+
 ## [1.0.6] — 2026-08-24
 
 ### Fixed

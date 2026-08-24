@@ -1759,27 +1759,75 @@ def json_document(text):
 
 
 def measure_repo(guard, env):
-    """Bytes the repository occupies, or None when it cannot be measured.
+    """(bytes, snapshot count) for the repository, or (None, None).
 
     None is a real answer here and must stay distinct from 0: plan_trim reads an
     unknown size as "delete nothing", and a 0 would read as "wildly under the
     limit" — the same outcome by luck rather than by rule.
+
+    The snapshot count rides along because the same JSON document already carries
+    it and js/core/reposize.js shows it next to the size. It is allowed to be
+    None on its own: an old restic that omits the field must not cost us a size
+    we did measure.
     """
     code, out, err = run_reader(guard["stats"], env)
     if code != 0:
         log("warning", "could not measure the repository size",
             exit_code=code, error=last_line(err))
-        return None
+        return None, None
     doc = json_document(out)
     if not isinstance(doc, dict):
         log("warning", "restic stats did not answer with a JSON document",
             text=last_line(out))
-        return None
+        return None, None
     total = doc.get("total_size")
     if not is_number(total) or total < 0:
         log("warning", "restic stats answered with no usable total_size")
-        return None
-    return total
+        return None, None
+    count = doc.get("snapshots_count")
+    return total, count if is_number(count) and count >= 0 else None
+
+
+def remember_repo_size(repo_id, size, snapshots):
+    """Leave the measured size where the Overview can find it.
+
+    The size guard has just paid for a `stats` call. The browser would otherwise
+    pay for its own — fifty seconds to two minutes against a remote repository —
+    to display the same number. Writing it here means a machine that backs up
+    nightly has a fresh size on screen without anyone ever waiting for one.
+
+    Best effort by design: this runs AFTER a successful backup, and a cache file
+    that could not be written is not a reason to report the backup differently.
+    Mirrors js/core/reposize.js — same path, same field names, same 0644, so the
+    two implementations stay swappable.
+    """
+    if not isinstance(repo_id, str) or not ID_RE.match(repo_id):
+        return False
+    # None here means the measurement failed. A cache entry saying 0, or saying
+    # nothing while carrying tonight's date, would be worse than no file at all.
+    if not is_number(size) or size < 0:
+        return False
+    entry = {
+        "size": size,
+        "snapshots": snapshots if is_number(snapshots) else None,
+        # Milliseconds, because the browser reads this with Date and every other
+        # timestamp hangar hands the UI is in milliseconds too.
+        "at": int(time.time() * 1000),
+    }
+    path = os.path.join(STATE_DIR, "size-%s.json" % repo_id)
+    try:
+        os.makedirs(STATE_DIR, mode=0o755, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(entry, fh)
+            fh.write("\n")
+        os.chmod(tmp, 0o644)
+        # Atomic, so a browser reading this file never sees half of it.
+        os.replace(tmp, path)
+        return True
+    except OSError as e:
+        log("warning", "could not record the repository size", path=path, error=str(e))
+        return False
 
 
 def list_snapshots(guard, env):
@@ -1825,7 +1873,7 @@ def guard_stop(reason, remaining, error):
     return out
 
 
-def run_size_guard(guard, env):
+def run_size_guard(guard, env, repo_id=None):
     """Keep the repository under its size limit; return the record, or None.
 
     The shape is forced by deduplication: forget the oldest -> prune -> measure ->
@@ -1846,6 +1894,10 @@ def run_size_guard(guard, env):
     started = time.time()
     start_bytes = None
     current = None
+    # Bound before the try: an Interrupted raised inside measure_repo would
+    # otherwise leave this name undefined, and the record written on the way out
+    # would die with a NameError instead of reporting the interruption.
+    snapshot_count = None
     iterations = 0
     forgotten = []
 
@@ -1856,7 +1908,7 @@ def run_size_guard(guard, env):
     # happened — the post steps ran before the guard started — so there is nothing
     # left to undo, only something to record.
     try:
-        start_bytes = measure_repo(guard, env)
+        start_bytes, snapshot_count = measure_repo(guard, env)
         current = start_bytes
         if start_bytes is None:
             outcome = guard_stop("unknown-size", 0, "the repository size could not be measured")
@@ -1900,7 +1952,7 @@ def run_size_guard(guard, env):
                     break
                 forgotten.append(short)
 
-                measured = measure_repo(guard, env)
+                measured, snapshot_count = measure_repo(guard, env)
                 if measured is None:
                     outcome = guard_stop("unknown-size", guard_over_by(current, limit),
                                          "the repository size could not be measured after pruning")
@@ -1930,6 +1982,13 @@ def run_size_guard(guard, env):
     }
     if outcome.get("error"):
         record["error"] = outcome["error"]
+
+    # Whatever the guard concluded, it measured — and the last measurement is
+    # still the truth about this repository. Recorded even when the guard gave up
+    # over the limit: a size the operator needs to see is exactly the size that
+    # made it give up. `current` is None when nothing could be measured, and
+    # remember_repo_size is what decides that is not worth writing down.
+    remember_repo_size(repo_id, current, snapshot_count)
 
     if remaining > 0:
         # The load-bearing report. A run that stopped while still over the limit is
@@ -2081,7 +2140,7 @@ def main(argv):
     # asked for, and the guard only exists to catch what that policy did not keep
     # small enough. Running it first would delete snapshots retention would have
     # removed for free.
-    guard_record = run_size_guard(plan.get("guard"), env)
+    guard_record = run_size_guard(plan.get("guard"), env, repo_id)
     if guard_record:
         record["size_guard"] = guard_record
         if guard_record["remaining"] > 0:

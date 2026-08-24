@@ -530,7 +530,12 @@ async function main() {
                 assertEqual(await page.isVisible('.badge:text-is("Unsaved changes")'), false);
             });
 
-            if (process.env.SHOT) await page.screenshot({ path: 'tests/e2e-theme.png', fullPage: true });
+            if (process.env.SHOT) {
+                await page.screenshot({ path: 'tests/e2e-theme.png', fullPage: true });
+                await page.click('.nav-pills .nav-link:text-is("Settings")').catch(() => {});
+                await page.waitForTimeout(600);
+                await page.screenshot({ path: 'tests/e2e-settings.png', fullPage: true });
+            }
             await ctx.close();
         }
 
@@ -988,7 +993,13 @@ async function main() {
                     'systemd-run': '', 'systemctl': ''
                 }),
                 files: Object.assign({}, DEFAULT_STUB.files, {
-                    '/etc/hangar/repos/attic.json': JSON.stringify(REPO)
+                    '/etc/hangar/repos/attic.json': JSON.stringify(REPO),
+                    // A size measured three hours ago. Fresh under the shipped
+                    // 24 hour default, so the Overview must show it — and its
+                    // date — without asking the repository anything.
+                    '/var/lib/hangar/state/size-attic.json': JSON.stringify({
+                        size: 5368709120, snapshots: 2, at: Date.now() - 3 * 3600e3
+                    })
                 }),
                 // The Logbook asks systemd whether its mount unit is already up.
                 // Without an answer it falls back to `restic ls`, which this stub
@@ -1000,6 +1011,50 @@ async function main() {
                         LoadState: { v: 'loaded' }, Id: { v: 'hangar.service' }
                     }]
                 }
+            });
+
+            await check('a remembered size and its date render on the Overview', async () => {
+                // Both of the last two UI bugs on this screen were invisible to
+                // the unit suites — the data was right and the DOM disagreed —
+                // so the size cache is checked here, in a real browser, against
+                // the real template.
+                await page.click('.nav-pills .nav-link:text-is("Overview")');
+                await page.waitForSelector('#hangar-overview', { timeout: 5000 });
+                await page.waitForTimeout(1200);
+                const shown = await page.evaluate(() =>
+                    document.getElementById('hangar-overview').innerText);
+                // The date the cache carries, not the moment the page rendered.
+                assert(/measured 3 hours ago/.test(shown),
+                    `the remembered date is not on screen: ${shown.slice(0, 400)}`);
+                assert(/5\.0 GiB/.test(shown), `the remembered size is not on screen: ${shown.slice(0, 400)}`);
+                assert(/Measure now/.test(shown), 'the Measure now button is not on screen');
+                if (process.env.SHOT)
+                    await page.screenshot({ path: 'tests/e2e-reposize.png', fullPage: true });
+
+                // And refreshing costs nothing: a size three hours old is fresh
+                // under the shipped 24 hour default, so the Overview must not
+                // touch the repository. Counted as a delta because the
+                // Repositories screen measures on load whatever the cache says.
+                const statsCalls = () => page.evaluate(() => window.__hangarStub.calls
+                    .filter((c) => c.kind === 'spawn' && /stats/.test(String(c.argv))).length);
+                const before = await statsCalls();
+                await page.click('#hangar-overview button:text-is("Refresh")');
+                await page.waitForTimeout(1200);
+                assertEqual(await statsCalls(), before,
+                    'the Overview measured a repository whose size it already knew');
+            });
+
+            await check('Measure now asks the repository again', async () => {
+                await page.click('.nav-pills .nav-link:text-is("Overview")');
+                await page.waitForSelector('#hangar-overview', { timeout: 5000 });
+                const before = await page.evaluate(() => window.__hangarStub.calls
+                    .filter((c) => c.kind === 'spawn' && /stats/.test(String(c.argv))).length);
+                await page.click('#hangar-overview button:text-is("Measure now")');
+                await page.waitForTimeout(1200);
+                const after = await page.evaluate(() => window.__hangarStub.calls
+                    .filter((c) => c.kind === 'spawn' && /stats/.test(String(c.argv))).length);
+                assert(after > before,
+                    `Measure now ran no stats call: ${before} -> ${after}`);
             });
 
             await check('a repository row shows its size instead of a stuck "Reading repository…"', async () => {

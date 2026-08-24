@@ -2099,3 +2099,93 @@ test('an unavailable Schedule does not stop the Repositories screen', async () =
         delete globalThis.cockpit;
     }
 });
+
+// --- the size this screen measures is shared, not thrown away --------------
+//
+// Both screens ask restic the same expensive question about the same
+// repository. Whichever pays for the answer writes it down, so the other does
+// not have to — and the row shows a remembered number instead of an em dash
+// while its own measurement is in flight.
+
+const RepoSize = require('../../js/core/reposize.js');
+
+test('a measured size is written to the shared cache', async () => {
+    const row = repoRow();
+    const written = [];
+    const spawn = (argv) => Promise.resolve(argv.indexOf('snapshots') >= 0
+        ? '[{"id":"aabbccdd","time":"2026-07-31T02:00:00Z"}]'
+        : '{"total_size":4096,"total_file_count":9,"snapshots_count":1}');
+    await withStubs([[RepoSize, 'read', async () => null],
+        [RepoSize, 'write', async (id, stats) => {
+            written.push([id, stats.totalSize]);
+            return { size: stats.totalSize, snapshots: 1, at: 5000 };
+        }]], () => withCockpit({ spawn: spawn }, async () => {
+        await Ui.hangarReposUi().loadStats(row);
+    }));
+    assert.deepEqual(written, [['nas', 4096]], 'the Overview must not pay for this again');
+    assert.equal(row.stats.size, 4096);
+    assert.equal(row.stats.at, 5000, 'and the row knows when it was taken');
+});
+
+test('a remembered size fills the row while its own measurement is in flight', async () => {
+    const row = repoRow();
+    let seen = null;
+    const spawn = (argv) => {
+        // Whatever the row looked like at the moment the slow query began.
+        if (argv.indexOf('snapshots') >= 0) seen = row.stats && row.stats.size;
+        return Promise.resolve(argv.indexOf('snapshots') >= 0
+            ? '[]' : '{"total_size":4096,"total_file_count":9}');
+    };
+    await withStubs([
+        [RepoSize, 'read', async () => ({ size: 2048, snapshots: 3, at: 1000 })],
+        [RepoSize, 'write', async () => ({ size: 4096, snapshots: 0, at: 2000 })]
+    ], () => withCockpit({ spawn: spawn }, async () => {
+        await Ui.hangarReposUi().loadStats(row);
+    }));
+    assert.equal(seen, 2048, 'the row was not an em dash while restic was thinking');
+    assert.equal(row.stats.size, 4096, 'and the fresh number replaces it');
+});
+
+test('a failed measurement leaves the remembered size on screen', async () => {
+    const row = repoRow();
+    const spawn = (argv) => (argv.indexOf('snapshots') >= 0
+        ? Promise.resolve('[{"id":"aabbccdd","time":"2026-07-31T02:00:00Z"}]')
+        : Promise.reject({ exit_status: 1, message: 'Fatal: unable to open repository' }));
+    await withStubs([
+        [RepoSize, 'read', async () => ({ size: 2048, snapshots: 3, at: 1000 })],
+        [RepoSize, 'write', async () => { throw new Error('must not be called'); }]
+    ], () => withCockpit({ spawn: spawn }, async () => {
+        await Ui.hangarReposUi().loadStats(row);
+    }));
+    const c = Ui.hangarReposUi();
+    assert.equal(row.stats.size, 2048, 'the last true size survives the failure');
+    assert.equal(c.size(row), '2.0 KiB');
+    assert.ok(row.alert, 'and the failure is still reported');
+});
+
+test('the row says when its size was measured, and says nothing when nothing has', () => {
+    const c = Ui.hangarReposUi();
+    const row = repoRow();
+    assert.equal(c.measuredAt(row), '', 'a row with no stats claims no date');
+    row.stats = { snapshots: 1, size: 10, at: null };
+    assert.equal(c.measuredAt(row), '', 'nor does a size that arrived without one');
+    row.stats = { snapshots: 1, size: 10, at: Date.now() - 3 * 60 * 60 * 1000 };
+    assert.equal(c.measuredAt(row), 'measured 3 hours ago');
+    assert.ok(SOURCE.includes('measuredAt(row)'),
+        'and the template must render it beside the size');
+});
+
+test('an unreadable cache is simply no cache, not a failed row', async () => {
+    const row = repoRow();
+    const spawn = (argv) => Promise.resolve(argv.indexOf('snapshots') >= 0
+        ? '[]' : '{"total_size":4096,"total_file_count":9}');
+    await withStubs([
+        [RepoSize, 'read', async () => { throw new Error('access denied'); }],
+        [RepoSize, 'write', async () => { throw new Error('read-only'); }]
+    ], () => withCockpit({ spawn: spawn }, async () => {
+        await Ui.hangarReposUi().loadStats(row);
+    }));
+    assert.equal(row.alert, null, 'a cache problem is never the repository\'s problem');
+    assert.equal(row.stats.size, 4096);
+    assert.equal(row.busy, '');
+});
