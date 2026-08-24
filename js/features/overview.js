@@ -746,6 +746,12 @@
         const provider = obj(i.provider);
         return {
             id: typeof r.id === 'string' ? r.id : '',
+            // Kept on the row so the size can be fetched after the screen is
+            // already up: without them the async pass has nothing to query with,
+            // and the only way to get a size would be to block the render again.
+            repo: r,
+            destination: i,
+            sizing: false,
             kind: typeof r.kind === 'string' ? r.kind : '',
             remote: typeof i.remote === 'string' ? i.remote : '',
             providerId: provider && typeof provider.id === 'string' ? provider.id : '',
@@ -1014,6 +1020,10 @@
                     this.overall = overallStatus(jobs);
                     this.banners = authBanners(jobs, repos, this.now);
                     this.loading = false;
+                    // Deliberately not awaited: the screen is complete without
+                    // sizes, and a size that takes a minute must not be able to
+                    // delay it. Each row fills itself in when its query returns.
+                    this.fillRepoSizes();
                     this.syncWatch();
                 }
             },
@@ -1076,16 +1086,56 @@
                         continue;
                     }
                     const def = Object.assign({}, repo, { id: id });
-                    let stats = null;
-                    let err = null;
+                    // No size yet. `restic stats` reads the repository, and on a
+                    // remote one that means loading its index first — measured at
+                    // 50 seconds against a NAS over SFTP. Waiting for it here held
+                    // the WHOLE screen: jobs, statuses and schedules, all of them
+                    // read from local files in milliseconds, sat behind one remote
+                    // query nobody needs in order to see whether last night worked.
+                    // A broken definition is a local fault and is reported now,
+                    // not in a minute: building the argv is what rejects an
+                    // unknown kind, and it touches nothing remote. Only the size
+                    // is worth waiting for.
+                    let defErr = null;
                     try {
-                        stats = await this.fetchStats(def);
+                        statsArgv(def, D);
+                        environList(def, D);
                     } catch (e) {
-                        err = e;
+                        defErr = e;
                     }
-                    rows.push(repoRow(def, stats, err, D, await this.destinationOf(def)));
+                    rows.push(repoRow(def, null, defErr, D, await this.destinationOf(def)));
                 }
                 return rows;
+            },
+
+            // The sizes, afterwards and out of band. Each row updates as its own
+            // query returns, so one slow repository cannot delay another — and a
+            // repository that cannot be read shows its error in its own row
+            // rather than failing the screen.
+            async fillRepoSizes() {
+                const rows = this.repos || [];
+                await Promise.all(rows.map(async (row) => {
+                    if (!row || !row.repo) return;
+                    // Already known to be broken: asking again would only produce
+                    // the same error a minute later.
+                    if (row.error) return;
+                    row.sizing = true;
+                    try {
+                        const stats = await this.fetchStats(row.repo);
+                        if (stats) Object.assign(row, repoRow(row.repo, stats, null, D, row.destination));
+                    } catch (e) {
+                        Object.assign(row, repoRow(row.repo, null, e, D, row.destination));
+                    } finally {
+                        row.sizing = false;
+                        // Recomputed as each row lands, not only at the end: the
+                        // summary should climb toward the truth while the slow
+                        // repositories are still answering, rather than sitting
+                        // at zero and then jumping.
+                        this.totals = sumStats(this.repos || []);
+                    }
+                }));
+                this.totals = sumStats(this.repos || []);
+                return true;
             },
 
             // Which cloud destination a repository writes through, if any.
@@ -1683,7 +1733,20 @@
         '                        @click="remediateRepo(r)"',
         '                        x-text="remediationLabel(r.remediation)"></button>',
         '              </td>',
-        '              <td class="text-end" x-text="r.sizeText"></td>',
+        // While the size is still being measured the cell says so, rather than
+        // showing a dash that reads as "there is nothing here". A remote
+        // repository can take a minute to answer, and a dash for a minute is a
+        // wrong answer, not a slow one.
+        '              <td class="text-end">',
+        '                <span x-show="!r.sizing" x-text="r.sizeText"></span>',
+        // The toggle goes on a plain wrapper: Bootstrap's display utilities are
+        // !important and beat the inline display x-show sets, so the two must
+        // never share an element or the placeholder never goes away.
+        '                <span x-show="r.sizing">',
+        '                  <span class="hangar-skel-line d-inline-block align-middle"',
+        '                        style="width: 3.5rem" aria-label="Measuring"></span>',
+        '                </span>',
+        '              </td>',
         '              <td class="text-end" x-text="r.snapshots === null ? \'\\u2014\' : r.snapshots"></td>',
         '            </tr>',
         '          </template>',

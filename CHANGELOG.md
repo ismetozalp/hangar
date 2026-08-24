@@ -5,6 +5,26 @@ All notable changes to the Hangar Cockpit plugin are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.6] — 2026-08-24
+
+### Fixed
+
+- **The Overview waited on a remote size query before showing anything.**
+  `restic stats` reads the repository, and on a remote one that means loading
+  its index first — measured at 50 to 118 seconds against a NAS over SFTP. The
+  screen awaited it before rendering, so jobs, statuses and schedules already
+  read from local files in milliseconds sat behind it. A screencast showed the
+  loading placeholders still up after 28 seconds. Jobs now appear in about
+  three seconds and each repository fills in its own size when it arrives.
+- **A broken repository definition is reported at once**, rather than after the
+  wait: an unknown repository kind is rejected while building the command, which
+  touches nothing remote.
+
+### Changed
+
+- A repository whose size is still being measured shows a placeholder in that
+  cell rather than a dash, which reads as "there is nothing here".
+
 ## [1.0.5] — 2026-08-24
 
 ### Fixed

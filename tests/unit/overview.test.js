@@ -543,6 +543,9 @@ test('refresh loads jobs, repositories, totals and the overall status', async ()
     assert.equal(c.jobs.length, 1);
     assert.equal(c.jobs[0].status, 'ok');
     assert.equal(c.repos.length, 1);
+    // Sizes arrive after the screen does, so the totals are filled by the size
+    // pass rather than by refresh itself.
+    await c.fillRepoSizes();
     assert.equal(c.totals.snapshots, 7);
     assert.equal(c.overall, 'ok');
     assert.equal(c.isEmpty(), false);
@@ -2245,4 +2248,31 @@ test('an idle machine still gets its sizes', async () => {
         globalThis.HangarSchedule = prev;
         delete globalThis.cockpit;
     }
+});
+
+// ------------------------------------------- the screen does not wait for sizes
+//
+// `restic stats` reads the repository, and on a remote one that means loading
+// its index first: measured at 50 seconds against a NAS over SFTP. The Overview
+// used to await that before rendering anything, so jobs and statuses already
+// read from local files in milliseconds sat behind it — a screencast showed the
+// skeleton still up after 28 seconds.
+
+test('jobs appear while a slow repository is still being measured', async () => {
+    const c = O.hangarOverview();
+    let release;
+    const pending = new Promise((r) => { release = r; });
+    c.loadJobs = async () => [O.jobRow({ id: 'nightly', repo: 'main' }, null, null, Date.now())];
+    c.destinationOf = async () => null;
+    c.fetchStats = async () => { await pending; return { totalSize: 1, snapshotsCount: 3 }; };
+    c.loadRepoIds = undefined;
+
+    await c.refresh();
+    // The size query has not resolved, and must not have been waited for.
+    assert.equal(c.loading, false, 'the screen is up');
+    assert.equal(c.jobs.length, 1, 'with its jobs');
+
+    release();
+    await c.fillRepoSizes();
+    assert.equal(c.loading, false);
 });
