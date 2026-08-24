@@ -39,6 +39,9 @@ install:
 	@# Copy only FILES that exist — the plugin is built incrementally, so dirs
 	@# like html/ may not exist in early phases; a missing entry must not abort.
 	@for f in $(FILES); do if [ -e "$$f" ]; then cp -r "$$f" $(INSTALL_DIR)/; fi; done
+	@# Python compiles hangar-run beside itself when the tests import it. It is
+	@# build output for one interpreter version and has no business shipping.
+	@find $(INSTALL_DIR) -name __pycache__ -type d -prune -exec rm -rf {} +
 	install -d $(LIBEXEC)
 	@if [ -f libexec/hangar-run ]; then install -m 0755 libexec/hangar-run $(LIBEXEC)/hangar-run; fi
 	install -d -m 0755 $(SYSCONF)
@@ -65,6 +68,7 @@ zip:
 	@tmp=$$(mktemp -d); \
 	mkdir "$$tmp/hangar"; \
 	for f in $(FILES); do [ -e "$$f" ] && cp -r "$$f" "$$tmp/hangar/"; done; \
+	find "$$tmp/hangar" -name __pycache__ -type d -prune -exec rm -rf {} +; \
 	(cd "$$tmp" && zip -rq "hangar-$(VERSION).zip" hangar); \
 	mv "$$tmp/hangar-$(VERSION).zip" .; \
 	rm -rf "$$tmp"; \
