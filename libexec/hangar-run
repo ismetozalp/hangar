@@ -1673,7 +1673,9 @@ def stream_restic(argv, env, label):
                     log("info", "progress",
                         percent=round((msg.get("percent_done") or 0) * 100, 1),
                         files_done=msg.get("files_done"),
-                        bytes_done=msg.get("bytes_done"))
+                        total_files=msg.get("total_files"),
+                        bytes_done=msg.get("bytes_done"),
+                        total_bytes=msg.get("total_bytes"))
     except BaseException:
         # We are leaving this function early — a signal, almost always. restic must
         # not outlive us: the post steps are about to start the containers again,
