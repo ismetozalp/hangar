@@ -72,17 +72,42 @@
             },
 
             // --- theming ------------------------------------------------------
-            // Applied before anything else renders, so the page never flashes the
-            // default palette and then repaint into the chosen one.
+            // Match Cockpit's own explicit appearance preference before falling
+            // back to OS color scheme. index.html uses the same rule on first paint.
+            _prefersDark() {
+                let dark = !!(root.matchMedia &&
+                    root.matchMedia('(prefers-color-scheme: dark)').matches);
+                try {
+                    const shellTheme = root.localStorage && root.localStorage.getItem('shell:style');
+                    if (shellTheme === 'dark') dark = true;
+                    else if (shellTheme === 'light') dark = false;
+                } catch (_e) { /* unavailable storage: OS preference is sufficient */ }
+                return dark;
+            },
+
+            // Applied while the startup gate is still hiding the interface.
             applyTheme(id) {
                 const T = root.HangarThemes;
                 if (!T || !root.document || !root.document.documentElement) return;
                 const chosen = id !== undefined ? id
                     : ((this.settings && this.settings.theme) || T.DEFAULT_THEME);
-                const prefersDark = !!(root.matchMedia &&
-                    root.matchMedia('(prefers-color-scheme: dark)').matches);
                 root.document.documentElement.setAttribute(
-                    'data-bs-theme', T.resolve(chosen, prefersDark).attr);
+                    'data-bs-theme', T.resolve(chosen, this._prefersDark()).attr);
+            },
+
+            // Only reveal after Alpine has bound x-show/x-text and removed
+            // x-cloak. Do not wait for network, privilege or update checks.
+            _revealAfterTheme() {
+                const reveal = () => {
+                    if (root.document && root.document.documentElement)
+                        root.document.documentElement.classList.remove('hangar-loading');
+                };
+                if (typeof this.$nextTick === 'function') this.$nextTick(reveal);
+                else if (root.Alpine && typeof root.Alpine.nextTick === 'function')
+                    root.Alpine.nextTick(reveal);
+                else if (typeof root.requestAnimationFrame === 'function')
+                    root.requestAnimationFrame(reveal);
+                else reveal();
             },
 
             // 'system' has to keep tracking the OS after load, or a user who
@@ -113,12 +138,18 @@
 
                 this.applyTheme();
                 this._watchSystemTheme();
+                this._revealAfterTheme();
                 // A theme picked on the Settings screen must repaint the whole page,
                 // not just that tab, so the change comes back here as an event.
                 root.addEventListener('hangar:theme', (ev) => {
                     const id = ev && ev.detail;
                     if (this.settings) this.settings.theme = id;
                     this.applyTheme(id);
+                });
+                root.addEventListener('storage', (ev) => {
+                    if (ev && ev.key === 'shell:style' &&
+                        (!this.settings || this.settings.theme === 'system'))
+                        this.applyTheme();
                 });
 
                 await this.checkAdminAccess();

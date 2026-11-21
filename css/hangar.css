@@ -19,6 +19,10 @@
     --hangar-idle: var(--bs-secondary-color, #6c757d);
 }
 
+/* x-cloak must be defined in CSS; the attribute alone does not hide anything.
+   The document-level gate in index.html remains until async theme loading ends. */
+[x-cloak] { display: none !important; }
+
 body {
     margin: 0;
     font-size: 0.9rem;
