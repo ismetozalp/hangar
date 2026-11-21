@@ -751,6 +751,7 @@ function scheduleStub(o) {
         disable: record('disable'),
         start: record('start'),
         stop: record('stop'),
+        runNow: record('runNow'),
         daemonReload: record('daemonReload')
     }, o.schedule || {});
 }
@@ -1015,7 +1016,7 @@ test('a partial restic named no files for says so rather than showing an empty l
 
 test('the partial banner is a warning and the failure banner is not', () => {
     const partial = Jobs.SCREEN.slice(Jobs.SCREEN.indexOf('x-if="partial"'),
-        Jobs.SCREEN.indexOf('x-if="run"'));
+        Jobs.SCREEN.indexOf('x-if="run || live"'));
     assert.match(partial, /alert-warning/);
     assert.ok(!/alert-danger/.test(partial));
     assert.match(partial, /snapshot was written/i);
@@ -1154,7 +1155,9 @@ test('unlocking runs restic unlock and then repeats the backup', async () => {
 
         await c.applyRemediation();
         const ops = calls.filter((x) => x[0] === 'restic').map((x) => x[1]);
-        assert.deepEqual(ops, ['backup', 'unlock', 'backup']);
+        assert.deepEqual(ops, ['backup', 'unlock']);
+        assert.ok(calls.some((entry) => entry[0] === 'runNow' && entry[1] === 'nightly'),
+            'the retry must launch a persistent systemd backup');
         assert.equal(c.failure, null);
         assert.equal(c.working, false);
     });
