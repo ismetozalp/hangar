@@ -3200,3 +3200,52 @@ test('an idle job is not running, however incomplete its unit state', () => {
     for (const unit of [undefined, null, {}, { service: null }, { service: { active: false } }])
         assert.equal(c.isRunning({ id: 'n', job: { id: 'n' }, unit }), false, JSON.stringify(unit));
 });
+
+// --- durable systemd progress -------------------------------------------
+
+test('journal progress retains dynamic file totals and estimated sizes', () => {
+    const first = Jobs.progressFromJournal({
+        msg: 'progress', percent: 30.1,
+        files_done: 20043, total_files: 60000,
+        bytes_done: 1073741824, total_bytes: 3221225472
+    });
+    assert.deepEqual(first, {
+        percent: 30.1,
+        label: '30.1% · 20043 of 60000 files · 1 GiB of 3 GiB'
+    });
+    const growing = Jobs.progressFromJournal({
+        msg: 'progress', percent: 21.4,
+        files_done: 23000, total_files: 85000,
+        bytes_done: 2147483648, total_bytes: 8589934592
+    });
+    assert.match(growing.label, /2 GiB of 8 GiB/);
+    assert.equal(Jobs.progressFromJournal({ msg: 'other', total_bytes: 100 }), null);
+    assert.equal(Jobs.progressFromJournal({
+        msg: 'progress', files_done: 2, bytes_done: 2048
+    }).label, '2 files · 2 KiB');
+});
+
+test('the systemd runner preserves restic estimates in journal progress', () => {
+    const fs = require('node:fs');
+    const runner = fs.readFileSync(__dirname + '/../../libexec/hangar-run', 'utf8');
+    assert.match(runner, /total_files=msg\.get\("total_files"\)/);
+    assert.match(runner, /total_bytes=msg\.get\("total_bytes"\)/);
+});
+
+test('the Jobs Back up now button starts a persistent service, not browser restic', async () => {
+    const calls = [];
+    const world = baseWorld({
+        jobs: { nightly: sampleJob() },
+        repos: { nas: sampleRepo() },
+        run: async () => { throw new Error('browser backup must not launch'); },
+        schedule: { runNow: async (id) => { calls.push(id); } }
+    });
+    await withStubs(world, async () => {
+        const c = Jobs.hangarJobsUi();
+        await c.reload();
+        await c.runNow(c.jobs[0]);
+        assert.deepEqual(calls, ['nightly']);
+        assert.equal(c.failure, null);
+    });
+});
+

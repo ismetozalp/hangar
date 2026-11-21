@@ -901,6 +901,30 @@
         return bits.join(' · ');
     }
 
+    // Convert progress logged by the independent systemd runner into the
+    // same formatter formerly fed by browser-bound restic status messages.
+    // Restic's estimates may grow while it discovers additional files.
+    function progressFromJournal(entry) {
+        if (!isObj(entry) || entry.msg !== 'progress') return null;
+        const value = num(entry.percent);
+        const percent = value === null ? null : Math.max(0, Math.min(100, value));
+        const status = {
+            percent_done: percent === null ? null : percent / 100,
+            files_done: entry.files_done,
+            total_files: entry.total_files,
+            bytes_done: entry.bytes_done,
+            total_bytes: entry.total_bytes
+        };
+        let label = progressLabel(status);
+        if (percent !== null) {
+            // Preserve the one-decimal precision logged by hangar-run while
+            // retaining the existing human-readable file and size estimates.
+            const accurate = percent.toFixed(1).replace(/\.0$/, '') + '%';
+            label = label.replace(/^\d+%/, accurate);
+        }
+        return { percent: percent, label: label };
+    }
+
     // A backup of / can hit tens of thousands of unreadable files. The list is
     // still the point, but rendering all of them freezes the UI thread, so it is
     // truncated with an explicit count rather than silently.
@@ -1114,19 +1138,19 @@
         '  </div>',
         '</template>',
 
-        '<template x-if="run">',
+        '<template x-if="run || live">',
         '  <div class="card mb-3">',
         '    <div class="card-body py-2">',
         '      <div class="d-flex align-items-center gap-2">',
         '        <span class="hangar-dot running"></span>',
-        '        <strong x-text="\'Backing up \' + run.jobId"></strong>',
-        '        <span class="ms-auto small text-secondary" x-text="run.label"></span>',
+        '        <strong x-text="\'Backing up \' + (live || run).jobId"></strong>',
+        '        <span class="ms-auto small text-secondary" x-text="(live || run).label"></span>',
         '      </div>',
         '      <div class="progress hangar-progress mt-2" role="progressbar"',
-        '           :aria-valuenow="run.percent === null ? 0 : run.percent"',
+        '           :aria-valuenow="(live || run).percent === null ? 0 : (live || run).percent"',
         '           aria-valuemin="0" aria-valuemax="100" aria-label="Backup progress">',
-        '        <div class="progress-bar" :class="run.percent === null ? \'progress-bar-striped progress-bar-animated\' : \'\'"',
-        '             :style="\'width: \' + (run.percent === null ? 100 : run.percent) + \'%\'"></div>',
+        '        <div class="progress-bar" :class="(live || run).percent === null ? \'progress-bar-striped progress-bar-animated\' : \'\'"',
+        '             :style="\'width: \' + ((live || run).percent === null ? 100 : (live || run).percent) + \'%\'"></div>',
         '      </div>',
         '    </div>',
         '  </div>',
@@ -1295,6 +1319,7 @@
             // warning listing them, never a failure — the rest of the page is fine.
             unreadable: [],
             run: null,
+            live: null,
 
             async init() {
                 this.watchRepos();
@@ -1367,6 +1392,57 @@
                 return true;
             },
 
+            // This only reads status: the backup runs in a systemd unit and is
+            // never connected to, or cancelled by, the Cockpit browser session.
+            async refreshLive() {
+                const current = (this.jobs || []).find((r) =>
+                    r && r.unit && r.unit.service && r.unit.service.active);
+                if (!current) {
+                    this.live = null;
+                    return;
+                }
+                const status = {
+                    jobId: current.id, percent: null,
+                    label: 'Running independently of this browser…'
+                };
+                this.live = status;
+                if (typeof cockpit === 'undefined' || !cockpit ||
+                    typeof cockpit.spawn !== 'function') return;
+                try {
+                    const Schedule = M('HangarSchedule');
+                    const unit = Schedule.serviceUnit(current.id);
+                    const opts = { superuser: 'require', err: 'message' };
+                    // InvocationID isolates this run from previous journal entries.
+                    const output = await cockpit.spawn([
+                        'systemctl', 'show', unit, '--property=InvocationID', '--value'
+                    ], opts);
+                    const invocation = String(output || '').trim();
+                    if (!/^[0-9a-f]{32}$/i.test(invocation)) return;
+                    const journal = await cockpit.spawn([
+                        'journalctl', '--quiet', '--no-pager', '--output=cat',
+                        '-n', '80', '_SYSTEMD_INVOCATION_ID=' + invocation
+                    ], opts);
+                    const lines = String(journal || '').split(/\r?\n/);
+                    for (let i = lines.length - 1; i >= 0; i--) {
+                        let entry;
+                        try { entry = JSON.parse(lines[i].replace(/^<\d+>/, '')); }
+                        catch (_e) { continue; }
+                        const progress = progressFromJournal(entry);
+                        if (!progress) continue;
+                        status.percent = progress.percent;
+                        status.label = progress.label;
+                        break;
+                    }
+                    // Never let a late response from an older poll hide progress
+                    // from another backup that has since started.
+                    if ((this.jobs || []).some((r) => r.id === current.id &&
+                        r.unit && r.unit.service && r.unit.service.active))
+                        this.live = Object.assign({}, status);
+                } catch (_e) {
+                    // Disconnected journal queries have no effect on the backup.
+                }
+            },
+
             async reload() {
                 const Config = M('HangarConfig');
                 this.loading = true;
@@ -1379,6 +1455,7 @@
                     for (let i = 0; i < (Array.isArray(ids) ? ids.length : 0); i++)
                         rows.push(await this.loadJob(ids[i]));
                     this.jobs = rows;
+                    await this.refreshLive();
                     this.unreadable = this.unreadablePaths();
                 } catch (e) {
                     this.error = e;
@@ -1709,7 +1786,7 @@
             // ---- running ------------------------------------------------
 
             runNow(row) {
-                return this.startBackup(row && row.job);
+                return this.startViaUnit(row && row.job);
             },
 
             // Hands a container or VM job to its systemd unit. Nothing else can do
@@ -1900,7 +1977,7 @@
                 // Only a backup is safe to repeat unattended. A failed save or delete
                 // is repeated by the user, from a list that now shows what is really
                 // on disk.
-                if (f.op === 'backup' && row) await this.startBackup(row.job);
+                if (f.op === 'backup' && row) await this.startViaUnit(row.job);
                 else await this.reload();
             }
         };
@@ -2277,7 +2354,7 @@
         sourceProblems, sourceWarnings, riskWarnings, sourceDescription,
         formStateToJob, jobToFormState,
         validateForm, hasErrors, problemsFor, failureTitle, FAILURE_TITLES,
-        formatBytes, progressPercent, progressLabel, unreadableFiles, MAX_UNREADABLE,
+        formatBytes, progressPercent, progressLabel, progressFromJournal, unreadableFiles, MAX_UNREADABLE,
         isReadErrors, isCancelled,
         lastResultLabel, remediationLabel, backupOpts,
         splitLines, joinLines, splitTags, joinTags,
