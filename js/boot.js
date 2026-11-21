@@ -48,5 +48,15 @@
         return loadScript('js/alpine.min.js');
     }).catch(function (e) {
         console.error('[hangar] Alpine failed to start:', e);
+        // No raw Alpine markup on failure either: leave the shell hidden but
+        // display a clear error over the already-themed page background.
+        var shell = document.querySelector('.hangar-shell');
+        if (shell) shell.style.display = 'none';
+        var error = document.createElement('div');
+        error.setAttribute('role', 'alert');
+        error.className = 'alert alert-danger m-3';
+        error.textContent = 'Hangar could not load its interface. Reload Cockpit or check the browser console.';
+        document.body.appendChild(error);
+        document.documentElement.classList.remove('hangar-loading');
     });
 })();

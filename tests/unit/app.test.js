@@ -239,3 +239,92 @@ test('values are compared as strings, the way a select holds them', () => {
     assert.equal(App.selectNeedsSync('30', 30, ['30', '60']), false);
     assert.equal(App.selectNeedsSync('60', 30, ['30', '60']), true);
 });
+
+
+// --- startup paint: theme + hydration gate --------------------------------
+test('the first paint uses a theme bootstrap before external stylesheets', () => {
+    const fs = require('node:fs');
+    const html = fs.readFileSync(__dirname + '/../../index.html', 'utf8');
+    const css = fs.readFileSync(__dirname + '/../../css/hangar.css', 'utf8');
+    assert.match(html, /<html[^>]*class="hangar-loading"/);
+    assert.match(html, /html\.hangar-loading body\s*\{\s*visibility:\s*hidden/);
+    assert.match(css, /\[x-cloak\]\s*\{\s*display:\s*none\s*!important/);
+    const match = html.match(/<script id="hangar-initial-theme">([\s\S]*?)<\/script>/);
+    assert.ok(match, 'initial theme script is missing');
+    assert.ok(html.indexOf('hangar-initial-theme') < html.indexOf('css/bootstrap.min.css'),
+        'theme must be resolved before the CSS can first paint');
+    const run = new Function('window', 'localStorage', 'document', match[1]);
+    for (const [preference, osDark, expected] of [
+        ['dark', false, 'dark'], ['light', true, 'light'],
+        ['auto', true, 'dark'], ['auto', false, 'light']
+    ]) {
+        let attr = null;
+        run({ matchMedia: () => ({ matches: osDark }) },
+            { getItem: () => preference },
+            { documentElement: { setAttribute: (_k, v) => { attr = v; } } });
+        assert.equal(attr, expected);
+    }
+    let fallback = null;
+    run({ matchMedia: () => ({ matches: true }) },
+        { getItem: () => { throw new Error('blocked'); } },
+        { documentElement: { setAttribute: (_k, v) => { fallback = v; } } });
+    assert.equal(fallback, 'dark', 'blocked storage should fall back to OS dark mode');
+});
+
+test('the loading gate is removed only after Alpine has updated its bindings', () => {
+    const savedDocument = globalThis.document;
+    const removed = [];
+    globalThis.document = {
+        documentElement: { classList: { remove: (c) => removed.push(c) } }
+    };
+    try {
+        const app = App.hangarApp();
+        let nextTick = null;
+        app.$nextTick = (callback) => { nextTick = callback; };
+        app._revealAfterTheme();
+        assert.deepEqual(removed, [], 'interface was shown before Alpine nextTick');
+        assert.equal(typeof nextTick, 'function');
+        nextTick();
+        assert.deepEqual(removed, ['hangar-loading']);
+    } finally {
+        if (savedDocument === undefined) delete globalThis.document;
+        else globalThis.document = savedDocument;
+    }
+});
+
+test('explicit Cockpit light/dark preference overrides the OS in system mode', () => {
+    const saved = {
+        document: globalThis.document,
+        localStorage: globalThis.localStorage,
+        matchMedia: globalThis.matchMedia,
+        HangarThemes: globalThis.HangarThemes
+    };
+    const applied = [];
+    globalThis.document = { documentElement: {
+        setAttribute: (_key, value) => applied.push(value)
+    } };
+    globalThis.matchMedia = () => ({ matches: false });
+    globalThis.HangarThemes = {
+        DEFAULT_THEME: 'system',
+        resolve: (id, dark) => ({ attr: id === 'system' ? (dark ? 'dark' : 'light') : id })
+    };
+    try {
+        const app = App.hangarApp();
+        app.settings = { theme: 'system' };
+        globalThis.localStorage = { getItem: () => 'dark' };
+        app.applyTheme();
+        assert.equal(applied.at(-1), 'dark');
+        globalThis.localStorage = { getItem: () => 'light' };
+        globalThis.matchMedia = () => ({ matches: true });
+        app.applyTheme();
+        assert.equal(applied.at(-1), 'light');
+        app.applyTheme('dracula');
+        assert.equal(applied.at(-1), 'dracula',
+            'Hangar custom themes must retain precedence over the shell');
+    } finally {
+        for (const [key, value] of Object.entries(saved)) {
+            if (value === undefined) delete globalThis[key];
+            else globalThis[key] = value;
+        }
+    }
+});
